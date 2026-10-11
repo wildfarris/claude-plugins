@@ -1,0 +1,26 @@
+{
+  "name": "commons",
+  "version": "0.2.0",
+  "description": "Memory shared across projects, by topic: turn topics on per project in a sidebar, and Claude reads and saves to them in any session.",
+  "author": {
+    "name": "Jeremy Phares"
+  },
+  "license": "Apache-2.0",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "memoryDir": {
+      "type": "string",
+      "title": "Memory folder",
+      "description": "Where the shared memory is kept, one file per memory. Empty means ~/.claude/commons. Keep it outside every repo.",
+      "default": ""
+    },
+    "contextLimit": {
+      "type": "number",
+      "title": "Context size (characters)",
+      "description": "Most characters of shared memory added to a conversation's first message; past it, the newest are kept and Claude recalls the rest.",
+      "default": 6000,
+      "min": 1000,
+      "max": 30000
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "name": "council",
+  "version": "0.2.1",
+  "description": "Convene a council of advisors on a question or on a repo's recent work: built-in members plus your own member files, chosen per project, with animated pixel portraits and a brain trust mode.",
+  "author": {
+    "name": "Jeremy Phares"
+  },
+  "license": "Apache-2.0",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "briefModel": {
+      "type": "string",
+      "title": "Review model",
+      "description": "Model that briefs the council in review mode (/council review <ref>): picks files, then writes the brief.",
+      "default": "opus"
+    },
+    "advisorModel": {
+      "type": "string",
+      "title": "Advisor model",
+      "description": "Model of the five advisors (plain model calls, not agents).",
+      "default": "sonnet"
+    },
+    "advisorEffort": {
+      "type": "string",
+      "title": "Advisor effort",
+      "description": "Effort of the five advisors.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "low"
+    },
+    "deepModel": {
+      "type": "string",
+      "title": "Brain trust model",
+      "description": "Model for every call of a brain trust (/council deep): advisors, reconsiderations, follow-ups, the report, and review mode's herald. E.g. opus or fable.",
+      "default": "opus"
+    },
+    "deepEffort": {
+      "type": "string",
+      "title": "Brain trust effort",
+      "description": "Effort for every brain trust call.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "high"
+    },
+    "triageModel": {
+      "type": "string",
+      "title": "Court triage model",
+      "description": "In court mode, the model that decides whether a prompt goes to the council (changes, risks, decisions) or straight to Claude (questions, chatter).",
+      "default": "haiku"
+    }
+  }
+}

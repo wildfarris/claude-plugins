@@ -1,0 +1,26 @@
+{
+  "name": "personal-mods",
+  "owner": {
+    "name": "Jeremy Phares"
+  },
+  "metadata": {
+    "description": "Personal Claude Code mods."
+  },
+  "plugins": [
+    {
+      "name": "sidekick",
+      "source": "./sidekick",
+      "description": "A bar above the prompt (TL;DR, heads-up, rules, replay), a multi-repo scope guard, long-lived rules and a resume warning."
+    },
+    {
+      "name": "council",
+      "source": "./council",
+      "description": "Convene a council of five advisors on a question or on a repo's recent work, with animated pixel portraits."
+    },
+    {
+      "name": "commons",
+      "source": "./commons",
+      "description": "Memory shared across projects, by topic, with a sidebar to choose what each project sees."
+    }
+  ]
+}

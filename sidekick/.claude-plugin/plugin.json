@@ -1,0 +1,133 @@
+{
+  "name": "sidekick",
+  "version": "0.14.0",
+  "description": "A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard, long-lived rules, a resume warning, and trimming instead of summary compaction.",
+  "author": {
+    "name": "Jeremy Phares"
+  },
+  "license": "Apache-2.0",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model for TL;DR briefs, heads-up notes and the scope classifier.",
+      "default": "claude-haiku-5-5"
+    },
+    "replayEnabled": {
+      "type": "boolean",
+      "title": "Edit replay",
+      "description": "Record each turn's file edits and offer /replay to step through them.",
+      "default": true
+    },
+    "summaryEnabled": {
+      "type": "boolean",
+      "title": "TL;DR briefs",
+      "description": "Keep a record of each session (in ~/.claude/sidekick/ledgers, secrets redacted, 14 days) and show the TL;DR button, which briefs it only when clicked.",
+      "default": true
+    },
+    "headsUpEnabled": {
+      "type": "boolean",
+      "title": "Heads-up notes",
+      "description": "Show the Heads up button on the bar (it reviews the last answer only when clicked).",
+      "default": true
+    },
+    "noteLength": {
+      "type": "string",
+      "title": "Explanation length",
+      "description": "How long the explanation behind a note is.",
+      "options": [
+        "brief",
+        "standard",
+        "detailed"
+      ],
+      "default": "brief"
+    },
+    "focusTopics": {
+      "type": "string",
+      "title": "Watch especially for",
+      "description": "Topics heads-up notes should weigh first, e.g. \"security, data loss\".",
+      "default": ""
+    },
+    "ignoreTopics": {
+      "type": "string",
+      "title": "Never raise",
+      "description": "Topics heads-up notes should never raise, e.g. \"formatting\".",
+      "default": ""
+    },
+    "scopeGuardEnabled": {
+      "type": "boolean",
+      "title": "Scope guard",
+      "description": "Block changes outside this session's target folders, once set with /scope set or add.",
+      "default": true
+    },
+    "scopeClassifierEnabled": {
+      "type": "boolean",
+      "title": "Scope classifier",
+      "description": "Ask the model about shell commands the guard can't judge, when nothing built in will review them.",
+      "default": true
+    },
+    "classifierUsageCap": {
+      "type": "number",
+      "title": "Classifier usage cap (%)",
+      "description": "Pause the scope classifier once your 5-hour usage passes this percentage.",
+      "default": 90,
+      "min": 0,
+      "max": 100
+    },
+    "ruleSuggestionsEnabled": {
+      "type": "boolean",
+      "title": "Rule suggestions",
+      "description": "Show Rule? on the bar after the scope guard blocks something; a click asks for a rule suggestion, which you approve.",
+      "default": true
+    },
+    "resumeWarningEnabled": {
+      "type": "boolean",
+      "title": "Resume warning",
+      "description": "Hold the first prompt of a resumed session whose prompt cache has likely expired.",
+      "default": true
+    },
+    "trimEnabled": {
+      "type": "boolean",
+      "title": "Trim instead of summarizing",
+      "description": "When Claude Code compacts automatically, replace old tool output with stubs instead of a summary (keeping your answers, subagent reports and errors), if that frees enough.",
+      "default": true
+    },
+    "trimAtPercent": {
+      "type": "number",
+      "title": "Trim threshold (%)",
+      "description": "How full the context must be when the automatic compaction fires for a trim to be considered.",
+      "default": 80,
+      "min": 50,
+      "max": 99
+    },
+    "trimTargetPercent": {
+      "type": "number",
+      "title": "Trim only if it gets to (%)",
+      "description": "Trim only when it would bring the context down to this percent or less; otherwise leave it to normal compaction.",
+      "default": 50,
+      "min": 10,
+      "max": 90
+    },
+    "trimKeepTurns": {
+      "type": "number",
+      "title": "Turns kept whole",
+      "description": "The newest turns whose tool output a trim leaves alone. At least 1, so a trim during a turn never touches that turn's own tool calls.",
+      "default": 1,
+      "min": 1,
+      "max": 10
+    },
+    "contextReadoutEnabled": {
+      "type": "boolean",
+      "title": "Context readout",
+      "description": "Show how full the context is and what the last turn added on the bar; its panel breaks it down.",
+      "default": true
+    },
+    "councilButtonEnabled": {
+      "type": "boolean",
+      "title": "Council button",
+      "description": "When the council mod is installed, show a ⚜ Council button on the bar.",
+      "default": true
+    }
+  }
+}

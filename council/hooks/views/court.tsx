@@ -1,0 +1,205 @@
+// The court: the council in one strip on top, then one row per order, its
+// agent walking a road toward the order's folder as its todos get done.
+// Pure: drawn from the surface's element table, plain data and callbacks.
+// Shares the chamber's vocabulary (views/council.tsx).
+
+import type { ElementTable } from 'claude-code'
+
+import type { AdvisorReport, Council, Court, Order, Seat } from '../../types'
+import { seatsOf } from '../council'
+import { currentTodo, isFolded, progressOf } from '../court'
+
+export type CourtViewProps = {
+  court: Court
+  council: Council | null
+  // The pane's width, to fit the advisor strip into equal cells.
+  bodyColumns: number
+  // The road for one order (an Svg or a Text, by surface).
+  road: (order: Order) => unknown
+  onChamber: () => unknown
+  onToggleSession: () => unknown
+  onClearFinished: () => unknown
+  // The advisor whose verdict is open under the strip.
+  openVerdictId: string | null
+  onToggleVerdict: (id: string) => unknown
+  // A small animated portrait (desktop), or null (terminal: names only).
+  portrait: (seat: Seat, report: AdvisorReport) => unknown
+  isFinishedShown: boolean
+  onToggleFinished: () => unknown
+  // The finished order whose full report is open.
+  openOrderId: string | null
+  onToggleOrder: (id: string) => unknown
+}
+
+const ROLE_TITLE = { scout: 'Scout', knight: 'Knight' } as const
+const ROLE_GLYPH = { scout: '♟', knight: '♞' } as const
+
+const concernColor = (concern: number) => (concern >= 4 ? 'error' : concern === 3 ? 'warning' : 'success')
+
+// Newest first: by order number (O12 before O3).
+const orderNumber = (order: Order) => Number(order.id.replace(/^\D+/, '')) || 0
+const newestFirst = (left: Order, right: Order) => orderNumber(right) - orderNumber(left)
+
+const isFinished = (order: Order) => order.status === 'done' || order.status === 'failed'
+
+// The agent's report as plain text: markdown marks dropped, paragraphs kept.
+const reportText = (order: Order) =>
+  (order.report.trim() || (order.status === 'done' ? 'Back with no report.' : 'The agent stopped.'))
+    .replace(/\*\*|__|`/g, '')
+    .replace(/^#+\s*/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+
+// An order on the road: who and where, its progress on the right, the road,
+// then what it is doing now.
+function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown) {
+  const { Box, Text } = el
+  const { done, total } = progressOf(order)
+  const isWaiting = order.status === 'approved'
+  const now = isWaiting ? 'approved · waiting to be dispatched' : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
+  return (
+    <Box key={`order-${order.id}`} flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Box flexDirection="row" gap={1} flexShrink={1}>
+          <Text bold wrap="truncate-end">{`${ROLE_GLYPH[order.role]} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`}</Text>
+          <Text dimColor>{order.id}</Text>
+        </Box>
+        <Text color={isWaiting ? 'inactive' : 'claude'}>{`${done}/${total}${order.edits > 0 ? ` · ${order.edits} edit${order.edits === 1 ? '' : 's'}` : ''}`}</Text>
+      </Box>
+      {road(order)}
+      <Text dimColor italic wrap="truncate-end">
+        {now}
+      </Text>
+    </Box>
+  )
+}
+
+// An order that is back: one line with how it ended; pressed, its whole report.
+function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (id: string) => unknown) {
+  const { Box, Text, Button } = el
+  const isDone = order.status === 'done'
+  return (
+    <Box key={`order-${order.id}`} flexDirection="column">
+      <Box flexDirection="row" gap={1}>
+        <Text color={isDone ? 'success' : 'error'}>{isDone ? '✓' : '✕'}</Text>
+        <Button key={`order-toggle-${order.id}`} label={`${isOpen ? '▾' : '▸'} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`} plain onPress={() => onToggle(order.id)} />
+        <Text dimColor>{order.id}</Text>
+      </Box>
+      {isOpen && (
+        <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={isDone ? 'success' : 'error'}>
+          <Text wrap="wrap">{reportText(order)}</Text>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+function section(el: ElementTable, key: string, title: string, rows: unknown[]) {
+  const { Box, Text } = el
+  return (
+    <Box key={key} flexDirection="column" rowGap={1} marginTop={1}>
+      <Text bold dimColor>
+        {title}
+      </Text>
+      {rows}
+    </Box>
+  )
+}
+
+export function courtView(el: ElementTable, props: CourtViewProps) {
+  const { Box, Text, Button } = el
+  const { court, council } = props
+  const lastRuling = court.rulings[court.rulings.length - 1]
+  // On the road (working, then waiting), back home, and the archive: each newest first.
+  const active = court.orders.filter(order => !isFinished(order)).sort((left, right) => (left.status === right.status ? newestFirst(left, right) : left.status === 'dispatched' ? -1 : 1))
+  const home = court.orders.filter(order => isFinished(order) && !isFolded(order)).sort(newestFirst)
+  const archived = court.orders.filter(order => isFolded(order)).sort(newestFirst)
+  const hasFinished = home.length + archived.length > 0
+  const seats = council ? seatsOf(council) : []
+  const openSeat = seats.find(seat => seat.id === props.openVerdictId)
+  const openReport = openSeat && council ? council.advisors[openSeat.id] : undefined
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Box flexDirection="row" justifyContent="space-between" gap={2}>
+        <Text bold color="claude">
+          ⚜ The Court
+        </Text>
+        <Text color={court.isInSession ? 'success' : undefined} dimColor={!court.isInSession}>
+          {court.isInSession ? '● in session' : '○ court mode off'}
+        </Text>
+      </Box>
+      {court.isInSession && <Text dimColor>prompts go to the council first</Text>}
+      {council !== null && (
+        <Box flexDirection="column" marginTop={1}>
+          <Box flexDirection="row" flexWrap="wrap" rowGap={1}>
+            {seats.map(seat => {
+              const report = council.advisors[seat.id]
+              const name = seat.title.replace(/^The /, '').split(' ').pop()
+              const mark = report?.status === 'done' ? String(report.concern) : report?.status === 'abstained' ? '–' : '…'
+              const isOpen = props.openVerdictId === seat.id
+              // Equal cells, as many to a row as fit: the strip lines up in a grid.
+              const perRow = Math.max(1, Math.min(seats.length, Math.floor(props.bodyColumns / 14)))
+              return (
+                <Box key={`seat-${seat.id}`} flexDirection="column" alignItems="center" width={`${Math.floor(100 / perRow)}%`}>
+                  {report ? props.portrait(seat, report) : null}
+                  <Button key={`verdict-${seat.id}`} label={`${name} ${mark}`} variant={isOpen ? 'primary' : 'secondary'} onPress={() => props.onToggleVerdict(seat.id)} />
+                </Box>
+              )
+            })}
+          </Box>
+          {openSeat && openReport && (
+            <Box flexDirection="column" borderStyle="quote" borderColor={openReport.status === 'done' ? concernColor(openReport.concern) : 'inactive'} paddingLeft={1}>
+              <Text bold wrap="wrap">
+                {openReport.status === 'done' ? `${openSeat.title} · ${openReport.concern}/5 · ${openReport.verdict}` : openReport.status === 'abstained' ? `${openSeat.title} abstains: ${openReport.verdict}` : `${openSeat.title}: no verdict yet`}
+              </Text>
+              {openReport.detail !== '' && (
+                <Text dimColor wrap="wrap">
+                  {openReport.detail}
+                </Text>
+              )}
+            </Box>
+          )}
+        </Box>
+      )}
+      {(court.heldPrompt !== null || lastRuling) && (
+        <Box flexDirection="column" marginTop={1}>
+          {court.heldPrompt !== null && (
+            <Text italic dimColor wrap="wrap">
+              {`petition before the council: ${court.heldPrompt.replace(/\s+/g, ' ').slice(0, 120)}`}
+            </Text>
+          )}
+          {lastRuling && (
+            <Text color={lastRuling.isApproved ? 'success' : 'error'} wrap="wrap">
+              {lastRuling.isApproved ? `Approved: ${lastRuling.plan}` : `Refused: ${lastRuling.plan}`}
+            </Text>
+          )}
+        </Box>
+      )}
+      {court.orders.length === 0 && (
+        <Box marginTop={1}>
+          <Text dimColor wrap="wrap">
+            No orders yet. Claude proposes dispatches with the council's propose_orders tool; approved ones appear here as roads.
+          </Text>
+        </Box>
+      )}
+      {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road)))}
+      {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
+      {archived.length > 0 && (
+        <Box flexDirection="column" rowGap={1} marginTop={1}>
+          <Button
+            key="court-finished"
+            label={`${props.isFinishedShown ? '▾' : '▸'} Archived · ${archived.length}`}
+            plain
+            dimColor
+            onPress={props.onToggleFinished}
+          />
+          {props.isFinishedShown && archived.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder))}
+        </Box>
+      )}
+      <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1}>
+        <Button key="court-chamber" label="chamber" variant="primary" onPress={props.onChamber} />
+        <Button key="court-session" label={court.isInSession ? 'end court mode' : 'court mode'} variant="secondary" onPress={props.onToggleSession} />
+        {hasFinished && <Button key="court-clear" label="clear finished" variant="secondary" onPress={props.onClearFinished} />}
+      </Box>
+    </Box>
+  )
+}
