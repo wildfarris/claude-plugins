@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -80,7 +80,7 @@ function learningStandIn(on: On, files: Map<string, string>) {
         ? 'PROJECT: Security matters little in this LAN-only game.\nEVERYWHERE: Prefers Go.'
         : 'CONCERN: 2\nVERDICT: Fine.\nDETAIL: Ok.',
   })
-  on('process.run', ($, e) => (e.argv[0] === 'printenv' ? { value: { exitCode: 0, stdout: `${HOME}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : { deny: 'no' }))
+  mock.env(on, { HOME })
   on('fs.read', ($, e) => (files.has(e.path) ? { value: files.get(e.path)! } : { deny: 'no such file' }))
   on('fs.write', ($, e) => {
     files.set(e.path, e.text)

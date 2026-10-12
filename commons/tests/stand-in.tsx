@@ -1,6 +1,6 @@
 // Stands in for the engine beneath the plugin: the session, the clock, the UI
 // calls, the prompt box, and a small in-memory file system for the memory
-// folder (fs.read/write/list, `rm -rf` and `printenv HOME` through process.run).
+// folder (fs.read/write/list, and `rm -rf` through process.run), with HOME set.
 
 import { mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
@@ -25,6 +25,7 @@ export function standIn(on: On, options: { root: string; files?: Map<string, str
   const harness: Harness = { files: options.files ?? new Map(), toasts: [], filled: [], draft: { text: '' }, removed: [], opened: [], root: options.root }
   const { files } = harness
   mock.clock(on, { now: Date.UTC(2026, 9, 8, 12, 0, 0) })
+  mock.env(on, { HOME })
   on('session.root', () => ({ value: harness.root }))
   on('session.cwd', () => ({ value: harness.root }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -66,7 +67,6 @@ export function standIn(on: On, options: { root: string; files?: Map<string, str
   on('process.run', ($, e) => {
     const argv = [...e.argv]
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-    if (argv[0] === 'printenv' && argv[1] === 'HOME') return out(`${HOME}\n`)
     if (argv[0] === 'rm') {
       const target = argv[argv.length - 1]!
       harness.removed.push(target)

@@ -132,9 +132,8 @@ test('heads-up runs only when clicked: no call after a long answer, the note on 
 
 const HOME = '/home/me'
 const LEDGER = `${HOME}/.claude/sidekick/ledgers/session-1`
-// printenv, chmod and the git calls a brief makes, for one repo at ROOT/project.
+// chmod and the git calls a brief makes, for one repo at ROOT/project.
 const machine = (argv: readonly string[]) => {
-  if (argv[0] === 'printenv') return { exitCode: 0, stdout: `${HOME}\n` }
   if (argv[0] === 'chmod') return { exitCode: 0, stdout: '' }
   if (argv[0] !== 'git') return undefined
   if (argv.includes('rev-parse')) return { exitCode: 0, stdout: `${ROOT}/project\n` }
@@ -150,6 +149,7 @@ test('TL;DR of a working turn: figures, the claims check, the record on disk, an
     root: ROOT,
     files,
     run: machine,
+    env: { HOME },
     toolResult: () => (isFailing ? { result: 'failed', text: '1 failing', isError: true } : { result: 'ok', text: 'ok' }),
     complete: () => 'DONE: Fixed the parser.\nSTUCK: The tests still fail.\nNEEDS YOU: NONE\nPHASES:\n- +0:00 Edited the parser',
   })
@@ -189,6 +189,7 @@ test('/tldr full of a long session waits for a go-ahead, then condenses it part 
     root: ROOT,
     files,
     run: machine,
+    env: { HOME },
     complete: request => (request.prompt.startsWith('PART') ? '- worked on it' : 'DONE: A long night of steps.\nSTUCK: NONE\nNEEDS YOU: NONE\nPHASES:\n- +0:00 Steps'),
   })
   await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
@@ -370,6 +371,7 @@ test('handoff from the Cold cache card: the press returns at once, then HANDOFF.
     root: ROOT,
     files,
     run: machine,
+    env: { HOME },
     complete: () => 'DONE: Fixed the parser.\nSTUCK: NONE\nNEEDS YOU: Run the tests.\nPHASES:\n- +0:00 Edited the parser',
   })
   on('classic.SessionStart', () => ({}))
@@ -411,6 +413,7 @@ test('a brief whose part fails says why, and writes no handoff', async ($, on) =
     root: ROOT,
     files,
     run: machine,
+    env: { HOME },
     complete: request => (request.prompt.startsWith('PART') ? { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit' } : 'DONE: Steps.'),
   })
   await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
@@ -439,6 +442,7 @@ test('a handoff of a long session waits for the go-ahead, then writes HANDOFF.md
     root: ROOT,
     files,
     run: machine,
+    env: { HOME },
     complete: request => (request.prompt.startsWith('PART') ? '- worked on it' : 'DONE: A long night of steps.\nSTUCK: NONE\nNEEDS YOU: NONE\nPHASES:\n- +0:00 Steps'),
   })
   await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })

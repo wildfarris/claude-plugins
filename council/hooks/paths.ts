@@ -1,10 +1,12 @@
-// Paths on POSIX and Windows, for the checks that decide where an order's agent
-// may write and which folders the council names. Pure.
+// Paths on POSIX and Windows: where an agent may write, which folders a plugin
+// names, the home folder, and what a delete may remove. Pure.
 //
 // Plugins can't import from one another (each is installed into its own
-// folder), so this is a small local copy of sidekick's scope-guard approach:
-// every path is read into one canonical form before it is compared, and a path
-// that can't be read with certainty is refused, never let through.
+// folder), so this file is kept identical in sidekick, council and commons
+// (hooks/paths.ts): change all three together. It follows sidekick's
+// scope-guard approach: every path is read into one canonical form before it
+// is compared, and a path that can't be read with certainty is refused, never
+// let through.
 //
 // Canonical forms: POSIX `/a/b` (unchanged, `..` resolved); Windows `c:/a/b`
 // for a drive (any spelling: `C:\a\b`, `c:/a`, mixed separators, `\\?\C:\a`,
@@ -134,3 +136,16 @@ export function fromBashDrivePath(path: string): string {
   const mounted = /^\/(?:cygdrive\/|mnt\/)?([A-Za-z])(\/[\s\S]*)?$/.exec(path)
   return mounted ? `${mounted[1]!.toUpperCase()}:${mounted[2] ?? '/'}` : path
 }
+
+// The home folder from the environment ($.env.get): HOME, else USERPROFILE,
+// which is all native Windows sets. A Git Bash HOME (/c/Users/me), taken as
+// one only where USERPROFILE is set too, becomes C:/Users/me. undefined when
+// neither is set: callers say so rather than guess.
+export function homeFromEnvironment(home: string | undefined, profile: string | undefined): string | undefined {
+  const fromHome = home?.trim()
+  const fromProfile = profile?.trim()
+  if (fromHome) return fromProfile ? fromBashDrivePath(fromHome) : fromHome
+  return fromProfile || undefined
+}
+
+export const NO_HOME = 'could not find the home folder: neither HOME nor USERPROFILE is set'

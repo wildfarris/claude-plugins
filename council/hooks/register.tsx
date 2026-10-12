@@ -87,6 +87,7 @@ import {
   type Proposal,
   type RulingResult,
 } from './court'
+import { NO_HOME, homeFromEnvironment } from './paths'
 import { courtView } from './views/court'
 import { lessonsView } from './views/lessons'
 import {
@@ -600,10 +601,11 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
 
 let homeFolder: string | undefined
 
+// The home folder ('' when neither HOME nor USERPROFILE is set), read once.
 async function home($: EngineInterface): Promise<string> {
   if (homeFolder === undefined) {
-    const result = await $.process.run(['printenv', 'HOME'], { timeoutMs: 3000 }).catch(() => undefined)
-    homeFolder = result?.exitCode === 0 ? result.stdout.trim() : ''
+    const [fromHome, fromProfile] = await Promise.all([$.env.get('HOME').catch(() => undefined), $.env.get('USERPROFILE').catch(() => undefined)])
+    homeFolder = homeFromEnvironment(fromHome, fromProfile) ?? ''
   }
   return homeFolder
 }
@@ -645,7 +647,7 @@ async function readMemberFolder($: EngineInterface, folder: string, source: 'use
 // Everyone this project could seat, from the built-ins and both member folders.
 async function loadMembers($: EngineInterface): Promise<{ members: MemberDefinition[]; problems: string[]; root: string }> {
   const [root, homePath] = await Promise.all([$.session.root(), home($)])
-  const user = homePath === '' ? { members: [], problems: [] } : await readMemberFolder($, `${homePath}/.claude/council/members`, 'user', homePath, 0)
+  const user = homePath === '' ? { members: [], problems: [`Your own member files were not read: ${NO_HOME}.`] } : await readMemberFolder($, `${homePath}/.claude/council/members`, 'user', homePath, 0)
   const project = await readMemberFolder($, `${root}/.claude/council/members`, 'project', homePath, user.members.length)
   return { members: mergeMembers(user.members, project.members), problems: [...user.problems, ...project.problems], root }
 }
@@ -949,7 +951,7 @@ async function courtCommand($: EngineInterface, action: string): Promise<string>
 
 async function learningFiles($: EngineInterface) {
   const homePath = await home($)
-  if (homePath === '') throw new Error('could not find the home folder')
+  if (homePath === '') throw new Error(NO_HOME)
   const folder = `${homePath}/.claude/council/learning`
   return { lessons: `${folder}/lessons.json`, guidance: `${folder}/guidance.md`, proposal: `${folder}/proposed-guidance.md` }
 }

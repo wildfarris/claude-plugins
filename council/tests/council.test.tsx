@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -201,9 +201,9 @@ const COMMON_DIR = `${REPO}/.git`
 function repoStandIn(on: On, now: number) {
   const ran: Array<{ argv: string[]; cwd: string | undefined }> = []
   const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  mock.env(on, { HOME: '/home/me' })
   on('process.run', ($, e) => {
     const argv = [...e.argv]
-    if (argv[0] === 'printenv') return out('/home/me\n')
     ran.push({ argv, cwd: e.init?.cwd })
     const command = argv.slice(1).join(' ')
     if (command === 'rev-parse --show-toplevel') return out(`${REPO}\n`)
@@ -323,7 +323,7 @@ test('in a session over several repos, review names the repo by its folder', asy
 const HOME = '/home/me'
 
 function memberFiles(on: On, files: Record<string, string>) {
-  on('process.run', ($, e) => (e.argv[0] === 'printenv' ? { value: { exitCode: 0, stdout: `${HOME}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : { deny: 'no' }))
+  mock.env(on, { HOME })
   on('fs.list', ($, e) => {
     const prefix = `${e.path}/`
     const names = Object.keys(files).filter(path => path.startsWith(prefix) && !path.slice(prefix.length).includes('/'))

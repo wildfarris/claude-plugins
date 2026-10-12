@@ -38,6 +38,7 @@ import {
   withTopicSwitched,
   type ProjectSettings,
 } from './library'
+import { NO_HOME, homeFromEnvironment } from './paths'
 import { memoryFolder, readSettings, type CommonsSettings } from './settings'
 import { sidebarView } from './views/sidebar'
 
@@ -59,9 +60,9 @@ let refreshGeneration = 0
 
 async function folder($: EngineInterface): Promise<string> {
   if (folderCache !== undefined) return folderCache
-  const result = await $.process.run(['printenv', 'HOME'], { timeoutMs: 5000 }).catch(() => undefined)
-  const home = result?.exitCode === 0 ? result.stdout.trim() : ''
-  if (home === '' && !settings.memoryDir.startsWith('/')) throw new Error('could not find the home folder; set memoryDir to an absolute path')
+  const [fromHome, fromProfile] = await Promise.all([$.env.get('HOME').catch(() => undefined), $.env.get('USERPROFILE').catch(() => undefined)])
+  const home = homeFromEnvironment(fromHome, fromProfile) ?? ''
+  if (home === '' && (settings.memoryDir === '' || settings.memoryDir.startsWith('~'))) throw new Error(`${NO_HOME}; set memoryDir to an absolute path`)
   folderCache = memoryFolder(settings.memoryDir, home)
   return folderCache
 }

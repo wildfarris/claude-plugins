@@ -95,6 +95,7 @@ import { readSettings, type SidekickSettings } from './settings'
 import { planTrim, trimDecision, trimNotice } from './trim'
 import { breakdownRows, emptyReadout, withMeasurement } from './context-readout'
 import { councilGlimpse, orderFolderFor } from './council-glimpse'
+import { NO_HOME, homeFromEnvironment } from './paths'
 import { modelFailureText, stringList, textKey } from './values'
 import { barView } from './views/bar'
 import { barModel, type BarHandlers, type BarState } from './views/bar-model'
@@ -720,11 +721,19 @@ async function writeSessionHandoff($: EngineInterface, surface: RenderSurface): 
 
 // ── Scope guard ───────────────────────────────────────────────────────────
 
-// The home folder ('' when it can't be read), read once per process.
+// The home folder ('' when neither HOME nor USERPROFILE is set), read once
+// per process. Unknown, the ledger stays off and says why once.
 async function readHome($: EngineInterface): Promise<string> {
   if (homeFolder === undefined) {
-    const result = await $.process.run(['printenv', 'HOME'], { timeoutMs: 3000 }).catch(() => undefined)
-    homeFolder = result?.exitCode === 0 ? result.stdout.trim() : ''
+    const [fromHome, fromProfile] = await Promise.all([$.env.get('HOME').catch(() => undefined), $.env.get('USERPROFILE').catch(() => undefined)])
+    homeFolder = homeFromEnvironment(fromHome, fromProfile) ?? ''
+    if (homeFolder === '') {
+      try {
+        $.ui.log(`sidekick: ${NO_HOME}; the turn ledger (TL;DR, handoff) is off and the scope guard can't place ~ paths.`)
+      } catch {
+        // A log line is best effort.
+      }
+    }
   }
   return homeFolder
 }

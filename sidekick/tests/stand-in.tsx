@@ -46,11 +46,14 @@ export function baseStandIn(
     files?: Map<string, string>
     // Answers $.process.run; absent, every process fails.
     run?: (argv: readonly string[]) => { exitCode: number; stdout: string } | undefined
+    // Answers $.env.get (HOME, USERPROFILE); absent, every variable is unset.
+    env?: Record<string, string>
   },
 ): Harness {
   const clock = mock.clock(on, { now: 1_000_000 })
   const harness: Harness = { tools: [], prompts: [], filled: [], draft: { text: '' }, messages: [], toasts: [], completions: [], clock }
   mock.store(on, options.store)
+  mock.env(on, options.env ?? {})
   on('session.root', () => ({ value: options.root }))
   on('session.cwd', () => ({ value: options.cwd ?? options.root }))
   on('session.id', () => ({ value: 'session-1' }))
