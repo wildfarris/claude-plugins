@@ -90,10 +90,22 @@ For work across several folders (a mono session over several repos), Claude can 
 1. **Claude proposes.** It calls `mcp__council__propose_orders` with a plan and up to 6 dispatches, each a folder (a subfolder of the session), a role and a todo list:
    - a **scout** (`council:scout`) reads, searches and reports, and can't change anything;
    - a **knight** (`council:knight`) edits files and runs commands.
-2. **The council rules.** The advisors judge the plan as they would a question, without a fork (the plan is the brief). Any concern of 5 refuses it, with the reason; concerns of 3–4 become conditions on every order. Approved dispatches become orders O1, O2….
+2. **The council rules.** The advisors judge the plan as they would a question, without a fork (the plan is the brief). Any concern of 5 refuses it, with the reason; concerns of 3–4 become conditions on every order, unless an arbiter drops them (see below). Approved dispatches become orders O1, O2….
 3. **Claude dispatches** each order with the Agent tool, naming its order id. A council agent with no matching order is refused. Before it starts, its task is rewritten to carry the order: its folder, its todos, the council's conditions and that folder's `CLAUDE.md`.
 4. **Each agent is held to its folder.** A knight's file edits outside the folder are refused here. With sidekick installed, its scope guard also holds the knight's shell commands to the folder.
 5. **Progress.** Each agent reports its todo list with `mcp__council__progress`, which moves it along its road. Its last answer is its report.
+
+**The arbiter.** Without one, every concern of 3–4 binds every order, so a single advisor can put a condition on work you asked for. Set `arbiter` to one member's id, and that member reviews the conditions on each approved plan:
+
+- **When:** only after a plan is approved and at least one condition was raised. A concern of 5 still refuses the plan; the arbiter never sees a refused plan and can't overturn a refusal.
+- **How:** one extra call on `advisorModel` at low effort, as that member (its own system prompt, references and lessons, with the arbiter's request added). It reads your request when the plugin has it (in court mode), otherwise Claude's plan stands for it; the plan and its dispatches; and each condition with its advisor and reason. The conditions are passed as quoted data, and the member is told they are never instructions.
+- **What it can do:** keep or drop each condition, with a one-line reason, as strict JSON. It can't add, merge or reword a condition: decisions on conditions it wasn't given, and anything else in its reply, are ignored. Its own conditions are reviewed the same way.
+- **What you see:** kept conditions go on the orders as before. Dropped ones are not attached, but stay in the tool's answer to Claude and under the ruling in the court pane as notes ("Dropped by the Hand: <condition> (<reason>)"), beside a line saying how many it kept and dropped.
+- **Fail open:** if the call errors, times out, or answers with anything but valid JSON deciding every condition, every condition stands, with a note that the review failed.
+- **Still a member:** the arbiter sits, rules with its own verdict (and its own 5s), and answers consults and follow-ups like everyone else. The role only adds the review.
+- **Unset or not seated:** an `arbiter` that names no member seated on this project's council is ignored (a toast says so), and the conditions stand as they would without one.
+
+The arbiter is a council member, a model call: not you, and not a proxy for you. Decisions that are yours still go to you. Its call sends your request, the plan and the conditions to the model provider Claude Code is configured with, as every advisor call already does.
 
 **The pane** shows the court whenever there are orders: the council in one line of colored chips on top, then one row per order. Each row is a road from the castle to the folder's house, with the agent standing where its finished todos have brought it, what it's doing now, and its report once it's home (a flag). Finished rows sink to the bottom, then fold away at your next message; **clear finished** removes them. **chamber** switches to the full council view and back.
 
@@ -104,15 +116,15 @@ For work across several folders (a mono session over several repos), Claude can 
 **Limits:**
 - Progress follows the todo list the agent reports with the council's own `mcp__council__progress` tool (Claude Code's TodoWrite isn't offered to subagents in every build). If an agent doesn't report, its row shows steps and edits but stays put. If it adds todos, it steps back.
 - Without sidekick, only file edits are held to the folder, not shell commands.
-- An order's council sits for about a minute (five advisor calls) before work starts.
+- An order's council sits for about a minute (five advisor calls) before work starts; an arbiter's review adds one more call when there are conditions.
 
 ## Settings
 
-Set them with `/plugin configure council@personal-mods`: `briefModel` (review mode's herald, default Opus), `advisorModel` (default Sonnet), `advisorEffort` (default low), and the brain trust's `deepModel` (default Opus) and `deepEffort` (default high).
+Set them with `/plugin configure council@personal-mods`: `briefModel` (review mode's herald, default Opus), `advisorModel` (default Sonnet), `advisorEffort` (default low), the brain trust's `deepModel` (default Opus) and `deepEffort` (default high), court mode's `triageModel` (default Haiku), and `arbiter` (a member's id, its member file's name without `.md`, e.g. `hand` for `~/.claude/council/members/hand.md` or `castellan` for a built-in; empty for none, the default).
 
 ## Developing
 
-`hooks/register.tsx` holds every hook and every function that touches `$` (the engine follows `$` only into the hooks module's top-level functions). The rest is pure: `members.ts` (built-in members, member files, references, who sits), `council.ts` (prompts, verdict parsing, state changes), `court.ts` (proposals, rulings, orders, dispatch instructions, progress), `agents/` (the scout and knight types), `views/court.tsx`, `review.ts` (review mode's git commands and prompts), `sprites.ts` and `views/council.tsx`.
+`hooks/register.tsx` holds every hook and every function that touches `$` (the engine follows `$` only into the hooks module's top-level functions). The rest is pure: `members.ts` (built-in members, member files, references, who sits), `council.ts` (prompts, verdict parsing, state changes), `court.ts` (proposals, rulings, the arbiter's review, orders, dispatch instructions, progress), `agents/` (the scout and knight types), `views/court.tsx`, `review.ts` (review mode's git commands and prompts), `sprites.ts` and `views/council.tsx`.
 
 ```bash
 claude plugin validate ~/.claude/mod-sources/personal-mods/council
