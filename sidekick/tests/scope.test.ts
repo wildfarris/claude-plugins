@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { analyzeCommand, checkFileEdit, denialMessage, describeScope, parseClassifierAnswer, resolvePath, scopeFolderCandidate, topLevelFolder, type ScopeContext } from '../hooks/scope-guard'
-import { RULE_MARKER, builtInEntries, exclusiveConflict, parseRule, ruleKey, ruleSpec, syncRules } from '../hooks/scope-rules'
+import { RULE_MARKER, builtInEntries, exclusiveConflict, parseRule, parseSettingsText, ruleKey, ruleSpec, syncRules } from '../hooks/scope-rules'
 
 const ROOT = '/dev/work'
 const AT_ROOT = { root: ROOT, cwd: ROOT, folders: [`${ROOT}/project`] }
@@ -442,5 +442,13 @@ describe('Windows paths', () => {
     expect(resolvePath('/dev/work/project', 'C:\\x')).toBe('/dev/work/project/C:\\x')
     expect(checkFileEdit('/dev/work/project/a\\..\\..\\other', AT_ROOT).kind).toBe('allow')
     expect(checkFileEdit('/dev/work/project/C:\\x', AT_ROOT).kind).toBe('allow')
+  })
+})
+
+describe('settings files', () => {
+  test('a byte-order mark from a Windows editor is not a malformed settings file', () => {
+    expect(parseSettingsText('\uFEFF{"permissions":{"deny":["Edit(x)"]}}')).toEqual({ permissions: { deny: ['Edit(x)'] } })
+    expect(parseSettingsText('\uFEFF')).toEqual({})
+    expect(() => parseSettingsText('\uFEFF{oops')).toThrow()
   })
 })

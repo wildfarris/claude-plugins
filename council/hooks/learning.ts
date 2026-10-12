@@ -66,7 +66,8 @@ export function lessonFromReconsider(council: Council, project: string, at: stri
 export function parseLessons(text: string | undefined): Lesson[] {
   if (text === undefined || text.trim() === '') return []
   try {
-    const data = JSON.parse(text) as unknown
+    // A leading byte-order mark (Windows editors write one) is not JSON.
+    const data = JSON.parse(text.replace(/^﻿/, '')) as unknown
     if (!Array.isArray(data)) return []
     return data.flatMap(raw => {
       const entry = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
@@ -94,7 +95,7 @@ export const formatLessons = (lessons: readonly Lesson[]) => `${JSON.stringify(l
 export function parseGuidance(text: string | undefined): Guidance {
   const guidance: Guidance = []
   let current: Guidance[number] | undefined
-  for (const line of (text ?? '').split('\n')) {
+  for (const line of (text ?? '').replace(/^﻿/, '').split('\n')) {
     const heading = /^##\s+(.+?)\s*$/.exec(line)
     if (heading) {
       current = { scope: heading[1]!, items: [] }

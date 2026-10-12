@@ -45,7 +45,7 @@ function hashText(text: string): string {
   return hash.toString(16).padStart(8, '0')
 }
 
-export const projectName = (projectPath: string) => projectPath.split('/').filter(Boolean).pop() ?? projectPath
+export const projectName = (projectPath: string) => projectPath.split(/[\\/]/).filter(Boolean).pop() ?? projectPath
 
 // A topic's id: its name, lowercased, letters and digits joined by dashes.
 export function slugify(name: string): string {
@@ -55,7 +55,8 @@ export function slugify(name: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 40)
     .replace(/-+$/, '')
-  return slug === '' ? 'topic' : slug
+  // A name Windows reserves for a device can't be a folder there.
+  return slug === '' ? 'topic' : /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(slug) ? `${slug}-topic` : slug
 }
 
 export const isSafeId = (id: string) => /^[a-z0-9][a-z0-9-]*$/.test(id) && id.length <= 80
@@ -77,9 +78,13 @@ export function nextTopicId(name: string, isTaken: (id: string) => boolean): str
 
 const isString = (value: unknown): value is string => typeof value === 'string'
 
+// A leading byte-order mark (Windows editors write one) is not JSON: dropped
+// before every file is parsed.
+const withoutBom = (text: string) => text.replace(/^﻿/, '')
+
 export function parseTopic(id: string, text: string): Topic | undefined {
   try {
-    const data = JSON.parse(text) as Record<string, unknown>
+    const data = JSON.parse(withoutBom(text)) as Record<string, unknown>
     if (!isString(data.name)) return undefined
     return {
       id,
@@ -108,7 +113,8 @@ export function formatMemory(memory: Omit<Memory, 'id'>): string {
   return `<!-- commons ${JSON.stringify({ project: memory.project, savedAt: memory.savedAt })} -->\n${memory.text.trim()}\n`
 }
 
-export function parseMemory(id: string, text: string): Memory | undefined {
+export function parseMemory(id: string, raw: string): Memory | undefined {
+  const text = withoutBom(raw)
   const header = HEADER.exec(text)
   let meta: Record<string, unknown> = {}
   if (header) {
@@ -126,7 +132,7 @@ export function parseMemory(id: string, text: string): Memory | undefined {
 export function parseProjectSettings(projectPath: string, text: string | undefined): ProjectSettings {
   if (text === undefined) return emptyProjectSettings(projectPath)
   try {
-    const data = JSON.parse(text) as Record<string, unknown>
+    const data = JSON.parse(withoutBom(text)) as Record<string, unknown>
     // Another project's file (a legacy key collision): not ours.
     if (isString(data.path) && data.path !== projectPath) return emptyProjectSettings(projectPath)
     const ids = (value: unknown) => (Array.isArray(value) ? value.filter(isString) : [])

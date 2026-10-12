@@ -13,6 +13,7 @@ import {
   parseProjectSettings,
   parseTopic,
   projectKey,
+  projectName,
   readRememberInput,
   recallText,
   slugify,
@@ -135,5 +136,44 @@ describe('audit fixes', () => {
   test('memoryDir must be absolute and plain', () => {
     expect(() => memoryFolder('commons', '/home/me')).toThrow('absolute')
     expect(() => memoryFolder('/srv/../etc', '/home/me')).toThrow('..')
+  })
+})
+
+describe('Windows', () => {
+  test('the memory folder takes drive, UNC and ~\\ paths, in their own spelling', () => {
+    expect(memoryFolder('', 'C:\\Users\\me')).toBe('C:\\Users\\me\\.claude\\commons')
+    expect(memoryFolder('', 'C:/Users/me')).toBe('C:\\Users\\me\\.claude\\commons')
+    expect(memoryFolder('~\\notes\\commons\\', 'C:\\Users\\me')).toBe('C:\\Users\\me\\notes\\commons')
+    expect(memoryFolder('~/notes', 'C:\\Users\\me')).toBe('C:\\Users\\me\\notes')
+    expect(memoryFolder('D:\\shared\\commons', '')).toBe('D:\\shared\\commons')
+    expect(memoryFolder('d:/shared//commons/', 'C:\\Users\\me')).toBe('D:\\shared\\commons')
+    expect(memoryFolder('\\\\nas\\team\\commons', 'C:\\Users\\me')).toBe('\\\\nas\\team\\commons')
+    for (const setting of ['commons', 'D:commons', '\\commons', 'C:\\shared\\..\\Windows', 'C:\\shared\\.\\commons', '~\\..\\x']) {
+      expect(() => memoryFolder(setting, 'C:\\Users\\me')).toThrow()
+    }
+    // On POSIX ~\ is not a home path, and backslashes are ordinary characters.
+    expect(() => memoryFolder('~\\notes', '/home/me')).toThrow('absolute')
+    expect(memoryFolder('/srv/a\\b', '/home/me')).toBe('/srv/a\\b')
+  })
+
+  test('files a Windows editor saved with a byte-order mark still read', () => {
+    const bom = '\uFEFF'
+    expect(parseTopic('t', `${bom}{"name":"T","status":"active","isGlobal":false,"createdBy":"/p","createdAt":"x"}`)?.name).toBe('T')
+    expect(parseProjectSettings('/p', `${bom}{"path":"/p","on":["t"],"off":[]}`).on).toEqual(['t'])
+    expect(parseMemory('m', `${bom}<!-- commons {"project":"/p","savedAt":"x"} -->\nA note.\n`)).toMatchObject({ text: 'A note.', project: '/p' })
+  })
+
+  test('topic ids never take a name Windows reserves for a device', () => {
+    expect(slugify('CON')).toBe('con-topic')
+    expect(slugify('nul')).toBe('nul-topic')
+    expect(slugify('Com1')).toBe('com1-topic')
+    expect(slugify('LPT9')).toBe('lpt9-topic')
+    expect(slugify('Console')).toBe('console')
+    expect(slugify('com10')).toBe('com10')
+  })
+
+  test('a project is named by its last folder, whichever separator', () => {
+    expect(projectName('C:\\claude\\workspace\\web')).toBe('web')
+    expect(projectName('/dev/web/')).toBe('web')
   })
 })

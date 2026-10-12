@@ -127,7 +127,8 @@ export type ParsedMember = { member: MemberDefinition } | { problem: string }
 export function parseMemberFile(fileName: string, text: string, source: 'user' | 'project', base: MemberDefinition | undefined, spareIndex: number): ParsedMember {
   const id = memberId(fileName)
   if (id === '') return { problem: `${fileName}: the file name gives no id` }
-  const match = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/.exec(text.replace(/\r\n/g, '\n'))
+  // A leading byte-order mark (Windows editors write one) would hide the header.
+  const match = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/.exec(text.replace(/^﻿/, '').replace(/\r\n/g, '\n'))
   const header = match ? parseHeader(match[1]!.split('\n')) : {}
   const remit = (match ? match[2]! : text).trim().replace(/\s+/g, ' ')
   const field = (key: string) => (typeof header[key] === 'string' ? (header[key] as string).trim() : undefined)

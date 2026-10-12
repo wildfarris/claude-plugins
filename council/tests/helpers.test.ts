@@ -6,6 +6,7 @@ import { readSettings } from '../hooks/settings'
 import { CYCLE_TICKS, RASTER_COLUMNS, RASTER_ROWS, SPRITE_WIDTH, animatedSvg, bodyRows, rasterCells, spriteFrame, toBase64 } from '../hooks/sprites'
 import { arbiterPrompt, arbiterSeat, needsArbiter, namesWholeCouncil, parseArbiterReply, parseTriage, ruling, withArbiterReview, type ProposedCondition } from '../hooks/court'
 import { BUILT_IN_MEMBERS, BUILT_IN_SEATS, mergeMembers, parseMemberFile, resolveReference, seatedMembers, trimReferences } from '../hooks/members'
+import { parseGuidance, parseLessons } from '../hooks/learning'
 
 const ADVISORS = BUILT_IN_SEATS
 const seat = (id: string) => BUILT_IN_SEATS.find(entry => entry.id === id)!
@@ -352,5 +353,14 @@ describe('arbiter', () => {
     const failed = withArbiterReview(result, hand, { failure: 'no answer' })
     expect(failed.conditions).toEqual(result.conditions)
     expect(failed.notes).toEqual(["The Hand's review of the conditions failed (no answer); every condition stands."])
+  })
+})
+
+describe('files from Windows editors', () => {
+  test('a byte-order mark hides neither the lessons, the guidance nor a member file\'s header', () => {
+    const lesson = { id: 'l1', project: '/p', at: '2026-10-01', topic: null, added: 'Prefer Go.', moves: [] }
+    expect(parseLessons(`\uFEFF${JSON.stringify([lesson])}`)).toEqual([lesson])
+    expect(parseGuidance('\uFEFF## Everywhere\n- Prefers Go.\n')).toEqual([{ scope: 'Everywhere', items: ['Prefers Go.'] }])
+    expect(parseMemberFile('auditor.md', '\uFEFF---\r\ntitle: The Auditor\r\n---\r\ncompliance', 'user', undefined, 0)).toMatchObject({ member: { title: 'The Auditor', remit: 'compliance' } })
   })
 })

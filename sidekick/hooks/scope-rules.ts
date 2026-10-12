@@ -118,9 +118,11 @@ export function syncRules(settings: SettingsObject, previousDeny: readonly strin
   return next
 }
 
+// A leading byte-order mark (Windows editors write one) is not JSON: dropped.
 export function parseSettingsText(text: string | undefined): SettingsObject {
-  if (text === undefined || text.trim() === '') return {}
-  return objectOf(JSON.parse(text) as unknown)
+  const json = text?.replace(/^﻿/, '')
+  if (json === undefined || json.trim() === '') return {}
+  return objectOf(JSON.parse(json) as unknown)
 }
 
 // The exclusive partner a scope change would collide with, if any.
