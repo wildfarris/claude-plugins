@@ -19,8 +19,43 @@ export type GuardVerdict =
   | { kind: 'unclear'; reason: string }
 
 // ── Paths ──────────────────────────────────────────────────────────────────
+//
+// Two styles, picked by the session root: POSIX, and Windows (drive letters,
+// backslashes, UNC). Every path the guard compares (a file edit, a command's
+// paths, and the root, cwd, home and scope folders themselves) is first put in
+// one canonical form: POSIX paths as they always were; Windows paths as
+// `c:/a/b` (forward slashes, the drive letter lowercased) or `//server/share/a`.
+//
+// On Windows the root's own folders compare case-insensitively, as NTFS does,
+// so a path spelled in another case is still policed. The folders below the
+// root, which decide what a scope covers, compare exactly: another case is
+// blocked rather than let through.
 
-export function normalizePath(path: string): string {
+export type PathStyle = 'posix' | 'windows'
+
+// A path the guard cannot place, though it could be inside the root: a UNC or
+// device path beside a drive-letter root (\\localhost\c$ reaches the root), a
+// drive-relative path on the root's drive, a short (8.3) name or wildcard
+// where the root's own folders are, a name Windows would trim (trailing dot or
+// space) or a stream (`name:stream`). It counts as out of scope: blocked.
+export const UNPLACEABLE = '(a path the guard cannot place)'
+
+export const pathStyleOf = (root: string): PathStyle => (/^[A-Za-z]:([\\/]|$)/.test(root) || root.startsWith('\\\\') ? 'windows' : 'posix')
+
+// A canonical absolute path: '' (POSIX), 'c:' (a drive) or '//server/share'.
+type Parsed = { prefix: string; segments: string[] }
+
+type Placing = {
+  style: PathStyle
+  // The canonical root, for the Windows checks that need it (absent: skipped).
+  root?: Parsed
+  // The canonical home folder, for `~`.
+  home?: string
+  // A file tool's path: `$` is literal, and `/c/…` could be read either way.
+  isFileTool?: boolean
+}
+
+function normalizePosix(path: string): string {
   const isAbsolute = path.startsWith('/')
   const parts: string[] = []
   for (const part of path.split('/')) {
@@ -36,48 +71,253 @@ export function normalizePath(path: string): string {
   return isAbsolute ? `/${joined}` : joined || '.'
 }
 
-// `$VAR` paths, `~user` paths, `~` without a known home, and relative paths
-// from an unknown directory can't be resolved here: undefined.
-export function resolvePath(base: string | undefined, path: string, home?: string): string | undefined {
-  if (path.includes('$')) return undefined
-  if (path === '~' || path.startsWith('~/')) return home === undefined ? undefined : normalizePath(`${home}${path.slice(1)}`)
-  if (path.startsWith('~')) return undefined
-  if (path.startsWith('/')) return normalizePath(path)
-  return base === undefined ? undefined : normalizePath(`${base}/${path}`)
+// POSIX unless told otherwise (scope-rules relies on that).
+export function normalizePath(path: string, style: PathStyle = 'posix'): string {
+  return style === 'posix' ? normalizePosix(path) : (placeAll(undefined, path, { style, isFileTool: true })[0] ?? path)
 }
 
-export const isInside = (path: string, folder: string) => path === folder || path.startsWith(folder.endsWith('/') ? folder : `${folder}/`)
+const formatPath = ({ prefix, segments }: Parsed) => (prefix.startsWith('//') ? [prefix, ...segments].join('/') : `${prefix}/${segments.join('/')}`)
+
+// A canonical path back into its parts; undefined for anything else.
+function parseCanonical(path: string): Parsed | undefined {
+  if (path.startsWith('//')) {
+    const [server, share, ...segments] = path.slice(2).split('/')
+    return server && share ? { prefix: `//${server}/${share}`, segments: segments.filter(Boolean) } : undefined
+  }
+  if (/^[a-z]:\//.test(path)) return { prefix: path.slice(0, 2), segments: path.slice(3).split('/').filter(Boolean) }
+  if (path.startsWith('/')) return { prefix: '', segments: path.split('/').filter(Boolean) }
+  return undefined
+}
+
+const sameName = (a: string, b: string, isCaseless: boolean) =>
+  a === b || (isCaseless && (a.toLowerCase() === b.toLowerCase() || a.toUpperCase() === b.toUpperCase()))
+
+// The segments of a canonical path below a canonical folder, or undefined when
+// it isn't inside it. Windows names compare case-insensitively.
+function segmentsBelow(path: string, folder: string): string[] | undefined {
+  const inner = parseCanonical(path)
+  const outer = parseCanonical(folder)
+  if (!inner || !outer) return undefined
+  const isCaseless = outer.prefix !== ''
+  if (!sameName(inner.prefix, outer.prefix, isCaseless) || inner.segments.length < outer.segments.length) return undefined
+  if (!outer.segments.every((segment, index) => sameName(inner.segments[index]!, segment, isCaseless))) return undefined
+  return inner.segments.slice(outer.segments.length)
+}
+
+// Win32 path forms, backslashes already turned to slashes: \\?\ and \\.\
+// device forms, drive-absolute paths and UNC. undefined: none of those.
+function parseWindowsAbsolute(text: string): { prefix: string; parts: string[] } | typeof UNPLACEABLE | undefined {
+  let rest = text
+  const device = /^(?:\/\/[?.]\/|\/\?\?\/)([\s\S]*)$/.exec(text)
+  if (device) {
+    const inner = device[1]!
+    const drive = /^([A-Za-z]):(?:\/([\s\S]*))?$/.exec(inner)
+    if (drive) return { prefix: `${drive[1]!.toLowerCase()}:`, parts: (drive[2] ?? '').split('/') }
+    // \\?\UNC\server\share; anything else (pipes, volumes, GLOBALROOT) can't be placed.
+    if (!/^unc\//i.test(inner)) return UNPLACEABLE
+    rest = `//${inner.slice(4)}`
+  }
+  const drive = /^([A-Za-z]):\/([\s\S]*)$/.exec(rest)
+  if (drive) return { prefix: `${drive[1]!.toLowerCase()}:`, parts: drive[2]!.split('/') }
+  if (rest.startsWith('//')) {
+    const [server, share, ...parts] = rest.slice(2).split('/')
+    return server && share ? { prefix: `//${server}/${share}`, parts } : UNPLACEABLE
+  }
+  return undefined
+}
+
+const isDriveRoot = (root: Parsed | undefined) => root !== undefined && !root.prefix.startsWith('//')
+
+// A short (8.3) name, a wildcard or a brace where the root's own folders are
+// could stand for one of them.
+function aliasesRoot(path: Parsed, root: Parsed): boolean {
+  if (!sameName(path.prefix, root.prefix, true)) return false
+  for (let index = 0; index < Math.min(path.segments.length, root.segments.length); index++) {
+    const segment = path.segments[index]!
+    if (/~\d|[*?[{]/.test(segment)) return true
+    if (!sameName(segment, root.segments[index]!, true)) return false
+  }
+  return false
+}
+
+// Resolves `..` and `.` (never above the drive or share) and checks what
+// Windows would read differently from the guard.
+function finishWindows(raw: { prefix: string; parts: string[] }, placing: Placing): string {
+  if (raw.prefix.startsWith('//') && isDriveRoot(placing.root)) return UNPLACEABLE
+  const segments: string[] = []
+  for (const part of raw.parts) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      segments.pop()
+      continue
+    }
+    // Windows trims trailing dots and spaces; `name:stream` is a stream on name.
+    if (/[. ]$/.test(part) || part.includes(':')) return UNPLACEABLE
+    segments.push(part)
+  }
+  const parsed = { prefix: raw.prefix, segments }
+  return placing.root && aliasesRoot(parsed, placing.root) ? UNPLACEABLE : formatPath(parsed)
+}
+
+function placePosix(base: string | undefined, path: string, placing: Placing): string | undefined {
+  if (!placing.isFileTool && path.includes('$')) return undefined
+  if (path === '~' || path.startsWith('~/')) return placing.home === undefined ? undefined : normalizePosix(`${placing.home}${path.slice(1)}`)
+  if (path.startsWith('~')) return undefined
+  if (path.startsWith('/')) return normalizePosix(path)
+  if (base === UNPLACEABLE) return UNPLACEABLE
+  return base === undefined ? undefined : normalizePosix(`${base}/${path}`)
+}
+
+function placeWindows(base: string | undefined, path: string, placing: Placing): (string | undefined)[] {
+  const text = path.replace(/\\/g, '/')
+  const absolute = parseWindowsAbsolute(text)
+  // Whatever a variable in it holds, a UNC or device path stays one.
+  if (absolute === UNPLACEABLE || (absolute !== undefined && absolute.prefix.startsWith('//') && isDriveRoot(placing.root))) return [UNPLACEABLE]
+  if (!placing.isFileTool && text.includes('$')) return [undefined]
+  if (absolute !== undefined) return [finishWindows(absolute, placing)]
+  if (text === '~' || text.startsWith('~/')) return placing.home === undefined ? [undefined] : placeWindows(undefined, `${placing.home}${text.slice(1)}`, placing)
+  if (text.startsWith('~')) return [undefined]
+  const baseParsed = base === undefined || base === UNPLACEABLE ? undefined : parseCanonical(base)
+
+  // C:foo: relative to the folder the drive is in, known only for the base's drive.
+  const driveRelative = /^([A-Za-z]):([\s\S]*)$/.exec(text)
+  if (driveRelative) {
+    const drive = `${driveRelative[1]!.toLowerCase()}:`
+    if (baseParsed?.prefix === drive) return placeWindows(base, driveRelative[2]!, placing)
+    if (placing.root === undefined || placing.root.prefix === drive) return [UNPLACEABLE]
+    return [finishWindows({ prefix: drive, parts: driveRelative[2]!.split('/') }, placing)]
+  }
+
+  if (text.startsWith('/')) {
+    // \foo or /foo: the current drive's root to Windows; Git Bash's own
+    // folders (/tmp, /usr) are outside any root, so the drive reading is the
+    // stricter stand-in for them.
+    const current = baseParsed?.prefix ?? placing.root?.prefix
+    const onCurrentDrive = current === undefined ? undefined : finishWindows({ prefix: current, parts: text.split('/') }, placing)
+    // /c/…, /cygdrive/c/…, /mnt/c/…: drive C in Git Bash, Cygwin and WSL.
+    const mounted = /^\/(?:cygdrive\/|mnt\/)?([A-Za-z])(?=\/|$)([\s\S]*)$/.exec(text)
+    if (!mounted) return [onCurrentDrive]
+    const onMountedDrive = finishWindows({ prefix: `${mounted[1]!.toLowerCase()}:`, parts: mounted[2]!.split('/') }, placing)
+    // A file tool might read /c/x either way: both are checked.
+    return placing.isFileTool ? [onMountedDrive, onCurrentDrive] : [onMountedDrive]
+  }
+
+  if (base === UNPLACEABLE) return [UNPLACEABLE]
+  if (baseParsed === undefined) return [undefined]
+  return [finishWindows({ prefix: baseParsed.prefix, parts: [...baseParsed.segments, ...text.split('/')] }, placing)]
+}
+
+// Every reading of a path: canonical paths, UNPLACEABLE, or undefined for one
+// that can't be resolved (`$VAR` in a command, `~user`, `~` without a known
+// home, a relative path from an unknown directory). Only a file tool's
+// `/c/…` on Windows has two readings.
+function placeAll(base: string | undefined, path: string, placing: Placing): (string | undefined)[] {
+  return placing.style === 'posix' ? [placePosix(base, path, placing)] : placeWindows(base, path, placing)
+}
+
+// A command's path, as the shell reads it. The style follows the base (or the
+// path itself, when it's absolute).
+export function resolvePath(base: string | undefined, path: string, home?: string): string | undefined {
+  const style = pathStyleOf(base ?? path)
+  const canonicalBase = base === undefined || style === 'posix' ? base : placeAll(undefined, base, { style })[0]
+  return placeAll(canonicalBase, path, { style, ...(home === undefined ? {} : { home }) })[0]
+}
+
+// A canonical absolute path for display and comparison, or undefined.
+function canonicalAbsolute(path: string, style: PathStyle): string | undefined {
+  const placed = placeAll(undefined, path, { style, isFileTool: true })[0]
+  return placed === UNPLACEABLE ? undefined : placed
+}
+
+// The guard's context with every path in canonical form. A scope folder the
+// guard can't place covers nothing but still keeps the guard on.
+type Placed = { style: PathStyle; root: string; rootParsed: Parsed; cwd?: string; home?: string; folders: string[] }
+
+function placeContext(context: Pick<ScopeContext, 'root' | 'folders'> & Partial<Pick<ScopeContext, 'cwd' | 'home'>>): Placed {
+  const style = pathStyleOf(context.root)
+  const root = style === 'posix' ? normalizePosix(context.root) : placeAll(undefined, context.root, { style, isFileTool: true })[0]
+  const rootParsed = root === undefined ? undefined : parseCanonical(root)
+  // Fails closed: the caller blocks the call when the guard throws.
+  if (root === undefined || rootParsed === undefined) throw new Error(`the session root ${context.root} cannot be placed`)
+  // These paths are literal (no `$` expansion); of /c/… the drive reading is taken.
+  const bare: Placing = { style, root: rootParsed, isFileTool: true }
+  const homePlaced = context.home ? placeAll(undefined, context.home, bare)[0] : undefined
+  const home = homePlaced === UNPLACEABLE ? undefined : homePlaced
+  const placing: Placing = home === undefined ? bare : { ...bare, home }
+  const cwdPlaced = context.cwd === undefined ? undefined : placeAll(root, context.cwd, placing)[0]
+  const cwd = cwdPlaced === UNPLACEABLE ? undefined : cwdPlaced
+  const folders = context.folders.map(folder => placeAll(root, folder, placing)[0] ?? UNPLACEABLE)
+  return { style, root, rootParsed, folders, ...(cwd === undefined ? {} : { cwd }), ...(home === undefined ? {} : { home }) }
+}
+
+const placingOf = (placed: Placed, isFileTool = false): Placing => ({
+  style: placed.style,
+  root: placed.rootParsed,
+  ...(placed.home === undefined ? {} : { home: placed.home }),
+  ...(isFileTool ? { isFileTool } : {}),
+})
+
+// Both canonical. On Windows, case-insensitive.
+export const isInside = (path: string, folder: string) => segmentsBelow(path, folder) !== undefined
 
 export function relativeTo(root: string, path: string): string {
-  if (path === root) return '.'
-  return isInside(path, root) ? path.slice(root.length + 1) : path
+  const style = pathStyleOf(root)
+  const canonicalRoot = canonicalAbsolute(root, style)
+  const canonicalPath = canonicalAbsolute(path, style)
+  const below = canonicalRoot === undefined || canonicalPath === undefined ? undefined : segmentsBelow(canonicalPath, canonicalRoot)
+  return below === undefined ? path : below.length === 0 ? '.' : below.join('/')
 }
 
 // The root itself as a scope folder covers only the root's own files (and
-// commands run at the root), never the folders under it.
-const covers = (folder: string, path: string, root: string) =>
-  folder === root ? path === root || topLevelFolder(root, path) === root : isInside(path, folder)
+// commands run at the root), never the folders under it. Below the root, a
+// folder covers a path only when its names match exactly.
+function covers(folder: string, path: string, below: readonly string[], root: string): boolean {
+  if (folder === UNPLACEABLE) return false
+  const folderBelow = segmentsBelow(folder, root)
+  if (folderBelow === undefined) return isInside(path, folder)
+  if (folderBelow.length === 0) return below.length <= 1
+  return folderBelow.length <= below.length && folderBelow.every((segment, index) => segment === below[index])
+}
+
+function outOfScope(path: string, placed: Placed): boolean {
+  if (placed.folders.length === 0) return false
+  if (path === UNPLACEABLE) return true
+  const below = segmentsBelow(path, placed.root)
+  if (below === undefined) return false
+  return !placed.folders.some(folder => covers(folder, path, below, placed.root))
+}
 
 // Inside the root, outside every scope folder: the one case the guard stops.
 export function isOutOfScope(path: string, context: Pick<ScopeContext, 'root' | 'folders'>): boolean {
   if (context.folders.length === 0) return false
-  if (!isInside(path, context.root)) return false
-  return !context.folders.some(folder => covers(folder, path, context.root))
+  const placed = placeContext(context)
+  return outOfScope(path === UNPLACEABLE ? path : (canonicalAbsolute(path, placed.style) ?? UNPLACEABLE), placed)
 }
 
 // The scope folder that would hold a path: the top-level folder under the root
 // it sits in, or the root itself for the root's own files.
 export function topLevelFolder(root: string, path: string): string | undefined {
-  const resolved = normalizePath(path)
-  if (!isInside(resolved, root) || resolved === root) return undefined
-  const [topLevel, ...rest] = relativeTo(root, resolved).split('/')
-  return topLevel && rest.length > 0 ? `${root}/${topLevel}` : root
+  const style = pathStyleOf(root)
+  const canonicalRoot = canonicalAbsolute(root, style)
+  const canonicalPath = canonicalAbsolute(path, style)
+  const below = canonicalRoot === undefined || canonicalPath === undefined ? undefined : segmentsBelow(canonicalPath, canonicalRoot)
+  if (below === undefined || below.length === 0) return undefined
+  if (below.length === 1) return canonicalRoot
+  const parsedRoot = parseCanonical(canonicalRoot!)!
+  return formatPath({ prefix: parsedRoot.prefix, segments: [...parsedRoot.segments, below[0]!] })
 }
 
+// A file tool's path is literal (no `$` expansion). Every reading of it must
+// be in scope; one the guard can't place or resolve is blocked.
 export function checkFileEdit(filePath: string, context: ScopeContext): GuardVerdict {
-  const resolved = resolvePath(context.cwd, filePath)
-  if (resolved === undefined || !isOutOfScope(resolved, context)) return { kind: 'allow' }
-  return { kind: 'block', target: resolved, reason: 'edits a file outside the target folder' }
+  if (context.folders.length === 0) return { kind: 'allow' }
+  const placed = placeContext(context)
+  const readings = placeAll(placed.cwd, filePath, placingOf(placed, true))
+  if (readings.some(reading => reading === undefined || reading === UNPLACEABLE)) {
+    return { kind: 'block', target: UNPLACEABLE, reason: `edits a path the guard cannot place inside or outside the root (${filePath})` }
+  }
+  const offending = readings.find(reading => outOfScope(reading!, placed))
+  return offending === undefined ? { kind: 'allow' } : { kind: 'block', target: offending, reason: 'edits a file outside the target folder' }
 }
 
 // ── Shell commands ─────────────────────────────────────────────────────────
@@ -330,8 +570,9 @@ export const isAssignment = (token: Pick<Token, 'text' | 'isQuoted'>) => !token.
 
 const isFlag = (token: Token) => !token.isQuoted && token.text.startsWith('-') && token.text !== '-'
 
+// Backslashes and a drive letter mark Windows paths ('C:\x', 'docs\a.md').
 const looksLikePath = (text: string) =>
-  text === '.' || text === '..' || text.startsWith('/') || text.startsWith('./') || text.startsWith('../') || text.startsWith('~') || text.includes('/')
+  text === '.' || text === '..' || text.startsWith('/') || text.startsWith('./') || text.startsWith('../') || text.startsWith('~') || text.includes('/') || text.includes('\\') || /^[A-Za-z]:/.test(text)
 
 // sed -i, -i.bak, -Ei; perl -pi, -i.orig: in-place edits.
 const hasInPlaceFlag = (tokens: Token[]) =>
@@ -503,13 +744,15 @@ const MAX_NESTING = 4
 export function analyzeCommand(command: string, context: ScopeContext, depth = 0): GuardVerdict {
   if (context.folders.length === 0) return { kind: 'allow' }
   if (depth > MAX_NESTING) return { kind: 'unclear', reason: 'nests shell code too deeply to judge' }
-  // undefined once a `cd` goes somewhere the guard can't resolve.
-  let directory: string | undefined = context.cwd
+  const placed = placeContext(context)
+  // undefined once a `cd` goes somewhere the guard can't resolve or place.
+  let directory: string | undefined = placed.cwd
   let pipelineReadPaths: { path: string }[] = []
   let unclearReason: string | undefined
 
-  const resolve = (base: string | undefined, path: string) => resolvePath(base, path, context.home)
-  const outside = (path: string | undefined) => path !== undefined && isOutOfScope(path, context)
+  // Canonical, UNPLACEABLE (out of scope: blocked) or undefined (unresolvable).
+  const resolve = (base: string | undefined, path: string) => placeAll(base, path, placingOf(placed))[0]
+  const outside = (path: string | undefined) => path !== undefined && outOfScope(path, placed)
   // Shell code run from here: judged as a command of its own.
   const judgeInner = (inner: string): GuardVerdict | undefined => {
     if (directory === undefined) {
@@ -532,7 +775,8 @@ export function analyzeCommand(command: string, context: ScopeContext, depth = 0
 
     if (analysis.changesDirectoryTo !== undefined) {
       // A bare `cd` goes home.
-      directory = analysis.changesDirectoryTo === '' ? context.home : resolve(directory, analysis.changesDirectoryTo)
+      const next = analysis.changesDirectoryTo === '' ? placed.home : resolve(directory, analysis.changesDirectoryTo)
+      directory = next === UNPLACEABLE ? undefined : next
       continue
     }
     for (const inner of analysis.innerCommands ?? []) {
@@ -570,15 +814,23 @@ export function analyzeCommand(command: string, context: ScopeContext, depth = 0
 // ── Messages ───────────────────────────────────────────────────────────────
 
 export function describeScope(context: Pick<ScopeContext, 'root' | 'folders'>): string {
-  const describe = (folder: string) => (folder === context.root ? './ (root files)' : `${relativeTo(context.root, folder)}/`)
+  const describe = (folder: string) => {
+    const relative = relativeTo(context.root, folder)
+    return relative === '.' ? './ (root files)' : `${relative}/`
+  }
   return context.folders.length > 0 ? context.folders.map(describe).join(', ') : '(none)'
 }
 
 // The folder `/scope set|add <text>` names, if it is the root (its own files)
-// or a folder under it (the caller still checks that it exists).
+// or a folder under it (the caller still checks that it exists). Canonical.
 export function scopeFolderCandidate(root: string, text: string): string | undefined {
-  const folder = resolvePath(root, text.replace(/\/+$/, '') || '.')
-  return folder !== undefined && isInside(folder, root) ? folder : undefined
+  const style = pathStyleOf(root)
+  const canonicalRoot = canonicalAbsolute(root, style)
+  const rootParsed = canonicalRoot === undefined ? undefined : parseCanonical(canonicalRoot)
+  if (canonicalRoot === undefined || rootParsed === undefined) return undefined
+  const trimmed = text.replace(style === 'windows' ? /[\\/]+$/ : /\/+$/, '') || '.'
+  const folder = placeAll(canonicalRoot, trimmed, { style, root: rootParsed })[0]
+  return folder !== undefined && folder !== UNPLACEABLE && isInside(folder, canonicalRoot) ? folder : undefined
 }
 
 // What Claude reads when a call is blocked: enough to correct itself. A shell
@@ -586,14 +838,23 @@ export function scopeFolderCandidate(root: string, text: string): string | undef
 // it names the scope the user would have to add.
 export function denialMessage(verdict: { target: string; reason: string }, context: ScopeContext, kind: 'edit' | 'command'): string {
   const scope = describeScope(context)
-  const firstFolder = context.folders.find(folder => folder !== context.root)
+  const firstFolder = context.folders.find(folder => relativeTo(context.root, folder) !== '.')
   const firstName = firstFolder ? relativeTo(context.root, firstFolder) : undefined
+  const reCommand = kind === 'command' && firstName ? [`Re-run it scoped to the target, for example \`cd ${firstName} && …\` or paths under ${firstName}/.`] : []
+  if (verdict.target === UNPLACEABLE) {
+    return [
+      `Blocked by the sidekick scope guard: this ${verdict.reason}.`,
+      `This session's target is ${scope} under ${context.root}.`,
+      ...reCommand,
+      'Spell the path as a plain absolute path (drive letter and full folder names; no UNC, device, short 8.3 or wildcard forms). If the change belongs outside the target, stop and ask the user to run `/scope add <folder>`, or `/scope clear` to stop guarding this session.',
+    ].join(' ')
+  }
   const needed = topLevelFolder(context.root, verdict.target)
-  const addSpec = needed === undefined || needed === context.root ? '.' : relativeTo(context.root, needed)
+  const addSpec = needed === undefined ? '.' : relativeTo(context.root, needed)
   return [
     `Blocked by the sidekick scope guard: this ${verdict.reason} (${relativeTo(context.root, verdict.target)}).`,
     `This session's target is ${scope} under ${context.root}.`,
-    ...(kind === 'command' && firstName ? [`Re-run it scoped to the target, for example \`cd ${firstName} && …\` or paths under ${firstName}/.`] : []),
+    ...reCommand,
     `If the task needs this change, stop and ask the user to run \`/scope add ${addSpec}\`${addSpec === '.' ? " (the root's own files)" : ''}, or \`/scope clear\` to stop guarding this session.`,
   ].join(' ')
 }

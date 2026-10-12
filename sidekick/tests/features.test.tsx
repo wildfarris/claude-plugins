@@ -694,3 +694,43 @@ test("a council knight's Bash is held to its order's folder", async ($, on) => {
   const inside = await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'rm -rf project/build' } as never)
   expect((inside as { deny?: string }).deny).toBeUndefined()
 })
+
+test("on Windows, a council knight edits inside its order's folder and nowhere else under the root", async ($, on) => {
+  const WINDOWS_ROOT = 'C:\\claude\\workspace'
+  baseStandIn(on, { root: WINDOWS_ROOT, decide: () => 'allow' })
+  on('command.list', () => ({ value: [{ name: 'council', description: '', source: 'plugin' }] }))
+  // The order's folder as the council writes it: the root, then a forward slash.
+  on('state.get', ($, e, next) =>
+    String(e.plugin) === 'council' && String(e.key) === 'court'
+      ? { value: { value: { orders: [{ agentId: 'agent-1', status: 'dispatched', folder: `${WINDOWS_ROOT}/agent-host` }] }, version: 1 } }
+      : next(e),
+  )
+  await $.session.start({ cwd: WINDOWS_ROOT, surface: 'desktop', isInteractive: true })
+  await settle()
+  const edit = (file_path: string) => $.tool.call({ tool: 'Edit', agentId: 'agent-1', file_path, old_string: 'a', new_string: 'b' } as never) as Promise<{ deny?: string }>
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', agentId: 'agent-1', command } as never) as Promise<{ deny?: string }>
+  for (const inside of [
+    'C:\\claude\\workspace\\agent-host\\docs\\build-prompt.md',
+    'C:/claude/workspace/agent-host/docs/build-prompt.md',
+    'c:\\claude\\workspace\\agent-host\\docs\\build-prompt.md',
+    'C:\\claude/workspace\\agent-host/docs\\build-prompt.md',
+    '/c/claude/workspace/agent-host/docs/build-prompt.md',
+  ]) {
+    expect((await edit(inside)).deny).toBeUndefined()
+  }
+  for (const outside of [
+    'C:\\claude\\workspace\\castra\\README.md',
+    'C:\\claude\\workspace\\agent-host2\\a.md',
+    'C:\\claude\\workspace\\agent-host\\..\\castra\\a.md',
+    'C:\\claude\\workspace\\CLAUDE.md',
+    '\\\\localhost\\c$\\claude\\workspace\\castra\\a.md',
+  ]) {
+    expect((await edit(outside)).deny).toContain('sidekick scope guard')
+  }
+  // Outside the root: never policed.
+  expect((await edit('D:\\scratch\\notes.md')).deny).toBeUndefined()
+  expect((await bash("rm -rf 'C:\\claude\\workspace\\agent-host\\build'")).deny).toBeUndefined()
+  expect((await bash('cd /c/claude/workspace/agent-host && rm -rf build')).deny).toBeUndefined()
+  expect((await bash("rm -rf 'C:\\claude\\workspace\\castra\\build'")).deny).toContain('outside the target folder')
+  expect((await bash('rm -rf /c/claude/workspace/castra/build')).deny).toContain('outside the target folder')
+})
