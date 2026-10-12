@@ -49,6 +49,7 @@ import {
   pickFilesPrompt,
   projectMap,
   reviewBriefPrompt,
+  reviewFolderCandidate,
   type ReviewMaterial,
   type ReviewRequest,
 } from './review'
@@ -87,7 +88,7 @@ import {
   type Proposal,
   type RulingResult,
 } from './court'
-import { NO_HOME, homeFromEnvironment } from './paths'
+import { NO_HOME, homeFromEnvironment, joinUnder } from './paths'
 import { courtView } from './views/court'
 import { lessonsView } from './views/lessons'
 import {
@@ -356,7 +357,7 @@ async function reviewTarget($: EngineInterface, args: string): Promise<{ project
   const [root, cwd] = await Promise.all([$.session.root(), $.session.cwd()])
   const [first = '', ...others] = args.trim().split(/\s+/)
   if (first === '' || others.length === 0) return { project: cwd, rest: args }
-  const candidate = first.startsWith('/') ? first.replace(/\/$/, '') : `${root}/${first.replace(/^\.\//, '').replace(/\/$/, '')}`
+  const candidate = reviewFolderCandidate(root, first)
   // A repo's own folder (holding .git), so `review main is it ready?` with a
   // plain main/ folder still reads main as the ref.
   const isFolder = await $.fs.exists(`${candidate}/.git`).catch(() => false)
@@ -662,7 +663,7 @@ async function seatsForProject($: EngineInterface): Promise<{ seats: Seat[]; pro
         referencePaths.map(async path => {
           const text = await $.fs.read(path).catch(() => undefined)
           if (typeof text !== 'string') problems.push(`${member.title}: could not read reference ${path}`)
-          return typeof text === 'string' ? { source: path.split('/').pop() ?? path, text } : undefined
+          return typeof text === 'string' ? { source: path.split(/[\\/]/).pop() ?? path, text } : undefined
         }),
       )
       return { ...member, references: trimReferences(read.filter((entry): entry is { source: string; text: string } => entry !== undefined)) }
@@ -779,7 +780,7 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   if ('error' in proposal) return proposal.error
   for (const dispatch of proposal.dispatches) {
     const isFolder = await $.fs
-      .stat(`${root}/${dispatch.folder}`)
+      .stat(joinUnder(root, dispatch.folder))
       .then(stat => stat.kind === 'dir')
       .catch(() => false)
     if (!isFolder) return `There is no folder ${dispatch.folder}/ under ${root}.`
@@ -849,7 +850,7 @@ async function dispatchOrder($: EngineInterface, e: { subagentType: string; desc
       deny: open.length > 0 ? `Name the order this carries in the description: open orders are ${open.join(', ')}.` : 'No approved order for this dispatch. Propose it with mcp__council__propose_orders first.',
     }
   }
-  const instructions = await $.fs.read(`${order.folder}/CLAUDE.md`).catch(() => undefined)
+  const instructions = await $.fs.read(joinUnder(order.folder, 'CLAUDE.md')).catch(() => undefined)
   return {
     order,
     prompt: dispatchPrompt(order, typeof instructions === 'string' ? instructions : null, e.prompt),

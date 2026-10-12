@@ -20,6 +20,7 @@
 // Reference paths are absolute, ~/…, or relative to the member file's folder.
 
 import type { Accessory, AdvisorId, Seat } from '../types'
+import { nativePath, parseAbsolute, pathStyleOf } from './paths'
 import { ACCESSORIES, isHexColor } from './sprites'
 
 export type MemberSource = 'built-in' | 'user' | 'project'
@@ -154,17 +155,18 @@ export function parseMemberFile(fileName: string, text: string, source: 'user' |
 }
 
 // A reference path as written, resolved: absolute, ~/…, or relative to the
-// member file's folder. Undefined when it can't be (`~user/…`, a variable).
+// member file's folder, `..` resolved, in the platform's own spelling. On
+// Windows (the member folder's style) `C:\…`, `C:/…`, `~\…` and backslashes
+// work too. Undefined when it can't be placed (`~user/…`, a variable, a
+// drive-relative `C:x`, or a drive-less `\x` on Windows).
 export function resolveReference(path: string, memberFolder: string, home: string): string | undefined {
-  if (path.includes('$') || /^~[^/]/.test(path)) return undefined
-  const absolute = path.startsWith('~/') ? `${home}/${path.slice(2)}` : path.startsWith('/') ? path : `${memberFolder}/${path}`
-  const parts: string[] = []
-  for (const part of absolute.split('/')) {
-    if (part === '' || part === '.') continue
-    if (part === '..') parts.pop()
-    else parts.push(part)
-  }
-  return `/${parts.join('/')}`
+  const style = pathStyleOf(memberFolder)
+  const isSeparator = (character: string | undefined) => character === '/' || (style === 'windows' && character === '\\')
+  if (path.includes('$') || (path.startsWith('~') && !isSeparator(path[1]))) return undefined
+  const isAbsolute = style === 'windows' ? /^([A-Za-z]:|[\\/])/.test(path) : path.startsWith('/')
+  const absolute = path.startsWith('~') ? `${home}/${path.slice(2)}` : isAbsolute ? path : `${memberFolder}/${path}`
+  const parsed = parseAbsolute(absolute, style)
+  return parsed === undefined ? undefined : nativePath(parsed)
 }
 
 // The references' text within the limits, in order; a reference that doesn't

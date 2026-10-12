@@ -6,7 +6,7 @@
 
 import type { AdvisorId, Council, Court, Order, OrderRole, OrderTodo, Ruling, Seat } from '../types'
 import { seatsOf } from './council'
-import { isPathInside } from './paths'
+import { isPathInside, joinUnder, pathStyleOf, relativeToRoot } from './paths'
 
 export const AGENT_TYPES: Record<OrderRole, string> = { scout: 'council:scout', knight: 'council:knight' }
 
@@ -28,13 +28,26 @@ export type Proposal = { plan: string; dispatches: ProposedDispatch[] }
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
 
-// A folder as Claude wrote it, relative to the session root; undefined when it
-// leaves the root or is the root itself (a dispatch is scoped to a subfolder).
+// A folder as Claude wrote it, relative to the session root, `/`-separated;
+// undefined when it leaves the root or is the root itself (a dispatch is
+// scoped to a subfolder). An absolute folder in any spelling (`C:\…`, `c:/…`,
+// mixed separators) must sit under the root; a relative one may use `\` on
+// Windows but no `.`, `..`, empty, drive-relative or (Windows) trailing-dot names.
 export function relativeFolder(root: string, folder: string): string | undefined {
-  const trimmed = folder.trim().replace(/\/+$/, '')
-  const relative = trimmed.startsWith(`${root}/`) ? trimmed.slice(root.length + 1) : trimmed.replace(/^\.\//, '')
-  if (relative === '' || relative.startsWith('/') || relative.split('/').some(part => part === '..' || part === '.' || part === '')) return undefined
-  return relative
+  const style = pathStyleOf(root)
+  const trimmed = folder.trim()
+  const isAbsolute = style === 'windows' ? /^([A-Za-z]:|[\\/])/.test(trimmed) : trimmed.startsWith('/')
+  if (isAbsolute) {
+    const relative = relativeToRoot(root, trimmed)
+    return relative === undefined || relative === '' ? undefined : relative
+  }
+  const separator = style === 'windows' ? /[\\/]/ : /\//
+  const parts = trimmed.split(separator)
+  if (parts[0] === '.') parts.shift()
+  while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
+  const isBadPart = (part: string) => part === '' || part === '.' || part === '..' || part.startsWith('~') || (style === 'windows' && (part.includes(':') || /[. ]$/.test(part)))
+  if (parts.length === 0 || parts.some(isBadPart)) return undefined
+  return parts.join('/')
 }
 
 // The propose_orders tool's input, checked: what to put to the council, or why not.
@@ -211,7 +224,8 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
   return proposal.dispatches.map((dispatch, index) => ({
     id: `O${next + index + 1}`,
     role: dispatch.role,
-    folder: `${root}/${dispatch.folder}`,
+    // In the root's own separators: never a mixed `C:\root/folder`.
+    folder: joinUnder(root, dispatch.folder),
     relFolder: dispatch.folder,
     task: dispatch.task,
     todos: dispatch.todos.map(content => ({ content, status: 'pending', activeForm: content })),

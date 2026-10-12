@@ -3,7 +3,19 @@
 // Pure: the git commands to run, the material's trimming, and the herald's
 // two prompts (pick files, then brief). The hooks module runs and reads.
 
+import { joinUnder, pathStyleOf } from './paths'
+
 export const DEFAULT_REVIEW_QUESTION = 'Is this work sound and ready?'
+
+// The folder `review <folder> …` may name: absolute in any spelling (/x, and
+// on Windows C:\x, C:/x, \\server\share), else under the session root in the
+// root's own separators. Trailing separators and a leading ./ or .\ dropped.
+export function reviewFolderCandidate(root: string, first: string): string {
+  const isWindows = pathStyleOf(root) === 'windows'
+  const isAbsolute = isWindows ? /^([A-Za-z]:|[\\/])/.test(first) : first.startsWith('/')
+  const bare = first.replace(isWindows ? /(?<=.)[\\/]+$/ : /(?<=.)\/+$/, '')
+  return isAbsolute ? bare : joinUnder(root, bare.replace(isWindows ? /^\.[\\/]/ : /^\.\//, ''))
+}
 export const MAX_PICKED_FILES = 5
 
 // How the material is capped (characters), about 30k in all.
