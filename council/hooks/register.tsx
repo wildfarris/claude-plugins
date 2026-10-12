@@ -865,9 +865,11 @@ async function followAgentCall($: EngineInterface, agentId: string, tool: string
   if (order === undefined) return undefined
   if (FILE_TOOLS.has(tool)) {
     const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : ''
-    const absolute = path.startsWith('/') ? path : `${order.folder}/${path}`
-    if (!isInside(order, absolute)) {
-      return { deny: `Order ${order.id} is scoped to ${order.relFolder}/; ${path} is outside it. Work inside the folder, or report that the order needs a change.` }
+    // Only an absolute path the check can place inside the folder passes.
+    if (!isInside(order, path)) {
+      return {
+        deny: `Order ${order.id} is scoped to ${order.relFolder}/; ${path || 'that path'} is outside it, or can't be placed inside it (give the full absolute path, e.g. ${order.folder}). Work inside the folder, or report that the order needs a change.`,
+      }
     }
   }
   const todos = tool === 'TodoWrite' || tool === PROGRESS_TOOL ? readTodos(input) : undefined

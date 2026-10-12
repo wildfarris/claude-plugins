@@ -6,6 +6,7 @@
 
 import type { AdvisorId, Council, Court, Order, OrderRole, OrderTodo, Ruling, Seat } from '../types'
 import { seatsOf } from './council'
+import { isPathInside } from './paths'
 
 export const AGENT_TYPES: Record<OrderRole, string> = { scout: 'council:scout', knight: 'council:knight' }
 
@@ -286,8 +287,12 @@ export const progressOf = (order: Order) => {
 
 export const currentTodo = (order: Order) => order.todos.find(todo => todo.status === 'in_progress')?.activeForm ?? null
 
-// A path an order's agent may write: inside its folder.
-export const isInside = (order: Order, path: string) => path === order.folder || path.startsWith(`${order.folder}/`)
+// A path an order's agent may write: provably inside its folder, however it is
+// spelled (drive letters, backslashes, `..`). Fails closed: a relative path, or
+// one that can't be placed, is outside. The session root's own folders compare
+// case-insensitively on Windows; the order's folder and below, exactly.
+export const isInside = (order: Pick<Order, 'folder' | 'relFolder'>, path: string) =>
+  isPathInside(path, order.folder, order.relFolder.split(/[\\/]/).filter(Boolean).length)
 
 // What reaches Claude beside a prompt in court mode (hidden from the
 // transcript): the concerns worth acting on, or one line when there are none.
