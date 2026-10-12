@@ -1,6 +1,6 @@
 {
   "name": "sidekick",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard, long-lived rules, a resume warning, and trimming instead of summary compaction.",
   "author": {
     "name": "Jeremy Phares"

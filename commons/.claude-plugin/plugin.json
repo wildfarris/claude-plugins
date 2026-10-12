@@ -1,6 +1,6 @@
 {
   "name": "commons",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Memory shared across projects, by topic: turn topics on per project in a sidebar, and Claude reads and saves to them in any session.",
   "author": {
     "name": "Jeremy Phares"
