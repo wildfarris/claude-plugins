@@ -57,6 +57,11 @@
       "title": "Court triage model",
       "description": "In court mode, the model that decides whether a prompt goes to the council (changes, risks, decisions) or straight to Claude (questions, chatter).",
       "default": "haiku"
+    },
+    "arbiter": {
+      "type": "string",
+      "title": "Arbiter",
+      "description": "The id of one seated member (its member file's name, e.g. hand) who reviews the conditions on an approved plan of orders: one low-effort call on the advisor model keeps or drops each. Leave empty for none: every condition stands."
     }
   }
 }

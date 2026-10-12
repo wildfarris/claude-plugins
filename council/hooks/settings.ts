@@ -1,5 +1,8 @@
 import type { PluginOptions } from 'claude-code'
 
+import type { AdvisorId } from '../types'
+import { memberId } from './members'
+
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 export type CouncilSettings = {
@@ -11,12 +14,19 @@ export type CouncilSettings = {
   deepEffort: Effort
   // Court mode's triage of each prompt.
   triageModel: string
+  // The member who reviews an approved plan's conditions (keeps or drops
+  // each); null for none. It must also be seated, which is checked when the
+  // council rules (court.ts arbiterSeat).
+  arbiter: AdvisorId | null
 }
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
 const textOption = (value: unknown, fallback: string) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
 const effortOption = (value: unknown, fallback: Effort) => EFFORTS.find(effort => effort === value) ?? fallback
+// A member id, read as a member file's name gives it ("Hand" or "hand.md" is
+// hand); null when unset or when nothing of an id is left.
+const memberOption = (value: unknown): AdvisorId | null => (typeof value === 'string' && memberId(value.trim()) !== '' ? memberId(value.trim()) : null)
 
 // The engine validates options against plugin.json's userConfig and fills in
 // defaults; this re-checks so a test or a hand-edited settings file can't
@@ -29,5 +39,6 @@ export function readSettings(options: PluginOptions): CouncilSettings {
     deepModel: textOption(options.deepModel, 'opus'),
     deepEffort: effortOption(options.deepEffort, 'high'),
     triageModel: textOption(options.triageModel, 'haiku'),
+    arbiter: memberOption(options.arbiter),
   }
 }

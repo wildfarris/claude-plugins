@@ -125,9 +125,17 @@ describe('review mode', () => {
 
 describe('settings', () => {
   test('defaults to Opus for reviews and Sonnet at low effort for advisors, and rejects bad values', () => {
-    expect(readSettings({})).toEqual({ briefModel: 'opus', advisorModel: 'sonnet', advisorEffort: 'low', deepModel: 'opus', deepEffort: 'high', triageModel: 'haiku' })
+    expect(readSettings({})).toEqual({ briefModel: 'opus', advisorModel: 'sonnet', advisorEffort: 'low', deepModel: 'opus', deepEffort: 'high', triageModel: 'haiku', arbiter: null })
     expect(readSettings({ advisorEffort: 'extreme', advisorModel: '  ' }).advisorEffort).toBe('low')
     expect(readSettings({ advisorModel: '  ' }).advisorModel).toBe('sonnet')
+  })
+
+  test('the arbiter is a member id as its file name gives it, or none', () => {
+    expect(readSettings({ arbiter: 'hand' }).arbiter).toBe('hand')
+    expect(readSettings({ arbiter: ' Hand.md ' }).arbiter).toBe('hand')
+    expect(readSettings({ arbiter: '' }).arbiter).toBeNull()
+    expect(readSettings({ arbiter: '  --  ' }).arbiter).toBeNull()
+    expect(readSettings({ arbiter: 3 }).arbiter).toBeNull()
   })
 })
 
