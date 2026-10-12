@@ -172,6 +172,11 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
               {lastRuling.isApproved ? `Approved: ${lastRuling.plan}` : `Refused: ${lastRuling.plan}`}
             </Text>
           )}
+          {lastRuling?.notes?.map((note, index) => (
+            <Text key={`ruling-note-${index}`} dimColor wrap="wrap">
+              {`· ${note}`}
+            </Text>
+          ))}
         </Box>
       )}
       {court.orders.length === 0 && (

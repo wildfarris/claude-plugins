@@ -166,6 +166,9 @@ export type Ruling = {
   gravest: number
   // Why it was refused, when it was.
   reason: string
+  // What the arbiter's review left beside the conditions: each one it
+  // dropped and why, or that its review failed (court.ts). Absent before it.
+  notes?: string[]
 }
 
 export type Court = {

@@ -78,6 +78,14 @@ import {
   TRIAGE_SYSTEM,
   ruling,
   rulingText,
+  arbiterPrompt,
+  arbiterSeat,
+  needsArbiter,
+  parseArbiterReply,
+  withArbiterReview,
+  type ArbiterDecision,
+  type Proposal,
+  type RulingResult,
 } from './court'
 import { courtView } from './views/court'
 import { lessonsView } from './views/lessons'
@@ -776,15 +784,49 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   }
   const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal, lastPetition) }), { source: 'claude' })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
-  const result = ruling(council, proposal.plan)
+  const ruled = ruling(council, proposal.plan)
+  const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled) : ruled
   const court = await read($, courtAtom)
   const orders = result.isApproved ? newOrders(court, proposal, root, result.conditions) : []
   await update($, courtAtom, current => ({
     ...current,
     orders: [...current.orders, ...orders],
-    rulings: [...current.rulings.slice(-9), { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason }],
+    rulings: [
+      ...current.rulings.slice(-9),
+      { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(result.notes ? { notes: result.notes } : {}) },
+    ],
   }))
   return rulingText(result, orders)
+}
+
+// The arbiter's review of an approved plan's conditions: one low-effort call
+// on the advisor model, as the member itself (its own system prompt, with the
+// arbiter's request added). With no arbiter, or one not seated, the ruling
+// stands as it is; a failed call keeps every condition, with a note saying so.
+async function arbitrate($: EngineInterface, council: Council, proposal: Proposal, result: RulingResult): Promise<RulingResult> {
+  if (settings.arbiter === null) return result
+  const seat = arbiterSeat(council, settings.arbiter)
+  if (seat === undefined) {
+    $.ui.toast(`Council: the arbiter "${settings.arbiter}" is not seated here, so the conditions stand unreviewed.`)
+    return result
+  }
+  let review: ArbiterDecision[] | { failure: string }
+  try {
+    const reply = await $.model.complete({
+      model: settings.advisorModel,
+      effort: 'low',
+      system: advisorSystemPrompt(seat, council.standing, true),
+      prompt: arbiterPrompt(proposal, lastPetition, result.proposed),
+      maxTokens: 800,
+      timeoutMs: 60000,
+    })
+    review = reply.isAnswered
+      ? parseArbiterReply(reply.text, result.proposed.length)
+      : { failure: reply.reason === 'aborted' ? 'the call timed out or was cut short' : reply.reason === 'api-error' ? 'the call failed' : 'it gave no answer' }
+  } catch {
+    review = { failure: 'the call failed' }
+  }
+  return withArbiterReview(result, seat, review)
 }
 
 // A council agent's dispatch: refused without an approved order; otherwise
