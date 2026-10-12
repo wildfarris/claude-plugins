@@ -24,6 +24,7 @@ import type { Bar, BarItemId, Brief, BriefRepo, ContextReadout, HeadsUpNote, Pen
 import {
   BRIEF_SYSTEM_PROMPT,
   CONFIRM_ABOVE_CALLS,
+  baseName,
   briefLabel,
   briefPrompt,
   briefSummaryText,
@@ -32,8 +33,11 @@ import {
   filesByRepo,
   handoffMarkdown,
   handoffStarterPrompt,
+  parentFolder,
   parseBriefReply,
+  pathInRepo,
   planBrief,
+  repoGroupFolder,
   sessionHandoffMarkdown,
   spanStats,
   statLines,
@@ -620,11 +624,11 @@ async function git($: EngineInterface, folder: string, args: string[]): Promise<
 // under the session root they sit in, resolved to its repo once.
 async function repoFacts($: EngineInterface, stats: SpanStats): Promise<BriefRepo[]> {
   const root = await $.session.root()
-  const groupFolder = (path: string) => (path.startsWith(`${root}/`) ? `${root}/${path.slice(root.length + 1).split('/')[0]}` : path.slice(0, path.lastIndexOf('/')))
+  const groupFolder = (path: string) => repoGroupFolder(root, path)
   const tops = new Map<string, string | undefined>()
   for (const folder of new Set(stats.files.map(file => groupFolder(file.path)))) {
     const isFolder = (await $.fs.stat(folder).catch(() => undefined))?.kind === 'dir'
-    tops.set(folder, await git($, isFolder ? folder : folder.slice(0, folder.lastIndexOf('/')), ['rev-parse', '--show-toplevel']))
+    tops.set(folder, await git($, isFolder ? folder : parentFolder(folder), ['rev-parse', '--show-toplevel']))
   }
   const since = new Date(stats.startAt).toISOString()
   const repos: BriefRepo[] = []
@@ -636,8 +640,8 @@ async function repoFacts($: EngineInterface, stats: SpanStats): Promise<BriefRep
     ])
     repos.push({
       folder,
-      name: folder.slice(folder.lastIndexOf('/') + 1),
-      files: files.map(file => ({ ...file, path: file.path.startsWith(`${folder}/`) ? file.path.slice(folder.length + 1) : file.path })),
+      name: baseName(folder),
+      files: files.map(file => ({ ...file, path: pathInRepo(folder, file.path) })),
       added: files.reduce((sum, file) => sum + file.added, 0),
       removed: files.reduce((sum, file) => sum + file.removed, 0),
       commits: log ? log.split('\n').filter(Boolean) : [],

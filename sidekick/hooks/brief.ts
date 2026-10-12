@@ -4,6 +4,7 @@
 
 import type { Brief, BriefRepo } from '../types'
 import { SPAN_LABELS, type BriefSpan, type LedgerEntry, type LedgerFile } from './ledger'
+import { joinUnder, relativeToRoot } from './paths'
 import { redactSecrets } from './secrets'
 
 type CallEntry = Extract<LedgerEntry, { kind: 'call' }>
@@ -31,7 +32,31 @@ export function elapsedStamp(at: number, startAt: number): string {
   return `+${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}`
 }
 
-const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+// The last name in a path, after a `/` or (Windows) a `\`; trailing separators ignored.
+export const baseName = (path: string) => {
+  const trimmed = path.replace(/(?<=.)[\\/]+$/, '')
+  return trimmed.slice(Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\')) + 1)
+}
+
+// The folder holding a path, cut at its last `/` or `\`.
+export const parentFolder = (path: string) => path.slice(0, Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')))
+
+// The folder a changed file is grouped under: the top-level folder below the
+// session root it sits in (in the root's own spelling), or its own folder
+// outside the root. A path under the root is placed however it is spelled:
+// backslashes, mixed separators, a drive letter in another case.
+export function repoGroupFolder(root: string, path: string): string {
+  const relative = relativeToRoot(root, path)
+  if (relative === undefined || relative === '') return parentFolder(path)
+  return joinUnder(root, relative.split('/')[0]!)
+}
+
+// A file's path inside its repo, `/`-separated (git prints the top folder
+// with `/` on Windows too); the path as given when it isn't inside.
+export function pathInRepo(folder: string, path: string): string {
+  const relative = relativeToRoot(folder, path)
+  return relative === undefined || relative === '' ? path : relative
+}
 
 const plural = (count: number, word: string) => `${count.toLocaleString('en-US')} ${word}${count === 1 ? '' : 's'}`
 
@@ -369,7 +394,7 @@ export type SessionHandoff = {
 export function sessionHandoffMarkdown(handoff: SessionHandoff): string {
   const { brief, root } = handoff
   return [
-    `# Handoff: ${root.slice(root.lastIndexOf('/') + 1) || root}`,
+    `# Handoff: ${baseName(root) || root}`,
     '',
     `Written by sidekick at ${handoff.writtenAt} from session ${handoff.sessionId} in \`${root}\`, covering the ${brief.label}. Generated from the session's record, not reviewed by a person: check each repo's git state before acting on it.`,
     '',

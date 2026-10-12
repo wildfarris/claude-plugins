@@ -2,6 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import {
   MAX_CHUNKS,
+  baseName,
   briefSummaryText,
   chunkLines,
   claimsCheck,
@@ -9,8 +10,12 @@ import {
   elapsedStamp,
   formatDuration,
   handoffMarkdown,
+  parentFolder,
   parseBriefReply,
+  pathInRepo,
   planBrief,
+  repoGroupFolder,
+  sessionHandoffMarkdown,
   spanStats,
   statLines,
 } from '../hooks/brief'
@@ -246,5 +251,54 @@ describe('what the record keeps', () => {
     expect(modelFailureText({ reason: 'api-error', status: 429, error: 'rate_limit' })).toBe('API error: rate_limit (429)')
     expect(modelFailureText({ reason: 'api-error', status: null, error: 'unknown' })).toBe('API error: unknown, no response')
     expect(modelFailureText({ reason: 'aborted' })).toBe('timed out or cancelled')
+  })
+})
+
+describe('Windows paths in the brief', () => {
+  const ROOT_WIN = 'C:\\claude\\workspace'
+  const turn = (answer: string, calls: LedgerEntry[]): LedgerEntry[] => [promptEntry(0, 't1', 'fix it'), ...calls, answerEntry(60_000, 't1', answer, 60_000, false)]
+
+  test('file names are found after a backslash, so the claims check matches them', () => {
+    expect(baseName('C:\\claude\\workspace\\agent-host\\docs\\build.md')).toBe('build.md')
+    expect(baseName('C:/claude/workspace/agent-host')).toBe('agent-host')
+    expect(baseName('C:\\claude\\workspace\\')).toBe('workspace')
+    expect(baseName('/dev/work/parser.ts')).toBe('parser.ts')
+    expect(baseName('/')).toBe('')
+    const edit = call('Edit', { file_path: 'C:\\claude\\workspace\\api\\parser.ts' }, { editedFile: { path: 'C:\\claude\\workspace\\api\\parser.ts', added: 1, removed: 0 } })
+    expect(claimsCheck(spanStats(turn('Fixed parser.ts.', [edit])))).toEqual([])
+    const failed = call('Edit', { file_path: 'C:\\claude\\workspace\\api\\lexer.ts' }, { isError: true })
+    expect(claimsCheck(spanStats(turn('Done.', [failed])))).toContain('An edit to lexer.ts failed and was never redone.')
+  })
+
+  test('changed files group under the top-level folder below the root, however they are spelled', () => {
+    for (const path of [
+      'C:\\claude\\workspace\\agent-host\\docs\\build.md',
+      'C:/claude/workspace/agent-host/docs/build.md',
+      'c:\\Claude\\workspace\\agent-host\\a.md',
+      'C:\\claude/workspace\\agent-host/src\\a.ts',
+    ]) {
+      expect([path, repoGroupFolder(ROOT_WIN, path)]).toEqual([path, 'C:\\claude\\workspace\\agent-host'])
+    }
+    // Outside the root: the file's own folder.
+    expect(repoGroupFolder(ROOT_WIN, 'D:\\other\\repo\\a.ts')).toBe('D:\\other\\repo')
+    expect(repoGroupFolder(ROOT_WIN, 'C:\\claude\\workspace\\agent-host\\..\\..\\x\\a.ts')).toBe('C:\\claude\\workspace\\agent-host\\..\\..\\x')
+    // POSIX is unchanged.
+    expect(repoGroupFolder('/dev/work', '/dev/work/project/src/a.ts')).toBe('/dev/work/project')
+    expect(repoGroupFolder('/dev/work', '/elsewhere/a.ts')).toBe('/elsewhere')
+    expect(parentFolder('C:\\a\\b.ts')).toBe('C:\\a')
+  })
+
+  test("paths inside a repo are relative to git's top folder, whichever separators either uses", () => {
+    expect(pathInRepo('C:/claude/workspace/agent-host', 'C:\\claude\\workspace\\agent-host\\docs\\build.md')).toBe('docs/build.md')
+    expect(pathInRepo('C:\\claude\\workspace\\agent-host', 'c:/claude/workspace/agent-host/a.md')).toBe('a.md')
+    expect(pathInRepo('C:/claude/workspace/agent-host', 'C:\\claude\\workspace\\agent-host2\\a.md')).toBe('C:\\claude\\workspace\\agent-host2\\a.md')
+    expect(pathInRepo('/dev/work/project', '/dev/work/project/src/a.ts')).toBe('src/a.ts')
+    expect(pathInRepo('/dev/work/project', '/dev/work/project2/a.ts')).toBe('/dev/work/project2/a.ts')
+  })
+
+  test("the session handoff's title is the root's last folder", () => {
+    const brief: Brief = { span: 'full', label: 'whole session', line: 'x', done: null, stuck: null, needsYou: null, findings: [], phases: [], stats: [], repos: [], skippedNote: null, isExpanded: false }
+    const markdown = sessionHandoffMarkdown({ brief, root: ROOT_WIN, sessionId: 's', recordFolder: 'C:\\Users\\me\\.claude\\sidekick\\ledgers\\s', heldPrompt: null, writtenAt: 'now' })
+    expect(markdown.split('\n')[0]).toBe('# Handoff: workspace')
   })
 })
