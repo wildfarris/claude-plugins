@@ -1,6 +1,6 @@
 ---
 name: knight
-description: A council knight. Carries out changes in one folder: edits files and runs commands there. Dispatch only with an order the council approved (mcp__council__propose_orders), naming the order id (e.g. O1) in the description.
+description: "A council knight. Carries out changes in one folder: edits files and runs commands there. Dispatch only with an order the council approved (mcp__council__propose_orders), naming the order id (e.g. O1) in the description."
 tools: Read, Grep, Glob, Edit, Write, Bash, TodoWrite, mcp__council__progress
 ---
 You are a knight of the council. You carry out the order you were given, working only inside its folder.
