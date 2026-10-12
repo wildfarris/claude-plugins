@@ -39,6 +39,7 @@ import {
   type ProjectSettings,
 } from './library'
 import { NO_HOME, homeFromEnvironment } from './paths'
+import { removeInside, type RemoveHost } from './remove'
 import { memoryFolder, readSettings, type CommonsSettings } from './settings'
 import { sidebarView } from './views/sidebar'
 
@@ -50,6 +51,8 @@ const sidebarAtom = atom({ plugin: 'commons', key: 'sidebar' } as const, { expan
 // Module state: rebuilt on every load.
 let settings: CommonsSettings = readSettings({})
 let folderCache: string | undefined
+// The home folder as read with the memory folder ('' when unknown): never deleted.
+let homeCache = ''
 // Parsed memories by file path, kept while the file's size and time stand:
 // memory files are written once, so a refresh reads only new ones.
 const memoryCache = new Map<string, { mtimeMs: number; size: number; memory: Memory | undefined }>()
@@ -63,6 +66,7 @@ async function folder($: EngineInterface): Promise<string> {
   const [fromHome, fromProfile] = await Promise.all([$.env.get('HOME').catch(() => undefined), $.env.get('USERPROFILE').catch(() => undefined)])
   const home = homeFromEnvironment(fromHome, fromProfile) ?? ''
   if (home === '' && (settings.memoryDir === '' || settings.memoryDir.startsWith('~'))) throw new Error(`${NO_HOME}; set memoryDir to an absolute path`)
+  homeCache = home
   folderCache = memoryFolder(settings.memoryDir, home)
   return folderCache
 }
@@ -170,15 +174,22 @@ async function saveMemory($: EngineInterface, topic: Topic, text: string, projec
   await $.fs.write(paths(await folder($)).memoryFile(topic.id, id), formatMemory({ text, project, savedAt: new Date(now).toISOString() }))
 }
 
+// remove.ts's engine calls, spelled here: the engine follows `$` into no other file.
+const removeHost = ($: EngineInterface): RemoveHost => ({
+  stat: (path, options) => $.fs.stat(path, options),
+  list: path => $.fs.list(path),
+  exists: path => $.fs.exists(path),
+  run: (argv, init) => $.process.run(argv, init),
+})
+
 // Removes a memory file or a whole topic folder, only ever inside the memory
-// folder's topics (the fs noun has no delete).
-async function removeInside($: EngineInterface, path: string): Promise<boolean> {
-  const topicsRoot = `${paths(await folder($)).topics}/`
-  if (!path.startsWith(topicsRoot)) return false
-  const inside = path.slice(topicsRoot.length).split('/')
-  if (inside.some(part => part === '' || part === '.' || part === '..')) return false
-  const result = await $.process.run(['rm', '-rf', '--', path], { timeoutMs: 10000 }).catch(() => undefined)
-  return result?.exitCode === 0
+// folder's topics (remove.ts checks it and runs the platform's delete).
+// Resolves why it couldn't, or undefined once it's gone.
+async function removeTopicPath($: EngineInterface, path: string): Promise<string | undefined> {
+  const topicsRoot = paths(await folder($)).topics
+  return removeInside(removeHost($), path, topicsRoot, homeCache || undefined)
+    .then(() => undefined)
+    .catch(error => (error instanceof Error ? error.message : String(error)))
 }
 
 // ── Claude's tools ────────────────────────────────────────────────────────
@@ -232,14 +243,14 @@ async function approveTopic($: EngineInterface, topic: Topic): Promise<void> {
 }
 
 async function discardTopic($: EngineInterface, topic: TopicView): Promise<void> {
-  const isRemoved = await removeInside($, paths(await folder($)).topic(topic.id))
-  if (!isRemoved) $.ui.toast(`Commons: could not remove "${topic.name}".`)
+  const failure = await removeTopicPath($, paths(await folder($)).topic(topic.id))
+  if (failure !== undefined) $.ui.toast(`Commons: could not remove "${topic.name}" (${failure}).`)
   await refresh($)
 }
 
 async function deleteMemory($: EngineInterface, topic: TopicView, memory: Memory): Promise<void> {
-  const isRemoved = await removeInside($, paths(await folder($)).memoryFile(topic.id, memory.id))
-  if (!isRemoved) $.ui.toast('Commons: could not delete that memory.')
+  const failure = await removeTopicPath($, paths(await folder($)).memoryFile(topic.id, memory.id))
+  if (failure !== undefined) $.ui.toast(`Commons: could not delete that memory (${failure}).`)
   await refresh($)
 }
 

@@ -64,6 +64,14 @@ export function standIn(on: On, options: { root: string; files?: Map<string, str
     if (names.size === 0) return { deny: 'no such directory' }
     return { value: [...names].map(([name, kind]) => ({ name, kind, size: 0, mtimeMs: 0, isLink: false })) }
   })
+  // What a delete checks first: whether the path is there, what it is and where it lands.
+  const isFolder = (path: string) => [...files.keys()].some(key => key.startsWith(`${path.replace(/\/$/, '')}/`))
+  on('fs.exists', ($, e) => ({ value: files.has(e.path) || isFolder(e.path) }))
+  on('fs.stat', ($, e) => {
+    const kind = files.has(e.path) ? ('file' as const) : isFolder(e.path) ? ('dir' as const) : undefined
+    if (kind === undefined) return { deny: 'no such file' }
+    return { value: { kind, size: files.get(e.path)?.length ?? 0, mtimeMs: 0, isLink: false, ...(e.resolve ? { realPath: e.path } : {}) } }
+  })
   on('process.run', ($, e) => {
     const argv = [...e.argv]
     const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })

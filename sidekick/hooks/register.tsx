@@ -96,6 +96,7 @@ import { planTrim, trimDecision, trimNotice } from './trim'
 import { breakdownRows, emptyReadout, withMeasurement } from './context-readout'
 import { councilGlimpse, orderFolderFor } from './council-glimpse'
 import { NO_HOME, homeFromEnvironment } from './paths'
+import { removeInside, type RemoveHost } from './remove'
 import { modelFailureText, stringList, textKey } from './values'
 import { barView } from './views/bar'
 import { barModel, type BarHandlers, type BarState } from './views/bar-model'
@@ -434,6 +435,14 @@ async function openLedger($: EngineInterface): Promise<void> {
   void pruneLedgers($, base, sessionFolder, await $.clock.now()).catch(() => undefined)
 }
 
+// remove.ts's engine calls, spelled here: the engine follows `$` into no other file.
+const removeHost = ($: EngineInterface): RemoveHost => ({
+  stat: (path, options) => $.fs.stat(path, options),
+  list: path => $.fs.list(path),
+  exists: path => $.fs.exists(path),
+  run: (argv, init) => $.process.run(argv, init),
+})
+
 async function pruneLedgers($: EngineInterface, base: string, current: string, now: number): Promise<void> {
   const folders = []
   for (const entry of await $.fs.list(base).catch(() => [])) {
@@ -441,7 +450,17 @@ async function pruneLedgers($: EngineInterface, base: string, current: string, n
     const files = await $.fs.list(`${base}/${entry.name}`).catch(() => [])
     folders.push({ name: entry.name, newestMs: Math.max(0, ...files.map(file => file.mtimeMs)) })
   }
-  for (const name of expiredLedgers(folders, current, now)) await $.process.run(['rm', '-rf', '--', `${base}/${name}`], { timeoutMs: 5000 })
+  // Each on its own: one that can't be deleted (or is refused) leaves the rest to go.
+  const home = await readHome($)
+  for (const name of expiredLedgers(folders, current, now)) {
+    await removeInside(removeHost($), `${base}/${name}`, base, home || undefined).catch(error => {
+      try {
+        $.ui.log(`sidekick: kept an expired ledger: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+      } catch {
+        // A log line is best effort.
+      }
+    })
+  }
 }
 
 // The time for a ledger entry: recording must never fail the hook it's in.

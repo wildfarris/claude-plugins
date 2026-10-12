@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { canonicalPath, fromBashDrivePath, homeFromEnvironment, isPathInside, joinUnder, relativeToRoot } from '../hooks/paths'
+import { canonicalPath, deleteTarget, fromBashDrivePath, homeFromEnvironment, isPathInside, joinUnder, nativePath, relativeToRoot } from '../hooks/paths'
 
 describe('path helpers', () => {
   test('canonical forms', () => {
@@ -43,6 +43,54 @@ describe('path helpers', () => {
     expect(homeFromEnvironment('/c/Users/me', 'C:\\Users\\me')).toBe('C:/Users/me')
     expect(homeFromEnvironment(undefined, undefined)).toBeUndefined()
     expect(homeFromEnvironment('', '')).toBeUndefined()
+  })
+
+  test('a delete target must be strictly inside its folder, never a root or the home folder', () => {
+    const ledgers = 'C:\\Users\\me\\.claude\\sidekick\\ledgers'
+    const home = 'C:\\Users\\me'
+    expect(deleteTarget(`${ledgers}/old-session`, ledgers, home)).toEqual({ path: 'C:\\Users\\me\\.claude\\sidekick\\ledgers\\old-session' })
+    expect(deleteTarget('c:/users/me/.claude/sidekick/ledgers/x/../y', 'c:/users/me/.claude/sidekick/ledgers', home)).toEqual({ path: 'C:\\users\\me\\.claude\\sidekick\\ledgers\\y' })
+    expect(deleteTarget('/home/me/.claude/commons/topics/scratch', '/home/me/.claude/commons/topics', '/home/me')).toEqual({ path: '/home/me/.claude/commons/topics/scratch' })
+    const refused = (target: string, folder = ledgers) => 'refusal' in deleteTarget(target, folder, home)
+    for (const target of [
+      '',
+      '   ',
+      ledgers,
+      `${ledgers}\\`,
+      `${ledgers}\\..`,
+      `${ledgers}\\x\\..\\..\\castra`,
+      `${ledgers}\\..\\..\\..`,
+      'C:\\Users\\me\\.claude\\sidekick\\ledgers2\\x',
+      'C:\\',
+      'C:\\Users\\me',
+      'C:\\Users',
+      'D:\\Users\\me\\.claude\\sidekick\\ledgers\\x',
+      'C:Users\\me\\.claude\\sidekick\\ledgers\\x',
+      '\\\\server\\share\\x',
+      '\\\\?\\GLOBALROOT\\x',
+      '/c/Users/me/.claude/sidekick/ledgers/x',
+      'old-session',
+      `${ledgers}\\x.`,
+    ]) {
+      expect([target, refused(target)]).toEqual([target, true])
+    }
+    // The folder's own names compare exactly: another case is refused, not guessed.
+    expect(refused('C:\\users\\ME\\.claude\\sidekick\\ledgers\\x')).toBe(true)
+    // A root, drive root or share root is never a folder to delete from.
+    expect(refused('/x', '/')).toBe(true)
+    expect(refused('C:\\x', 'C:\\')).toBe(true)
+    expect(refused('\\\\nas\\share\\x', '\\\\nas\\share')).toBe(true)
+    expect(refused('/home/me', '/home')).toBe(false)
+    expect('refusal' in deleteTarget('/home/me', '/home', '/home/me')).toBe(true)
+    expect('refusal' in deleteTarget('/home/me/a', '/home/me', '/home/me/a/b')).toBe(true)
+    // POSIX: backslashes are ordinary characters.
+    expect(deleteTarget('/srv/data/a\\..\\..', '/srv/data')).toEqual({ path: '/srv/data/a\\..\\..' })
+  })
+
+  test('native spellings', () => {
+    expect(nativePath({ prefix: 'c:', segments: ['a', 'b'] })).toBe('C:\\a\\b')
+    expect(nativePath({ prefix: '//nas/share', segments: ['a'] })).toBe('\\\\nas\\share\\a')
+    expect(nativePath({ prefix: '', segments: ['a', 'b'] })).toBe('/a/b')
   })
 
   test('Git Bash drive paths become drive paths; others are left alone', () => {

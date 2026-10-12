@@ -149,3 +149,31 @@ export function homeFromEnvironment(home: string | undefined, profile: string | 
 }
 
 export const NO_HOME = 'could not find the home folder: neither HOME nor USERPROFILE is set'
+
+// A canonical path in the platform's own spelling: `C:\a\b`, `\\server\share\a`, `/a/b`.
+export function nativePath(parsed: ParsedPath): string {
+  if (parsed.prefix === '') return formatPath(parsed)
+  const text = formatPath(parsed).replace(/\//g, '\\')
+  return parsed.prefix.startsWith('//') ? text : `${text[0]!.toUpperCase()}${text.slice(1)}`
+}
+
+// What a recursive delete may remove, by spelling: `target` must provably
+// resolve strictly inside `folder` (names compared exactly), the folder must
+// not be a root (`/`, a drive or a share), and the target must not be the home
+// folder or hold it. Answers the target in the platform's own spelling, with
+// `..` resolved, which is what gets deleted; or why it is refused. Links are
+// for the caller to check on disk (remove.ts).
+export function deleteTarget(target: string, folder: string, home?: string): { path: string } | { refusal: string } {
+  if (target.trim() === '' || folder.trim() === '') return { refusal: 'an empty path' }
+  const style = pathStyleOf(folder)
+  const outer = parseAbsolute(folder, style)
+  if (outer === undefined) return { refusal: `${folder} is not an absolute path that can be placed` }
+  if (outer.segments.length === 0) return { refusal: `${folder} is a root folder` }
+  const inner = parseAbsolute(target, style)
+  if (inner === undefined) return { refusal: `${target} is not an absolute path that can be placed` }
+  const below = segmentsBelow(inner, outer, 0)
+  if (below === undefined || below.length === 0) return { refusal: `${target} is not inside ${folder}` }
+  const homeParsed = home ? parseAbsolute(home, style) : undefined
+  if (homeParsed !== undefined && segmentsBelow(homeParsed, inner) !== undefined) return { refusal: `${target} is the home folder or holds it` }
+  return { path: nativePath(inner) }
+}
