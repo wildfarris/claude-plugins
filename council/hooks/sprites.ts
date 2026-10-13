@@ -368,33 +368,34 @@ const HOUSE = ['....RR....', '...RRRR...', '..RRRRRR..', '.RRRRRRRR.', 'RRRRRRRR
 const HOUSE_COLORS = { R: '#8a5a3c', H: '#b8a27a', d: '#3e2a1e', dark: '#4a4038', lit: '#f2c230' }
 const ROAD_COLORS = { toGo: '#4a4741', failed: '#7a7a7a', pennant: '#d9dee5' }
 
-// The work sites along a road, one per todo, all drawn on one 5-wide footing
-// that stands on the ground line. A finished todo shows a cairn that grows
-// with the tool calls made on it (levels 1-5, one per ten calls; level 0 draws
-// nothing): a low heap, a small cairn, a taller one, one with a pole, and at
-// level 5 the pole flies a banner in the agent's colour, a landmark that
-// reads from afar. A todo not started yet shows an enemy tent, the same one
-// every time.
-export const SITE_WIDTH = 5
-export const WORK_LEVELS: readonly (readonly string[])[] = [
-  [],
-  ['.SSS.', 'SSSSS'],
-  ['..S..', '.SSS.', 'SSSSS'],
-  ['..S..', '.SSS.', '.SSS.', 'SSSSS'],
-  ['..P..', '..P..', '..P..', '..S..', '.SSS.', '.SSS.', 'SSSSS'],
-  ['..PFF', '..PFF', '..PF.', '..P..', '..S..', '.SSS.', '.SSS.', 'SSSSS'],
-]
-export const ENEMY_TENT = ['..T..', '.TTT.', 'TTDTT', 'TTDTT']
-const SITE_COLORS = { S: '#9a9488', P: '#b8a27a', T: '#a8453b', D: '#2b1a17' }
+// The work sites along a road, one per todo, each on an 8-wide footing that
+// stands on the ground line. A finished todo shows its work as a stack of
+// bricks in the agent's colour: level N is N bricks, one per ten tool calls
+// made on the todo (level 0 draws nothing), each a 6x2 block with a pixel of
+// dark between, so the level can be counted at a glance. Level 5 is the five
+// bricks plus a banner on a pole. A todo not started yet shows an enemy tent,
+// a red triangle, the same every time.
+export const SITE_WIDTH = 8
+const BRICK = '.BBBBBB.'
+const BRICK_GAP = '........'
+const bricks = (level: number): string[] => Array.from({ length: level }, (_, index) => (index === 0 ? [BRICK, BRICK] : [BRICK_GAP, BRICK, BRICK])).flat()
+const BANNER = ['...PFFFF', '...PFFFF', '...PFFF.', '...P....']
+export const WORK_LEVELS: readonly (readonly string[])[] = [[], bricks(1), bricks(2), bricks(3), bricks(4), [...BANNER, ...bricks(5)]]
+export const ENEMY_TENT = ['...TT...', '..TTTT..', '..TTTT..', '.TTTTTT.', '.TTDDTT.', 'TTTDDTTT', 'TTTDDTTT']
+// B (brick) takes the agent's colour, F (banner) is victory green; on a failed
+// order both go grey. The tent is the same red either way.
+const SITE_COLORS = { P: '#d9dee5', T: '#e0483c', D: '#2b1a17' }
+export const BANNER_COLOR = '#3fb36b'
 // A mark is drawn only where it clears its neighbour and the standing agent,
-// whose body reaches about six pixels either side of its middle.
+// whose body reaches six pixels either side of its middle (a tent's peak and
+// brick stack are narrower at the top than at the base, which is what clears).
 const SITE_GAP = SITE_WIDTH + 1
-const AGENT_REACH = 6 + Math.ceil(SITE_WIDTH / 2)
+const AGENT_REACH = 9.5
 
-const siteRects = (site: Site, left: number, ground: number, flag: string): string => {
-  if (site.kind === 'ahead') return patternRects(ENEMY_TENT, left, ground - ENEMY_TENT.length + 1, key => SITE_COLORS[key as keyof typeof SITE_COLORS])
-  const art = WORK_LEVELS[site.level] ?? []
-  return patternRects(art, left, ground - art.length + 1, key => (key === 'F' ? flag : SITE_COLORS[key as keyof typeof SITE_COLORS]))
+const siteRects = (site: Site, left: number, ground: number, brick: string, banner: string): string => {
+  const color = (key: string) => (key === 'B' ? brick : key === 'F' ? banner : SITE_COLORS[key as keyof typeof SITE_COLORS])
+  const art = site.kind === 'ahead' ? ENEMY_TENT : (WORK_LEVELS[site.level] ?? [])
+  return patternRects(art, left, ground - art.length + 1, color)
 }
 
 // A landmark's pattern as SVG rects at (left, top); '.' is clear.
@@ -436,7 +437,7 @@ export function roadSvg(appearance: Appearance, fraction: number, state: 'travel
       : thinned(road.sites.length, reach / road.sites.length)
           .map(index => ({ index, centre: roadStart + (reach * index) / stops + SPRITE_WIDTH / 2 }))
           .filter(({ centre }) => Math.abs(centre - (at + SPRITE_WIDTH / 2)) >= AGENT_REACH)
-          .map(({ index, centre }) => siteRects(road.sites[index]!, Math.round(centre - SITE_WIDTH / 2), ground, state === 'failed' ? ROAD_COLORS.failed : appearance.color))
+          .map(({ index, centre }) => siteRects(road.sites[index]!, Math.round(centre - SITE_WIDTH / 2), ground, state === 'failed' ? ROAD_COLORS.failed : appearance.color, state === 'failed' ? ROAD_COLORS.failed : BANNER_COLOR))
           .join('')
   const mood: SpriteMood = state === 'failed' ? 'failed' : state === 'done' ? 'content' : 'deliberating'
   // A fallen dispatch is framed as an alarm, even though its agent went gray.
@@ -472,9 +473,11 @@ const thinned = (count: number, apart: number, wanted = SITE_GAP): number[] => {
   return Array.from({ length: count }, (_, index) => index).filter(index => index % every === 0)
 }
 
-// The text marks of the same sites: a cairn growing ▁ ▂ ▃ ▅ and a banner (⚐) at
-// level 5, and ▲ for a tent.
-export const TEXT_WORK = ['', '▁', '▂', '▃', '▅', '⚐'] as const
+// The text marks of the same sites: the level itself as a plain digit 1 to 5
+// (ASCII, so every terminal font draws it and the levels read apart), and ▲
+// (Geometric Shapes, which Windows Terminal's Cascadia fonts have) for a tent.
+// Level 0 leaves the road as it was.
+export const TEXT_WORK = ['', '1', '2', '3', '4', '5'] as const
 export const TEXT_TENT = '▲'
 
 // The same road as text, for the terminal: ▰ done, ▱ to go, the agent's

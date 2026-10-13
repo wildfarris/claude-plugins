@@ -66,7 +66,7 @@
     "callTally": {
       "type": "boolean",
       "title": "Work along the road",
-      "description": "In the court, draw each order's todos as stops along its road: a cairn that grows with the tool calls made on each finished todo (one level per ten calls, up to a banner at fifty), and a little enemy tent on each todo not yet started. Off leaves the plain road.",
+      "description": "In the court, draw each order's todos as stops along its road: a stack of bricks on each finished todo (one brick per ten tool calls made on it, up to five, the fifth with a banner), and a red enemy tent on each todo not yet started. Off leaves the plain road.",
       "default": true
     }
   }
