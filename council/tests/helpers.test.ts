@@ -126,7 +126,7 @@ describe('review mode', () => {
 
 describe('settings', () => {
   test('defaults to Opus for reviews and Sonnet at low effort for advisors, and rejects bad values', () => {
-    expect(readSettings({})).toEqual({ briefModel: 'opus', advisorModel: 'sonnet', advisorEffort: 'low', deepModel: 'opus', deepEffort: 'high', triageModel: 'haiku', arbiter: null })
+    expect(readSettings({})).toEqual({ briefModel: 'opus', advisorModel: 'sonnet', advisorEffort: 'low', deepModel: 'opus', deepEffort: 'high', triageModel: 'haiku', arbiter: null, isTallyShown: true })
     expect(readSettings({ advisorEffort: 'extreme', advisorModel: '  ' }).advisorEffort).toBe('low')
     expect(readSettings({ advisorModel: '  ' }).advisorModel).toBe('sonnet')
   })
@@ -362,5 +362,14 @@ describe('files from Windows editors', () => {
     expect(parseLessons(`\uFEFF${JSON.stringify([lesson])}`)).toEqual([lesson])
     expect(parseGuidance('\uFEFF## Everywhere\n- Prefers Go.\n')).toEqual([{ scope: 'Everywhere', items: ['Prefers Go.'] }])
     expect(parseMemberFile('auditor.md', '\uFEFF---\r\ntitle: The Auditor\r\n---\r\ncompliance', 'user', undefined, 0)).toMatchObject({ member: { title: 'The Auditor', remit: 'compliance' } })
+  })
+})
+
+describe('tally setting', () => {
+  test('the call tally is on by default and only a boolean turns it off', () => {
+    expect(readSettings({}).isTallyShown).toBe(true)
+    expect(readSettings({ callTally: false }).isTallyShown).toBe(false)
+    expect(readSettings({ callTally: true }).isTallyShown).toBe(true)
+    expect(readSettings({ callTally: 'no' }).isTallyShown).toBe(true)
   })
 })

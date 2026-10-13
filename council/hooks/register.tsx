@@ -563,6 +563,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onChamber: () => update($, isChamberShownAtom, () => true),
       openVerdictId: await read($, openVerdictAtom),
       isFinishedShown: await read($, isFinishedShownAtom),
+      isTallyShown: settings.isTallyShown,
       openOrderId: await read($, openOrderAtom),
       onToggleOrder: id => update($, openOrderAtom, current => (current === id ? null : id)),
       portrait: (seat, report) => {

@@ -115,12 +115,13 @@ The arbiter is a council member, a model call: not you, and not a proxy for you.
 
 **Limits:**
 - Progress follows the todo list the agent reports with the council's own `mcp__council__progress` tool (Claude Code's TodoWrite isn't offered to subagents in every build). If an agent doesn't report, its row shows steps and edits but stays put. If it adds todos, it steps back.
+- Each row also shows a small tally of the agent's tool calls beside its edit count: one glyph per ten calls (⚔ for a knight, ○ for a scout), up to ten, then `+N` for more tens, and a † on an order that failed. The number of calls stays beside the glyphs (e.g. `⚔⚔⚔ 34 calls`); an order under ten calls shows none. Turn it off with the `callTally` setting.
 - Without sidekick, only file edits are held to the folder, not shell commands.
 - An order's council sits for about a minute (five advisor calls) before work starts; an arbiter's review adds one more call when there are conditions.
 
 ## Settings
 
-Set them with `/plugin configure council@personal-mods`: `briefModel` (review mode's herald, default Opus), `advisorModel` (default Sonnet), `advisorEffort` (default low), the brain trust's `deepModel` (default Opus) and `deepEffort` (default high), court mode's `triageModel` (default Haiku), and `arbiter` (a member's id, its member file's name without `.md`, e.g. `hand` for `~/.claude/council/members/hand.md` or `castellan` for a built-in; empty for none, the default).
+Set them with `/plugin configure council@personal-mods`: `briefModel` (review mode's herald, default Opus), `advisorModel` (default Sonnet), `advisorEffort` (default low), the brain trust's `deepModel` (default Opus) and `deepEffort` (default high), court mode's `triageModel` (default Haiku), `callTally` (the court's tool-call tally, default on), and `arbiter` (a member's id, its member file's name without `.md`, e.g. `hand` for `~/.claude/council/members/hand.md` or `castellan` for a built-in; empty for none, the default).
 
 ## Developing
 

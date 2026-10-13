@@ -8,6 +8,7 @@ import type { ElementTable } from 'claude-code'
 import type { AdvisorReport, Council, Court, Order, Seat } from '../../types'
 import { seatsOf } from '../council'
 import { currentTodo, isFolded, progressOf } from '../court'
+import { tallyLabel } from '../tally'
 
 export type CourtViewProps = {
   court: Court
@@ -25,6 +26,8 @@ export type CourtViewProps = {
   // A small animated portrait (desktop), or null (terminal: names only).
   portrait: (seat: Seat, report: AdvisorReport) => unknown
   isFinishedShown: boolean
+  // Draw each order's tool-call tally (the tallyGlyphs setting).
+  isTallyShown: boolean
   onToggleFinished: () => unknown
   // The finished order whose full report is open.
   openOrderId: string | null
@@ -51,9 +54,10 @@ const reportText = (order: Order) =>
 
 // An order on the road: who and where, its progress on the right, the road,
 // then what it is doing now.
-function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown) {
+function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown, isTallyShown: boolean) {
   const { Box, Text } = el
   const { done, total } = progressOf(order)
+  const tally = isTallyShown ? tallyLabel(order.steps, order.role, order.status) : ''
   const isWaiting = order.status === 'approved'
   const now = isWaiting ? 'approved · waiting to be dispatched' : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
   return (
@@ -63,7 +67,7 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
           <Text bold wrap="truncate-end">{`${ROLE_GLYPH[order.role]} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`}</Text>
           <Text dimColor>{order.id}</Text>
         </Box>
-        <Text color={isWaiting ? 'inactive' : 'claude'}>{`${done}/${total}${order.edits > 0 ? ` · ${order.edits} edit${order.edits === 1 ? '' : 's'}` : ''}`}</Text>
+        <Text color={isWaiting ? 'inactive' : 'claude'}>{`${done}/${total}${order.edits > 0 ? ` · ${order.edits} edit${order.edits === 1 ? '' : 's'}` : ''}${tally === '' ? '' : ` · ${tally}`}`}</Text>
       </Box>
       {road(order)}
       <Text dimColor italic wrap="truncate-end">
@@ -74,15 +78,17 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
 }
 
 // An order that is back: one line with how it ended; pressed, its whole report.
-function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (id: string) => unknown) {
+function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (id: string) => unknown, isTallyShown: boolean) {
   const { Box, Text, Button } = el
   const isDone = order.status === 'done'
+  const tally = isTallyShown ? tallyLabel(order.steps, order.role, order.status) : ''
   return (
     <Box key={`order-${order.id}`} flexDirection="column">
       <Box flexDirection="row" gap={1}>
         <Text color={isDone ? 'success' : 'error'}>{isDone ? '✓' : '✕'}</Text>
         <Button key={`order-toggle-${order.id}`} label={`${isOpen ? '▾' : '▸'} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`} plain onPress={() => onToggle(order.id)} />
         <Text dimColor>{order.id}</Text>
+        {tally !== '' && <Text dimColor>{tally}</Text>}
       </Box>
       {isOpen && (
         <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={isDone ? 'success' : 'error'}>
@@ -186,8 +192,8 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
           </Text>
         </Box>
       )}
-      {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road)))}
-      {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
+      {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road, props.isTallyShown)))}
+      {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder, props.isTallyShown)))}
       {archived.length > 0 && (
         <Box flexDirection="column" rowGap={1} marginTop={1}>
           <Button
@@ -197,7 +203,7 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
             dimColor
             onPress={props.onToggleFinished}
           />
-          {props.isFinishedShown && archived.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder))}
+          {props.isFinishedShown && archived.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder, props.isTallyShown))}
         </Box>
       )}
       <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1}>

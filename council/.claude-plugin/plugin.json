@@ -62,6 +62,12 @@
       "type": "string",
       "title": "Arbiter",
       "description": "The id of one seated member (its member file's name, e.g. hand) who reviews the conditions on an approved plan of orders: one low-effort call on the advisor model keeps or drops each. Leave empty for none: every condition stands."
+    },
+    "callTally": {
+      "type": "boolean",
+      "title": "Tool-call tally",
+      "description": "In the court, show a small glyph tally beside each order's counts: one glyph per ten tool calls (up to ten, then +N), a sword for knights, a hollow circle for scouts, and a dagger on an order that failed.",
+      "default": true
     }
   }
 }
