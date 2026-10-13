@@ -115,13 +115,13 @@ The arbiter is a council member, a model call: not you, and not a proxy for you.
 
 **Limits:**
 - Progress follows the todo list the agent reports with the council's own `mcp__council__progress` tool (Claude Code's TodoWrite isn't offered to subagents in every build). If an agent doesn't report, its row shows steps and edits but stays put. If it adds todos, it steps back.
-- Each row also shows a small tally of the agent's tool calls beside its edit count: one glyph per ten calls (⚔ for a knight, ○ for a scout), up to ten, then `+N` for more tens, and a † on an order that failed. The number of calls stays beside the glyphs (e.g. `⚔⚔⚔ 34 calls`); an order under ten calls shows none. Turn it off with the `callTally` setting.
+- Each row's road shows the work done. Every todo is a stop along the road: the agent stands at the first unfinished one, a finished stop shows a cairn that grows with the tool calls the agent made while that todo was in progress (none under 10 calls, then a low heap, a small cairn, a taller one, one with a pole, and from 50 calls a cairn flying a banner in the agent's colour), and each stop still ahead shows a little enemy tent. Calls made when no todo is in progress (before the agent's first list, or between two todos) are not credited to any stop. The row beside it shows the totals, `N edits · N calls`. Turn the stops, cairns and tents off with the `callTally` setting; the plain road and the numbers stay.
 - Without sidekick, only file edits are held to the folder, not shell commands.
 - An order's council sits for about a minute (five advisor calls) before work starts; an arbiter's review adds one more call when there are conditions.
 
 ## Settings
 
-Set them with `/plugin configure council@personal-mods`: `briefModel` (review mode's herald, default Opus), `advisorModel` (default Sonnet), `advisorEffort` (default low), the brain trust's `deepModel` (default Opus) and `deepEffort` (default high), court mode's `triageModel` (default Haiku), `callTally` (the court's tool-call tally, default on), and `arbiter` (a member's id, its member file's name without `.md`, e.g. `hand` for `~/.claude/council/members/hand.md` or `castellan` for a built-in; empty for none, the default).
+Set them with `/plugin configure council@personal-mods`: `briefModel` (review mode's herald, default Opus), `advisorModel` (default Sonnet), `advisorEffort` (default low), the brain trust's `deepModel` (default Opus) and `deepEffort` (default high), court mode's `triageModel` (default Haiku), `callTally` (the road's work sites and tents, default on), and `arbiter` (a member's id, its member file's name without `.md`, e.g. `hand` for `~/.claude/council/members/hand.md` or `castellan` for a built-in; empty for none, the default).
 
 ## Developing
 

@@ -132,7 +132,14 @@ export type OrderRole = 'scout' | 'knight'
 // it; 'done' / 'failed': the agent came back.
 export type OrderStatus = 'approved' | 'dispatched' | 'done' | 'failed'
 
-export type OrderTodo = { content: string; status: 'pending' | 'in_progress' | 'completed'; activeForm: string }
+export type OrderTodo = {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+  activeForm: string
+  // Tool calls the agent made while this todo was in progress (absent in orders
+  // saved before the court counted them, and until a first call).
+  calls?: number
+}
 
 export type Order = {
   // O1, O2…: what Claude names in the dispatch.

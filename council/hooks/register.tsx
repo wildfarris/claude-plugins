@@ -89,6 +89,7 @@ import {
   type RulingResult,
 } from './court'
 import { NO_HOME, homeFromEnvironment, joinUnder } from './paths'
+import { carryCalls, creditCall, sitesOf } from './tally'
 import { courtView } from './views/court'
 import { lessonsView } from './views/lessons'
 import {
@@ -554,16 +555,17 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       road: order => {
         const state = order.status === 'done' ? 'done' : order.status === 'failed' ? 'failed' : 'travelling'
         const { fraction } = progressOf(order)
+        // The callTally setting turns the work sites and tents off, leaving the plain road.
+        const sites = settings.isTallyShown ? sitesOf(order) : undefined
         const elements = table as unknown as Record<string, ((props: Record<string, unknown>) => unknown) | undefined>
         return e.surface !== 'terminal' && elements.Svg
           ? // No width: the strip takes its own (320px) up to the slot, so a narrow sidebar scales it down rather than clipping the house.
-            elements.Svg({ key: `road-${order.id}`, source: roadSvg(AGENT_LOOK[order.role], fraction, state), alt: `${order.role} on the road to ${order.relFolder}` })
-          : <table.Text key={`road-${order.id}`} color={order.status === 'failed' ? 'error' : order.status === 'done' ? 'success' : 'claude'}>{roadText(order.role === 'knight' ? '♞' : '♟', fraction, state)}</table.Text>
+            elements.Svg({ key: `road-${order.id}`, source: roadSvg(AGENT_LOOK[order.role], fraction, state, 2, sites), alt: `${order.role} on the road to ${order.relFolder}` })
+          : <table.Text key={`road-${order.id}`} color={order.status === 'failed' ? 'error' : order.status === 'done' ? 'success' : 'claude'}>{roadText(order.role === 'knight' ? '♞' : '♟', fraction, state, undefined, sites)}</table.Text>
       },
       onChamber: () => update($, isChamberShownAtom, () => true),
       openVerdictId: await read($, openVerdictAtom),
       isFinishedShown: await read($, isFinishedShownAtom),
-      isTallyShown: settings.isTallyShown,
       openOrderId: await read($, openOrderAtom),
       onToggleOrder: id => update($, openOrderAtom, current => (current === id ? null : id)),
       portrait: (seat, report) => {
@@ -880,7 +882,8 @@ async function followAgentCall($: EngineInterface, agentId: string, tool: string
   await updateOrder(
     $,
     candidate => candidate.id === order.id,
-    current => ({ ...current, steps: current.steps + 1, ...(todos ? { todos } : {}) }),
+    // A new list keeps the calls already credited; any other call is credited to the task in progress.
+    current => ({ ...current, steps: current.steps + 1, todos: todos ? carryCalls(current.todos, todos) : creditCall(current.todos) }),
   )
   return { order }
 }

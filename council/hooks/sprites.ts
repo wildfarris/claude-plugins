@@ -5,6 +5,7 @@
 // animation reflects the output with no extra model call.
 
 import type { Accessory, AdvisorReport, CouncilPhase } from '../types'
+import type { RoadSites, Site } from './tally'
 
 export const SPRITE_WIDTH = 16
 export const SPRITE_HEIGHT = 18
@@ -367,6 +368,35 @@ const HOUSE = ['....RR....', '...RRRR...', '..RRRRRR..', '.RRRRRRRR.', 'RRRRRRRR
 const HOUSE_COLORS = { R: '#8a5a3c', H: '#b8a27a', d: '#3e2a1e', dark: '#4a4038', lit: '#f2c230' }
 const ROAD_COLORS = { toGo: '#4a4741', failed: '#7a7a7a', pennant: '#d9dee5' }
 
+// The work sites along a road, one per todo, all drawn on one 5-wide footing
+// that stands on the ground line. A finished todo shows a cairn that grows
+// with the tool calls made on it (levels 1-5, one per ten calls; level 0 draws
+// nothing): a low heap, a small cairn, a taller one, one with a pole, and at
+// level 5 the pole flies a banner in the agent's colour, a landmark that
+// reads from afar. A todo not started yet shows an enemy tent, the same one
+// every time.
+export const SITE_WIDTH = 5
+export const WORK_LEVELS: readonly (readonly string[])[] = [
+  [],
+  ['.SSS.', 'SSSSS'],
+  ['..S..', '.SSS.', 'SSSSS'],
+  ['..S..', '.SSS.', '.SSS.', 'SSSSS'],
+  ['..P..', '..P..', '..P..', '..S..', '.SSS.', '.SSS.', 'SSSSS'],
+  ['..PFF', '..PFF', '..PF.', '..P..', '..S..', '.SSS.', '.SSS.', 'SSSSS'],
+]
+export const ENEMY_TENT = ['..T..', '.TTT.', 'TTDTT', 'TTDTT']
+const SITE_COLORS = { S: '#9a9488', P: '#b8a27a', T: '#a8453b', D: '#2b1a17' }
+// A mark is drawn only where it clears its neighbour and the standing agent,
+// whose body reaches about six pixels either side of its middle.
+const SITE_GAP = SITE_WIDTH + 1
+const AGENT_REACH = 6 + Math.ceil(SITE_WIDTH / 2)
+
+const siteRects = (site: Site, left: number, ground: number, flag: string): string => {
+  if (site.kind === 'ahead') return patternRects(ENEMY_TENT, left, ground - ENEMY_TENT.length + 1, key => SITE_COLORS[key as keyof typeof SITE_COLORS])
+  const art = WORK_LEVELS[site.level] ?? []
+  return patternRects(art, left, ground - art.length + 1, key => (key === 'F' ? flag : SITE_COLORS[key as keyof typeof SITE_COLORS]))
+}
+
 // A landmark's pattern as SVG rects at (left, top); '.' is clear.
 const patternRects = (pattern: readonly string[], left: number, top: number, colorOf: (key: string) => string | undefined): string =>
   gridRects(
@@ -380,7 +410,13 @@ const patternRects = (pattern: readonly string[], left: number, top: number, col
 // other, the road paved in the agent's colour as far as its todos have
 // brought it, and the agent standing there; home, the house lights up and
 // flies the agent's pennant.
-export function roadSvg(appearance: Appearance, fraction: number, state: 'travelling' | 'done' | 'failed', pixelSize = 2): string {
+//
+// With `road` (an order's todos as sites, see tally.ts) each todo is a stop on
+// the road, evenly spaced: the agent stands at the first unfinished one,
+// finished ones behind it show their work level, and the ones ahead each show
+// a tent. Where stops come closer than a mark is wide, only every few are
+// drawn, and none is drawn under the agent. Without `road`, just the road.
+export function roadSvg(appearance: Appearance, fraction: number, state: 'travelling' | 'done' | 'failed', pixelSize = 2, road?: RoadSites): string {
   const width = ROAD_WIDTH
   const height = ROAD_HEIGHT
   const ground = height - 3
@@ -391,7 +427,17 @@ export function roadSvg(appearance: Appearance, fraction: number, state: 'travel
   const roadStart = castleRight + 3
   const roadEnd = houseLeft - 1
   const clamped = Math.max(0, Math.min(1, fraction))
-  const at = roadStart + (roadEnd - roadStart - SPRITE_WIDTH + 2) * clamped
+  const reach = roadEnd - roadStart - SPRITE_WIDTH + 2
+  const stops = road?.sites.length ?? 0
+  const at = stops > 0 ? roadStart + (reach * Math.min(stops, Math.max(0, road!.stands))) / stops : roadStart + reach * clamped
+  const marks =
+    road === undefined || stops === 0
+      ? ''
+      : thinned(road.sites.length, reach / road.sites.length)
+          .map(index => ({ index, centre: roadStart + (reach * index) / stops + SPRITE_WIDTH / 2 }))
+          .filter(({ centre }) => Math.abs(centre - (at + SPRITE_WIDTH / 2)) >= AGENT_REACH)
+          .map(({ index, centre }) => siteRects(road.sites[index]!, Math.round(centre - SITE_WIDTH / 2), ground, state === 'failed' ? ROAD_COLORS.failed : appearance.color))
+          .join('')
   const mood: SpriteMood = state === 'failed' ? 'failed' : state === 'done' ? 'content' : 'deliberating'
   // A fallen dispatch is framed as an alarm, even though its agent went gray.
   const frame = PLAQUE_FRAME[state === 'failed' ? 'alarmed' : mood]
@@ -413,17 +459,39 @@ export function roadSvg(appearance: Appearance, fraction: number, state: 'travel
     pennant,
     `<rect x="${roadStart}" y="${ground - 1}" width="${roadEnd - roadStart}" height="1" fill="${ROAD_COLORS.toGo}"/>`,
     `<rect x="${roadStart}" y="${ground - 1}" width="${Math.max(0, Math.min(roadEnd - roadStart, pavedTo))}" height="1" fill="${paved}"/>`,
+    marks,
     `<g transform="translate(${at.toFixed(1)} ${ground - SPRITE_HEIGHT})">${sprite}</g>`,
     '</svg>',
   ].join('')
 }
 
+// The stops that get a mark when `count` stops are `apart` pixels (or cells)
+// apart: all of them, or every few when they would crowd each other.
+const thinned = (count: number, apart: number, wanted = SITE_GAP): number[] => {
+  const every = apart > 0 ? Math.max(1, Math.ceil(wanted / apart)) : count
+  return Array.from({ length: count }, (_, index) => index).filter(index => index % every === 0)
+}
+
+// The text marks of the same sites: a cairn growing ▁ ▂ ▃ ▅ and a banner (⚐) at
+// level 5, and ▲ for a tent.
+export const TEXT_WORK = ['', '▁', '▂', '▃', '▅', '⚐'] as const
+export const TEXT_TENT = '▲'
+
 // The same road as text, for the terminal: ▰ done, ▱ to go, the agent's
 // glyph where it stands, and the house (⌂) or flag (⚑) at the end.
-export function roadText(glyph: string, fraction: number, state: 'travelling' | 'done' | 'failed', columns = ROAD_COLUMNS): string {
+export function roadText(glyph: string, fraction: number, state: 'travelling' | 'done' | 'failed', columns = ROAD_COLUMNS, road?: RoadSites): string {
   const span = Math.max(4, columns - 3)
-  const at = Math.round(Math.max(0, Math.min(1, fraction)) * (span - 1))
+  const stops = road?.sites.length ?? 0
+  const cellOf = (index: number) => Math.round((index / stops) * (span - 1))
+  const at = stops > 0 ? cellOf(Math.min(stops, Math.max(0, road!.stands))) : Math.round(Math.max(0, Math.min(1, fraction)) * (span - 1))
   const cells: string[] = Array.from({ length: span }, (_, index) => (index < at ? '━' : '┄'))
+  if (road !== undefined && stops > 0) {
+    // One cell each; stops that share a cell show the last, and none under the agent.
+    road.sites.forEach((site, index) => {
+      const cell = cellOf(index)
+      if (cell !== at && cell < span) cells[cell] = site.kind === 'ahead' ? TEXT_TENT : TEXT_WORK[site.level] || cells[cell]!
+    })
+  }
   cells[at] = state === 'failed' ? '✕' : glyph
   return `▙${cells.join('')}${state === 'done' ? '⚑' : '⌂'}`
 }

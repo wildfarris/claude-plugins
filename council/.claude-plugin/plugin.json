@@ -65,8 +65,8 @@
     },
     "callTally": {
       "type": "boolean",
-      "title": "Tool-call tally",
-      "description": "In the court, show a small glyph tally beside each order's counts: one glyph per ten tool calls (up to ten, then +N), a sword for knights, a hollow circle for scouts, and a dagger on an order that failed.",
+      "title": "Work along the road",
+      "description": "In the court, draw each order's todos as stops along its road: a cairn that grows with the tool calls made on each finished todo (one level per ten calls, up to a banner at fifty), and a little enemy tent on each todo not yet started. Off leaves the plain road.",
       "default": true
     }
   }

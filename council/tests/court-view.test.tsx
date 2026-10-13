@@ -36,7 +36,7 @@ const order = (patch: Partial<Order>): Order => ({
   ...patch,
 })
 
-const props = (orders: Order[], isTallyShown: boolean): CourtViewProps => ({
+const props = (orders: Order[]): CourtViewProps => ({
   court: { orders, isInSession: false, heldPrompt: null, rulings: [] } as never,
   council: null,
   bodyColumns: 80,
@@ -48,31 +48,25 @@ const props = (orders: Order[], isTallyShown: boolean): CourtViewProps => ({
   onToggleVerdict: () => undefined,
   portrait: () => null,
   isFinishedShown: false,
-  isTallyShown,
   onToggleFinished: () => undefined,
   openOrderId: null,
   onToggleOrder: () => undefined,
 })
 
-describe('court view tally', () => {
-  test('an active order shows its edits and its tally with the number beside it', () => {
-    const text = textOf(courtView(table, props([order({})], true)))
-    expect(text).toContain('12 edits · ⚔⚔⚔⚔⚔ 57 calls')
+describe('court rows', () => {
+  test('an active order shows its edits and calls as numbers, with no glyphs', () => {
+    const text = textOf(courtView(table, props([order({})])))
+    expect(text).toContain('12 edits · 57 calls')
+    for (const glyph of ['⚔', '†']) expect(text).not.toContain(glyph)
   })
 
-  test('the setting turns the tally off and leaves the row as it was', () => {
-    const text = textOf(courtView(table, props([order({})], false)))
-    expect(text).toContain('12 edits')
-    expect(text).not.toContain('⚔')
-    expect(text).not.toContain('calls')
+  test('an order with no calls yet shows none', () => {
+    expect(textOf(courtView(table, props([order({ steps: 0 })])))).not.toContain('call')
   })
 
-  test('a short order shows no tally', () => {
-    expect(textOf(courtView(table, props([order({ steps: 9 })], true)))).not.toContain('call')
-  })
-
-  test('a failed order that is back shows its tally ending in a dagger', () => {
-    const text = textOf(courtView(table, props([order({ status: 'failed', role: 'scout', steps: 31 })], true)))
-    expect(text).toContain('○○○† 31 calls')
+  test('a finished order shows its calls, still without glyphs', () => {
+    const text = textOf(courtView(table, props([order({ status: 'failed', role: 'scout', steps: 31 })])))
+    expect(text).toContain('31 calls')
+    for (const glyph of ['⚔', '†']) expect(text).not.toContain(glyph)
   })
 })

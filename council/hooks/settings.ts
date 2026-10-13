@@ -18,7 +18,7 @@ export type CouncilSettings = {
   // each); null for none. It must also be seated, which is checked when the
   // council rules (court.ts arbiterSeat).
   arbiter: AdvisorId | null
-  // The court's glyph tally of each order's tool calls (tally.ts).
+  // The road's work sites and tents (tally.ts, sprites.ts roadSvg).
   isTallyShown: boolean
 }
 
