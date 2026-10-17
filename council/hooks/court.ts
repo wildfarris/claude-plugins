@@ -219,11 +219,34 @@ export function withArbiterReview(result: RulingResult, arbiter: Pick<Seat, 'tit
   return { ...result, conditions: kept.map(condition => condition.text), notes: [...(result.notes ?? []), summary, ...dropped] }
 }
 
+// The number of an order id (`O12` is 12), or undefined for anything else.
+const orderNumber = (id: string): number | undefined => {
+  const match = /^O(\d+)$/.exec(id)
+  return match ? Number(match[1]) : undefined
+}
+
+// The number the court's next order gets: the saved counter, but never at or
+// below a saved order's number (a court saved before the counter existed has
+// none, and starts one past its highest id). Compared as numbers, so O10 follows O9.
+export const nextOrderNumber = (court: Pick<Court, 'orders' | 'nextOrderId'>): number =>
+  Math.max(
+    Number.isInteger(court.nextOrderId) && court.nextOrderId! > 0 ? court.nextOrderId! : 1,
+    ...court.orders.map(order => (orderNumber(order.id) ?? 0) + 1),
+  )
+
+// The court with `orders` added and its counter moved past them, so their ids
+// stay taken after they are cleared or withdrawn.
+export const withOrdersAdded = (court: Court, orders: readonly Order[]): Court => ({
+  ...court,
+  orders: [...court.orders, ...orders],
+  nextOrderId: Math.max(nextOrderNumber(court), ...orders.map(order => (orderNumber(order.id) ?? 0) + 1)),
+})
+
 // `now` (ms) stamps when each order was approved, which starts its expiry clock.
 export function newOrders(court: Court, proposal: Proposal, root: string, conditions: string[], now?: number): Order[] {
-  const next = court.orders.length
+  const next = nextOrderNumber(court)
   return proposal.dispatches.map((dispatch, index) => ({
-    id: `O${next + index + 1}`,
+    id: `O${next + index}`,
     role: dispatch.role,
     // In the root's own separators: never a mixed `C:\root/folder`.
     folder: joinUnder(root, dispatch.folder),

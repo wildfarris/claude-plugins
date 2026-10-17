@@ -187,6 +187,10 @@ export type Ruling = {
 
 export type Court = {
   orders: Order[]
+  // The number the next order gets (O<n>), counting up for the life of the
+  // court so clearing or withdrawing orders never frees an id. Absent in a court
+  // saved before it existed: ids then continue after the highest saved one.
+  nextOrderId?: number
   rulings: Ruling[]
   // Court mode: every prompt goes to the council before Claude.
   isInSession: boolean

@@ -77,6 +77,7 @@ import {
   readTodos,
   readWithdrawal,
   withExpired,
+  withOrdersAdded,
   withdrawOrders,
   withdrawalText,
   councilDigest,
@@ -801,16 +802,20 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
   const ruled = ruling(council, proposal.plan)
   const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled) : ruled
-  const court = await read($, courtAtom)
-  const orders = result.isApproved ? newOrders(court, proposal, root, result.conditions, await $.clock.now()) : []
-  await update($, courtAtom, current => ({
-    ...current,
-    orders: [...current.orders, ...orders],
-    rulings: [
-      ...current.rulings.slice(-9),
-      { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(result.notes ? { notes: result.notes } : {}) },
-    ],
-  }))
+  const now = await $.clock.now()
+  // Numbered inside the update, from the court as it is then, so an id is never
+  // handed out twice; the court's counter moves past it and clearing never frees it.
+  let orders: Order[] = []
+  await update($, courtAtom, current => {
+    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now) : []
+    return {
+      ...withOrdersAdded(current, orders),
+      rulings: [
+        ...current.rulings.slice(-9),
+        { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(result.notes ? { notes: result.notes } : {}) },
+      ],
+    }
+  })
   return rulingText(result, orders)
 }
 
