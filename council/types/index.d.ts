@@ -129,8 +129,9 @@ export type Roster = {
 export type OrderRole = 'scout' | 'knight'
 
 // 'approved': waiting for Claude to dispatch it; 'dispatched': an agent is on
-// it; 'done' / 'failed': the agent came back.
-export type OrderStatus = 'approved' | 'dispatched' | 'done' | 'failed'
+// it; 'done' / 'failed': the agent came back; 'withdrawn': retired before it
+// was dispatched (Claude withdrew it, or it expired), with `withdrawnReason`.
+export type OrderStatus = 'approved' | 'dispatched' | 'done' | 'failed' | 'withdrawn'
 
 export type OrderTodo = {
   content: string
@@ -161,6 +162,12 @@ export type Order = {
   report: string
   startedAt: number | null
   endedAt: number | null
+  // When the council approved it (ms), which starts its expiry clock. Absent in
+  // orders saved before expiry existed; the court stamps those when it next
+  // looks at them.
+  approvedAt?: number
+  // Why a withdrawn order was withdrawn ('expired' when it timed out).
+  withdrawnReason?: string
   // Finished, and folded away at the person's next prompt. Absent in orders
   // saved before folding existed.
   isFolded?: boolean

@@ -7,7 +7,7 @@ import type { ElementTable } from 'claude-code'
 
 import type { AdvisorReport, Council, Court, Order, Seat } from '../../types'
 import { seatsOf } from '../council'
-import { currentTodo, isFolded, progressOf } from '../court'
+import { currentTodo, isFinished, isFolded, progressOf } from '../court'
 import { callsLabel } from '../tally'
 
 export type CourtViewProps = {
@@ -40,8 +40,6 @@ const concernColor = (concern: number) => (concern >= 4 ? 'error' : concern === 
 // Newest first: by order number (O12 before O3).
 const orderNumber = (order: Order) => Number(order.id.replace(/^\D+/, '')) || 0
 const newestFirst = (left: Order, right: Order) => orderNumber(right) - orderNumber(left)
-
-const isFinished = (order: Order) => order.status === 'done' || order.status === 'failed'
 
 // The agent's report as plain text: markdown marks dropped, paragraphs kept.
 const reportText = (order: Order) =>
@@ -76,8 +74,24 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
 }
 
 // An order that is back: one line with how it ended; pressed, its whole report.
+// A withdrawn order has no report: its reason shows under it.
 function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (id: string) => unknown) {
   const { Box, Text, Button } = el
+  // Withdrawn before it was dispatched: greyed, with why instead of a report.
+  if (order.status === 'withdrawn') {
+    return (
+      <Box key={`order-${order.id}`} flexDirection="column">
+        <Box flexDirection="row" gap={1}>
+          <Text dimColor>⊘</Text>
+          <Text dimColor wrap="truncate-end">{`${ROLE_TITLE[order.role]} · ${order.relFolder}/`}</Text>
+          <Text dimColor>{order.id}</Text>
+        </Box>
+        <Box paddingLeft={2}>
+          <Text dimColor italic wrap="wrap">{`withdrawn · ${order.withdrawnReason ?? 'no reason given'}`}</Text>
+        </Box>
+      </Box>
+    )
+  }
   const isDone = order.status === 'done'
   const calls = callsLabel(order.steps)
   return (

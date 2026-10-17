@@ -427,3 +427,95 @@ test('the arbiter is still a member: it rules, its own conditions are reviewed, 
   const consult = String(((await $.tool.call({ tool: 'mcp__council__consult', question: 'Name it limiter or throttle?', context: 'A rate limiter.' } as never)) as { result?: unknown }).result)
   expect(consult).toContain('- The Court Jester (concern 3/5): Names will grate. Rename the flag.')
 })
+
+const withdraw = ($: Engine, ids: string[], reason = 'The person changed their mind.', agentId?: string) =>
+  $.tool.call({ tool: 'mcp__council__withdraw_orders', ids, reason, ...(agentId ? { agentId } : {}) } as never)
+const DAY = 24 * 60 * 60 * 1000
+
+test('withdraw_orders retires approved orders, refuses the rest by name, and a withdrawn order cannot be dispatched', async ($, on) => {
+  courtStandIn(on)
+  await start($)
+  await propose($, PLAN)
+  await propose($, PLAN)
+  // O1 is dispatched, O2 withdrawn; O3 and O4 are still open.
+  await spawn($, 'council:knight', 'O1 api limits')
+  const first = text(await withdraw($, ['O1', 'O2', 'O9']))
+  expect(first).toContain('Withdrew O2 (The person changed their mind.).')
+  expect(first).toContain('Refused O1: already dispatched')
+  expect(first).toContain('Refused O9: no such order')
+  expect(text(await withdraw($, ['O2']))).toContain('Refused O2: already withdrawn')
+  expect(text(await withdraw($, ['O3'], 'Superseded.'))).toContain('Withdrew O3 (Superseded.).')
+
+  // A dispatch must name an open order: the withdrawn ones are refused and left out of the list.
+  const refused = (await spawn($, 'council:knight', 'O3 api limits')) as { deny?: string }
+  expect(refused.deny).toContain('open orders are O4 (scout, web/)')
+  expect(refused.deny).not.toContain('O3 (')
+  expect((await spawn($, 'council:scout', 'O2 web retries')) as { deny?: string }).toMatchObject({ deny: expect.stringContaining('open orders are O4') })
+  expect(((await spawn($, 'council:scout', 'O4 web retries')) as { agentId?: string }).agentId).toBeDefined()
+
+  // The finished ones are refused too.
+  await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-1', reason: 'answer' } as never)
+  expect(text(await withdraw($, ['O1']))).toContain('Refused O1: already done')
+  expect(text(await withdraw($, ['O4']))).toContain('Refused O4: already dispatched')
+  expect(text(await withdraw($, ['O1'], ''))).toContain('Give a short reason')
+  expect(text(await withdraw($, []))).toContain('Name the orders')
+})
+
+test('an agent carrying an order cannot withdraw orders', async ($, on) => {
+  courtStandIn(on)
+  await start($)
+  await propose($, PLAN)
+  await spawn($, 'council:knight', 'O1 api limits')
+  expect(text(await withdraw($, ['O2'], 'Not needed.', 'agent-1'))).toContain('cannot withdraw orders')
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /On the road · 2/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('withdrawn orders show their reason in the finished section and fold away at your next message', async ($, on) => {
+  courtStandIn(on)
+  await start($)
+  await propose($, PLAN)
+  await withdraw($, ['O2'], 'Plan changed.')
+  let pane = await mountPane($)
+  expect(await pane.find({ text: /On the road · 1/ })).toBeDefined()
+  expect(await pane.find({ text: /Back home · 1/ })).toBeDefined()
+  expect(await pane.find({ text: /^withdrawn · Plan changed\.$/ })).toBeDefined()
+  // A withdrawn order is not drawn on a road.
+  expect(await pane.find({ key: 'road-O2' })).toBeUndefined()
+  await pane.unmount()
+  await $.prompt.submit({ text: 'thanks', origin: { kind: 'composer' } } as never)
+  pane = await mountPane($)
+  expect(await pane.find({ text: /Back home/ })).toBeUndefined()
+  expect(await pane.find({ text: /▸ Archived · 1/ })).toBeDefined()
+  expect(await pane.find({ text: /withdrawn · Plan changed\./ })).toBeUndefined()
+  await pane.press({ key: 'court-finished' })
+  expect(await pane.find({ text: /^withdrawn · Plan changed\.$/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('an order nobody dispatches expires after a day; a dispatched one does not', async ($, on) => {
+  const harness = courtStandIn(on)
+  await start($)
+  await propose($, PLAN)
+  await spawn($, 'council:knight', 'O1 api limits')
+  await harness.clock.advance(DAY - 60_000)
+  let pane = await mountPane($)
+  expect(await pane.find({ text: /On the road · 2/ })).toBeDefined()
+  await pane.unmount()
+
+  await harness.clock.advance(120_000)
+  pane = await mountPane($)
+  expect(await pane.find({ text: /On the road · 1/ })).toBeDefined()
+  expect(await pane.find({ text: /^withdrawn · expired$/ })).toBeDefined()
+  expect(await pane.find({ text: /Knight · api\// })).toBeDefined()
+  await pane.unmount()
+
+  // The expired order is no longer open; the dispatched one is still on its road and still reports.
+  expect((await spawn($, 'council:scout', 'O2 web retries')) as { deny?: string }).toMatchObject({ deny: expect.stringContaining('No approved order') })
+  expect(text(await withdraw($, ['O2']))).toContain('Refused O2: already withdrawn')
+  await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-1', reason: 'answer' } as never)
+  pane = await mountPane($)
+  expect(await pane.find({ text: /Back home · 2/ })).toBeDefined()
+  await pane.unmount()
+})

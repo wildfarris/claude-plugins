@@ -219,7 +219,8 @@ export function withArbiterReview(result: RulingResult, arbiter: Pick<Seat, 'tit
   return { ...result, conditions: kept.map(condition => condition.text), notes: [...(result.notes ?? []), summary, ...dropped] }
 }
 
-export function newOrders(court: Court, proposal: Proposal, root: string, conditions: string[]): Order[] {
+// `now` (ms) stamps when each order was approved, which starts its expiry clock.
+export function newOrders(court: Court, proposal: Proposal, root: string, conditions: string[], now?: number): Order[] {
   const next = court.orders.length
   return proposal.dispatches.map((dispatch, index) => ({
     id: `O${next + index + 1}`,
@@ -237,6 +238,7 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
     report: '',
     startedAt: null,
     endedAt: null,
+    ...(now === undefined ? {} : { approvedAt: now }),
   }))
 }
 
@@ -248,7 +250,7 @@ export function rulingText(result: Ruling & { conditions: string[] }, orders: re
     `The council approved the plan (gravest concern ${result.gravest}/5).`,
     ...(result.conditions.length > 0 ? ['Conditions:', ...result.conditions.map(condition => `- ${condition}`)] : []),
     ...(notes.length > 0 ? ['Notes (not conditions; the orders do not carry them):', ...notes.map(note => `- ${note}`)] : []),
-    'Dispatch each order with the Agent tool, its subagent_type as given, and its order id in the description (e.g. "O1 api limits"):',
+    'Dispatch each order with the Agent tool, its subagent_type as given, and its order id in the description (e.g. "O1 api limits"). An order you decide not to dispatch, withdraw with mcp__council__withdraw_orders; an undispatched order expires after a day:',
     ...orders.map(order => `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}`),
     'Each agent is given its folder, its todos and the conditions; keep your own prompt to the task.',
   ].join('\n')
@@ -259,7 +261,7 @@ export function rulingText(result: Ruling & { conditions: string[] }, orders: re
 export function matchOrder(orders: readonly Order[], subagentType: string, description: string, prompt: string): Order | undefined {
   const role = (Object.keys(AGENT_TYPES) as OrderRole[]).find(key => AGENT_TYPES[key] === subagentType)
   if (role === undefined) return undefined
-  const open = orders.filter(order => order.status === 'approved' && order.role === role)
+  const open = orders.filter(order => isOpen(order) && order.role === role)
   const named = /\bO(\d+)\b/.exec(`${description} ${prompt}`)
   if (named) return open.find(order => order.id === `O${named[1]}`)
   const byFolder = open.filter(order => `${description} ${prompt}`.includes(order.relFolder))
@@ -368,13 +370,101 @@ export function parseTriage(answer: string | undefined, seatIds: readonly string
   return { route: 'council' }
 }
 
-export const isFinished = (order: Order) => order.status === 'done' || order.status === 'failed'
+// An open order is approved and waiting: the only kind a dispatch may carry,
+// withdraw, or see expire.
+export const isOpen = (order: Pick<Order, 'status'>) => order.status === 'approved'
+
+// Withdrawn orders count as finished: they show in the finished section and fold away like the rest.
+export const isFinished = (order: Pick<Order, 'status'>) => order.status === 'done' || order.status === 'failed' || order.status === 'withdrawn'
 
 // Finished orders fold away at the person's next prompt, not on a timer, so
 // work that ends while they're away is still there when they come back.
 export const isFolded = (order: Order) => isFinished(order) && order.isFolded === true
 
 export const withFinishedFolded = (orders: readonly Order[]): Order[] => orders.map(order => (isFinished(order) && !order.isFolded ? { ...order, isFolded: true } : order))
+
+// ── Withdrawing orders that will not be dispatched ────────────────────────
+
+// An approved order nobody dispatches expires after this long (24 hours).
+export const ORDER_EXPIRY_MS = 24 * 60 * 60 * 1000
+export const EXPIRED_REASON = 'expired'
+
+export type Withdrawal = { ids: string[]; reason: string }
+
+// The withdraw_orders tool's input, checked: the order ids (any case, once
+// each) and a one-line reason, or why not.
+export function readWithdrawal(input: Record<string, unknown>): Withdrawal | { error: string } {
+  const ids = Array.isArray(input.ids) ? [...new Set((input.ids as unknown[]).filter(isText).map(id => id.trim().toUpperCase()))] : []
+  if (ids.length === 0) return { error: 'Name the orders to withdraw by id (e.g. ["O3"]).' }
+  if (!isText(input.reason)) return { error: 'Give a short reason for withdrawing them.' }
+  return { ids, reason: oneLine(input.reason) }
+}
+
+export type WithdrawalRefusal = { id: string; why: string }
+
+const NOT_OPEN: Partial<Record<Order['status'], string>> = {
+  dispatched: 'already dispatched (an agent is carrying it)',
+  done: 'already done',
+  failed: 'already finished (failed)',
+  withdrawn: 'already withdrawn',
+}
+
+// Withdraws the open orders named; refuses (and reports) the rest. The
+// others are untouched, and a withdrawn order is finished as of `now`.
+export function withdrawOrders(orders: readonly Order[], ids: readonly string[], reason: string, now: number): { orders: Order[]; withdrawn: string[]; refused: WithdrawalRefusal[] } {
+  const withdrawn: string[] = []
+  const refused: WithdrawalRefusal[] = []
+  for (const id of ids) {
+    const order = orders.find(candidate => candidate.id === id)
+    if (order === undefined) refused.push({ id, why: 'no such order' })
+    else if (isOpen(order)) withdrawn.push(id)
+    else refused.push({ id, why: NOT_OPEN[order.status] ?? `not open (${order.status})` })
+  }
+  return {
+    orders: orders.map((order): Order => (withdrawn.includes(order.id) ? { ...order, status: 'withdrawn', withdrawnReason: reason, endedAt: now } : order)),
+    withdrawn,
+    refused,
+  }
+}
+
+// What the tool tells Claude.
+export function withdrawalText(result: { withdrawn: readonly string[]; refused: readonly WithdrawalRefusal[] }, reason: string): string {
+  return [
+    result.withdrawn.length > 0 ? `Withdrew ${result.withdrawn.join(', ')} (${reason}). ${result.withdrawn.length === 1 ? 'It' : 'They'} can no longer be dispatched.` : 'Withdrew nothing.',
+    ...result.refused.map(refusal => `Refused ${refusal.id}: ${refusal.why}. Only approved orders that have not been dispatched can be withdrawn.`),
+  ].join('\n')
+}
+
+// The orders after expiry: an open order older than ORDER_EXPIRY_MS is
+// withdrawn as expired, and one with no approval time (saved before expiry
+// existed) is stamped `now`, which starts its clock. Dispatched and finished
+// orders are never touched. Returns the same array when nothing changes.
+export function withExpired(orders: readonly Order[], now: number): readonly Order[] {
+  let isChanged = false
+  const next = orders.map((order): Order => {
+    if (!isOpen(order)) return order
+    if (order.approvedAt === undefined) {
+      isChanged = true
+      return { ...order, approvedAt: now }
+    }
+    if (now - order.approvedAt < ORDER_EXPIRY_MS) return order
+    isChanged = true
+    return { ...order, status: 'withdrawn', withdrawnReason: EXPIRED_REASON, endedAt: now }
+  })
+  return isChanged ? next : orders
+}
+
+export const WITHDRAW_ORDERS_DESCRIPTION =
+  "Retire approved orders you have decided not to dispatch (the person changed their mind, a launch was rejected, the plan changed), so they stop waiting in the court. Give their ids and a short reason. Only approved orders that no agent has been sent on can be withdrawn; dispatched, finished, withdrawn and unknown ids are refused, and the reply says which. A withdrawn order cannot be dispatched; propose it again if it is needed after all. Undispatched orders also expire by themselves after 24 hours."
+
+export const WITHDRAW_ORDERS_SCHEMA = {
+  type: 'object',
+  properties: {
+    ids: { type: 'array', items: { type: 'string' }, description: 'The order ids to withdraw (e.g. ["O3", "O4"]).' },
+    reason: { type: 'string', description: 'Why they are not being dispatched, in a short phrase.' },
+  },
+  required: ['ids', 'reason'],
+}
 
 export const PROPOSE_ORDERS_DESCRIPTION =
   "Put a plan of dispatches to the person's council before doing the work. Each dispatch sends one agent into one subfolder: a scout (council:scout) reads and reports, a knight (council:knight) changes files and runs commands there. The advisors rule on the plan (it takes a minute); approved dispatches become orders O1, O2…, which you then carry out with the Agent tool, naming the order id in the description. Use it for multi-folder work, and always in court mode."

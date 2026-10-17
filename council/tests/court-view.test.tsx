@@ -70,3 +70,30 @@ describe('court rows', () => {
     for (const glyph of ['⚔', '†']) expect(text).not.toContain(glyph)
   })
 })
+
+describe('withdrawn orders', () => {
+  const withdrawn = (patch: Partial<Order> = {}) => order({ status: 'withdrawn', agentId: null, steps: 0, edits: 0, report: '', startedAt: null, withdrawnReason: 'plan changed', ...patch })
+
+  test('a withdrawn order shows its reason and no road, in the finished section', () => {
+    const text = textOf(courtView(table, { ...props([withdrawn()]), road: () => 'THE-ROAD' }))
+    expect(text).toContain('withdrawn · plan changed')
+    expect(text).toContain('Back home · 1')
+    expect(text).not.toContain('On the road')
+    expect(text).not.toContain('THE-ROAD')
+    expect(text).not.toContain('waiting to be dispatched')
+  })
+
+  test('a folded withdrawn order is archived with the finished ones', () => {
+    const text = textOf(courtView(table, props([withdrawn({ isFolded: true }), order({ id: 'O8', status: 'done', isFolded: true })])))
+    expect(text).toContain('Archived · 2')
+    expect(text).not.toContain('Back home')
+  })
+
+  test('an expired order says so', () => {
+    expect(textOf(courtView(table, props([withdrawn({ withdrawnReason: 'expired' })])))).toContain('withdrawn · expired')
+  })
+
+  test('clear finished is offered when only withdrawn orders are left', () => {
+    expect(textOf(courtView(table, props([withdrawn()])))).toContain('clear finished')
+  })
+})

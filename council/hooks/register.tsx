@@ -62,15 +62,23 @@ import {
   PROGRESS_TOOL,
   PROPOSE_ORDERS_DESCRIPTION,
   PROPOSE_ORDERS_SCHEMA,
+  WITHDRAW_ORDERS_DESCRIPTION,
+  WITHDRAW_ORDERS_SCHEMA,
   dispatchPrompt,
   emptyCourt,
+  isFinished,
   isInside,
+  isOpen,
   matchOrder,
   newOrders,
   progressOf,
   proposalBrief,
   readProposal,
   readTodos,
+  readWithdrawal,
+  withExpired,
+  withdrawOrders,
+  withdrawalText,
   councilDigest,
   withFinishedFolded,
   namesWholeCouncil,
@@ -545,6 +553,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onClose: () => update($, isRosterOpenAtom, () => false),
     })
   }
+  await expireOrders($).catch(() => undefined)
   const [court, isChamberShown] = await Promise.all([read($, courtAtom), read($, isChamberShownAtom)])
   const hasCourt = court.orders.length > 0 || court.isInSession
   if (hasCourt && !isChamberShown) {
@@ -577,7 +586,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onToggleVerdict: id => update($, openVerdictAtom, current => (current === id ? null : id)),
       onToggleFinished: () => update($, isFinishedShownAtom, current => !current),
       onToggleSession: () => setCourtSession($, !court.isInSession),
-      onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => order.status !== 'done' && order.status !== 'failed') })),
+      onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)) })),
     })
   }
   if (e.surface === 'terminal' && council !== null) startAnimation($)
@@ -793,7 +802,7 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   const ruled = ruling(council, proposal.plan)
   const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled) : ruled
   const court = await read($, courtAtom)
-  const orders = result.isApproved ? newOrders(court, proposal, root, result.conditions) : []
+  const orders = result.isApproved ? newOrders(court, proposal, root, result.conditions, await $.clock.now()) : []
   await update($, courtAtom, current => ({
     ...current,
     orders: [...current.orders, ...orders],
@@ -803,6 +812,28 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
     ],
   }))
   return rulingText(result, orders)
+}
+
+// Orders approved long ago and never dispatched expire: withdrawn as
+// "expired" (court.ts withExpired). Run wherever the court is looked at or
+// acted on, so no timer is needed.
+async function expireOrders($: EngineInterface): Promise<void> {
+  const [now, court] = await Promise.all([$.clock.now(), read($, courtAtom)])
+  if (withExpired(court.orders, now) === court.orders) return
+  await update($, courtAtom, current => ({ ...current, orders: [...withExpired(current.orders, now)] }))
+}
+
+// The withdraw_orders tool: Claude retires approved orders it won't dispatch.
+async function withdrawOrdersTool($: EngineInterface, input: Record<string, unknown>): Promise<string> {
+  const withdrawal = readWithdrawal(input)
+  if ('error' in withdrawal) return withdrawal.error
+  await expireOrders($)
+  const [now, court] = await Promise.all([$.clock.now(), read($, courtAtom)])
+  const outcome = withdrawOrders(court.orders, withdrawal.ids, withdrawal.reason, now)
+  if (outcome.withdrawn.length > 0) {
+    await update($, courtAtom, current => ({ ...current, orders: withdrawOrders(current.orders, withdrawal.ids, withdrawal.reason, now).orders }))
+  }
+  return withdrawalText(outcome, withdrawal.reason)
 }
 
 // The arbiter's review of an approved plan's conditions: one low-effort call
@@ -838,8 +869,10 @@ async function arbitrate($: EngineInterface, council: Council, proposal: Proposa
 // A council agent's dispatch: refused without an approved order; otherwise
 // given its order's scope, todos, conditions and the folder's CLAUDE.md.
 async function dispatchOrder($: EngineInterface, e: { subagentType: string; description: string; prompt: string }): Promise<{ deny: string } | { order: Order; prompt: string; description: string } | undefined> {
-  const court = await read($, courtAtom)
   const isCouncilAgent = Object.values(AGENT_TYPES).includes(e.subagentType)
+  // An order that has expired is no longer open to this dispatch.
+  if (isCouncilAgent) await expireOrders($)
+  const court = await read($, courtAtom)
   if (!isCouncilAgent) {
     if (court.isInSession && e.subagentType !== 'fork') {
       return { deny: `Court mode is on: dispatch work as ${AGENT_TYPES.scout} or ${AGENT_TYPES.knight} with an order from mcp__council__propose_orders.` }
@@ -848,7 +881,7 @@ async function dispatchOrder($: EngineInterface, e: { subagentType: string; desc
   }
   const order = matchOrder(court.orders, e.subagentType, e.description, e.prompt)
   if (order === undefined) {
-    const open = court.orders.filter(candidate => candidate.status === 'approved').map(candidate => `${candidate.id} (${candidate.role}, ${candidate.relFolder}/)`)
+    const open = court.orders.filter(isOpen).map(candidate => `${candidate.id} (${candidate.role}, ${candidate.relFolder}/)`)
     return {
       deny: open.length > 0 ? `Name the order this carries in the description: open orders are ${open.join(', ')}.` : 'No approved order for this dispatch. Propose it with mcp__council__propose_orders first.',
     }
@@ -1112,12 +1145,14 @@ export const register: Register = (on, options) => {
       argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|report|members|lessons|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
+    await expireOrders($).catch(() => undefined)
     await $.tool.register({
       name: 'propose_orders',
       description: PROPOSE_ORDERS_DESCRIPTION,
       inputSchema: PROPOSE_ORDERS_SCHEMA,
       isDeferred: false,
     })
+    await $.tool.register({ name: 'withdraw_orders', description: WITHDRAW_ORDERS_DESCRIPTION, inputSchema: WITHDRAW_ORDERS_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'progress', description: PROGRESS_DESCRIPTION, inputSchema: PROGRESS_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'consult', description: CONSULT_DESCRIPTION, inputSchema: CONSULT_SCHEMA, isDeferred: false })
     return result
@@ -1135,6 +1170,7 @@ export const register: Register = (on, options) => {
   // The council's own tool: it only convenes the council, so it needs no prompt.
   on('tool.check', { tool: 'mcp__council__propose_orders' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__progress' }, () => ({ decision: 'allow' as const }))
+  on('tool.check', { tool: 'mcp__council__withdraw_orders' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__consult' }, () => ({ decision: 'allow' as const }))
   on('tool.call', { tool: 'mcp__council__consult' }, async ($, e) => ({ result: await consultCouncil($, e as unknown as Record<string, unknown>) })).catch(() => ({
     deny: 'The council could not be consulted; ask the person instead.',
@@ -1142,6 +1178,11 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__council__propose_orders' }, async ($, e) => ({ result: await proposeOrders($, e as unknown as Record<string, unknown>) })).catch(() => ({
     deny: 'The council could not rule on the plan; ask the person.',
   }))
+
+  // Withdrawing is the main session's call: an agent carrying an order can't retire orders.
+  on('tool.call', { tool: 'mcp__council__withdraw_orders' }, async ($, e) =>
+    e.agentId !== undefined ? { deny: 'Council scouts and knights cannot withdraw orders; report to Claude instead.' } : { result: await withdrawOrdersTool($, e as unknown as Record<string, unknown>) },
+  ).catch(() => ({ deny: 'The council could not withdraw the orders; try again.' }))
 
   // Every dispatch: council agents carry an approved order; in court mode,
   // nothing else is dispatched.
@@ -1189,7 +1230,8 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind !== 'composer') return next(e)
     // Your next message folds away the orders that have finished since.
-    if ((await read($, courtAtom)).orders.some(order => (order.status === 'done' || order.status === 'failed') && !order.isFolded)) {
+    await expireOrders($).catch(() => undefined)
+    if ((await read($, courtAtom)).orders.some(order => isFinished(order) && !order.isFolded)) {
       await update($, courtAtom, current => ({ ...current, orders: withFinishedFolded(current.orders) }))
     }
     if (e.text.trim().startsWith('/')) return next(e)
