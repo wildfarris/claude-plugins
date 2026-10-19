@@ -78,6 +78,7 @@ import {
   checkFileEdit,
   denialMessage,
   describeScope,
+  fileReadings,
   parseClassifierAnswer,
   relativeTo,
   scopeFolderCandidate,
@@ -89,18 +90,24 @@ import {
   describeRule,
   exclusiveConflict,
   isLongLivedRule,
+  matchPathRules,
   parseRule,
   parseSettingsText,
+  pathRuleDenial,
   ruleKey,
   ruleSpec,
+  standingPathRules,
   syncRules,
+  type ActivePathRule,
   type LongLivedRule,
+  type PathOp,
+  type PathRuleHit,
   type PathRuleStyle,
 } from './scope-rules'
 import { readSettings, type SidekickSettings } from './settings'
 import { planTrim, trimDecision, trimNotice } from './trim'
 import { breakdownRows, emptyReadout, withMeasurement } from './context-readout'
-import { councilGlimpse, orderFolderFor } from './council-glimpse'
+import { councilGlimpse, orderFor, type CarriedOrder } from './council-glimpse'
 import { NO_HOME, homeFromEnvironment } from './paths'
 import { removeInside, type RemoveHost } from './remove'
 import { modelFailureText, stringList, textKey } from './values'
@@ -835,25 +842,63 @@ async function classifyCommand($: EngineInterface, command: string, context: Sco
   return result
 }
 
-// The folder of the council order a subagent carries, if it carries one
-// (read from the council mod's state; see council-glimpse.ts).
-async function councilOrderFolder($: EngineInterface, agentId: string): Promise<string | undefined> {
+// The council order a subagent carries, if it carries one (read from the
+// council mod's state; see council-glimpse.ts).
+async function councilOrder($: EngineInterface, agentId: string): Promise<CarriedOrder | undefined> {
   if (!(await read($, hasCouncilAtom))) return undefined
   const { value } = await $.state.get(councilCourtRef as unknown as ForeignStateRef)
-  return orderFolderFor(value as unknown, agentId)
+  return orderFor(value as unknown, agentId)
+}
+
+// The path rules a call answers to: the standing forbid rules (globs from the
+// root), then its council order's own (globs from the order's folder).
+async function activePathRules($: EngineInterface, root: string, order: CarriedOrder | undefined): Promise<ActivePathRule[]> {
+  const ordered = (order?.forbid ?? []).map(rule => ({ ...rule, base: order!.folder, source: { kind: 'order' as const, id: order!.id } }))
+  return [...standingPathRules(await readRules($, root), root), ...ordered]
+}
+
+// A write to a file that exists edits it; to one that doesn't, creates it.
+// Both, when the guard can't tell.
+async function opsForWrite($: EngineInterface, path: string): Promise<PathOp[]> {
+  const exists = await $.fs.exists(path).catch(() => undefined)
+  return exists === undefined ? ['create', 'edit'] : exists ? ['edit'] : ['create']
+}
+
+// The path rules a file tool's call breaks: Write, Edit, MultiEdit and
+// NotebookEdit create or edit, by whether the file is there.
+async function fileToolHits($: EngineInterface, filePath: string, context: ScopeContext, rules: readonly ActivePathRule[]): Promise<PathRuleHit[]> {
+  if (rules.length === 0) return []
+  const readings = fileReadings(filePath, context)
+  if (readings.length === 0) return []
+  const ops = await opsForWrite($, readings[0]!)
+  return readings.flatMap(reading => matchPathRules(reading, ops, rules))
+}
+
+// A path rule's refusal: a toast naming the rule, its source and the layer,
+// and the denial Claude reads.
+function refusePathRule($: EngineInterface, tool: string, hits: readonly PathRuleHit[], layer: 'file tool' | 'Bash'): string {
+  const first = hits[0]!
+  const source = first.rule.source.kind === 'order' ? `order ${first.rule.source.id}` : 'a standing rule'
+  $.ui.toast(`Path rule (${source}, ${layer} layer) blocked ${tool}: ${first.op} ${first.path} matches ${first.rule.glob}.`)
+  return pathRuleDenial(hits, layer)
 }
 
 // Returns the denial Claude reads, or undefined to let the call run. Called
 // only for the tools it polices, with the context already read. With no scope
-// set (only /scope set or add, or a council order, sets one) nothing is blocked.
-async function guardToolCall($: EngineInterface, tool: string, input: Record<string, unknown>, context: ScopeContext): Promise<string | undefined> {
+// set (only /scope set or add, or a council order, sets one) and no path
+// rules, nothing is blocked.
+async function guardToolCall($: EngineInterface, tool: string, input: Record<string, unknown>, context: ScopeContext, rules: readonly ActivePathRule[] = []): Promise<string | undefined> {
   let verdict: GuardVerdict = { kind: 'allow' }
   const isFileEdit = FILE_TOOLS.has(tool)
 
   if (isFileEdit) {
     const filePath = textField(input.file_path) ?? textField(input.notebook_path)
-    if (!filePath || context.folders.length === 0) return undefined
-    verdict = checkFileEdit(filePath, context)
+    if (!filePath) return undefined
+    if (context.folders.length > 0) verdict = checkFileEdit(filePath, context)
+    if (verdict.kind !== 'block') {
+      const hits = await fileToolHits($, filePath, context, rules)
+      if (hits.length > 0) return refusePathRule($, tool, hits, 'file tool')
+    }
   } else {
     const command = textField(input.command)
     if (!command) return undefined
@@ -966,7 +1011,8 @@ async function addRule($: EngineInterface, root: string, rule: LongLivedRule): P
 // declined, malformed, or names a folder that doesn't exist.
 async function offerRule($: EngineInterface, root: string, spec: string, reason: string, rules: readonly LongLivedRule[], declined: readonly string[]): Promise<void> {
   const rule = parseRule(spec, root)
-  if (rule === undefined) return
+  // Path rules are the person's own words: the review never suggests one.
+  if (rule === undefined || rule.kind === 'forbid') return
   const key = ruleKey(rule)
   if (rules.some(existing => ruleKey(existing) === key) || declined.includes(key)) return
   for (const folder of rule.kind === 'fence' ? [rule.folder] : rule.folders) {
@@ -995,11 +1041,11 @@ async function rulesCommand($: EngineInterface, args: string): Promise<string> {
   switch (action) {
     case 'list':
       return rules.length === 0
-        ? 'No long-lived rules. The bar offers one after the scope guard blocks something; /rules add fence <folder> or /rules add exclusive <a> <b> adds one.'
+        ? 'No long-lived rules. The bar offers one after the scope guard blocks something; /rules add fence <folder>, /rules add exclusive <a> <b> or /rules add forbid <glob> [create,edit,delete] <reason> adds one.'
         : `Rules (in .claude/settings.local.json):\n${rules.map((rule, index) => `${index + 1}. ${describeRule(rule, root)}`).join('\n')}`
     case 'add': {
       const rule = parseRule(rest.join(' '), root)
-      return rule === undefined ? 'Usage: /rules add fence <folder> | /rules add exclusive <folder> <folder>' : addRule($, root, rule)
+      return rule === undefined ? 'Usage: /rules add fence <folder> | /rules add exclusive <folder> <folder> | /rules add forbid <glob> [create,edit,delete] <reason>' : addRule($, root, rule)
     }
     case 'remove': {
       const index = Number(rest[0]) - 1
@@ -1009,7 +1055,7 @@ async function rulesCommand($: EngineInterface, args: string): Promise<string> {
       return `Removed: ${describeRule(removed, root)}. ${await applyRules($, root)}`
     }
     default:
-      return 'Usage: /rules [list | add fence <folder> | add exclusive <folder> <folder> | remove <n>]'
+      return 'Usage: /rules [list | add fence <folder> | add exclusive <folder> <folder> | add forbid <glob> [ops] <reason> | remove <n>]'
   }
 }
 
@@ -1292,7 +1338,7 @@ export const register: Register = (on, options) => {
     void detectCouncil($)
       .then(isFound => (isFound ? true : $.clock.sleep(3000).then(() => detectCouncil($))))
       .catch(() => undefined)
-    await $.command.register({ name: 'rules', description: "Long-lived rules in Claude Code's own settings: list, add or remove", argumentHint: '[list|add fence <folder>|add exclusive <a> <b>|remove <n>]' })
+    await $.command.register({ name: 'rules', description: "Long-lived rules in Claude Code's own settings: list, add or remove", argumentHint: '[list|add fence <folder>|add exclusive <a> <b>|add forbid <glob> [ops] <reason>|remove <n>]' })
     if (settings.isSummaryEnabled) await openLedger($).catch(() => undefined)
     const root = await $.session.root()
     await restoreScope($, root)
@@ -1383,10 +1429,12 @@ export const register: Register = (on, options) => {
       let denial: string | undefined
       try {
         context = await scopeContext($)
-        // A council knight or scout is held to its order's folder instead.
-        const orderFolder = typeof e.agentId === 'string' ? await councilOrderFolder($, e.agentId) : undefined
-        if (orderFolder !== undefined) context = { ...context, folders: [orderFolder] }
-        denial = await guardToolCall($, tool, input, context)
+        // A council knight or scout is held to its order's folder instead,
+        // and to its order's path rules beside the standing ones.
+        const order = agentId !== undefined ? await councilOrder($, agentId) : undefined
+        if (order !== undefined) context = { ...context, folders: [order.folder] }
+        const rules = await activePathRules($, context.root, order)
+        denial = await guardToolCall($, tool, input, context, rules)
       } catch {
         // A guard that can't check fails closed. Claude can retry; if it keeps
         // failing, the user turns the guard off (scopeGuardEnabled) or clears the scope.

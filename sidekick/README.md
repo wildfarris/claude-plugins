@@ -5,6 +5,7 @@ One Claude Code mod for working in one session across several repos:
 - **The bar**: one line above the prompt (`✦ TL;DR · Heads up · ▶ 3 edits +12 −4`). Its buttons do work only when clicked, and the open item's panel shows under the line.
 - **Scope guard**: keeps changes inside the session's target folder, so a `sed -i` run from the parent folder doesn't touch the sibling repos.
 - **Long-lived rules**: suggested after the guard blocks something, approved by you, written into Claude Code's own settings.
+- **Path rules**: "do not edit tests", "no new CSS": globs whose files may not be created, edited or deleted, from a council order's `forbid` or a standing rule, enforced by the scope guard.
 - **TL;DR briefs**: a record of each session kept as it happens, and on click a brief of what happened (the last turn, since the last brief, or the whole session), with a claims check of Claude's final answer against the record, a handoff for picking the work up in a new session, and a HANDOFF.md per repo.
 - **Heads-up**: on click, a review of the last answer for the one thing you'd likely miss.
 - **Resume warning**: holds the first prompt of a resumed session whose prompt cache has likely expired.
@@ -52,10 +53,26 @@ The scope guard handles each session's live scope. Rules that should always hold
 | --- | --- | --- |
 | `fence <folder>`: never edit it | a `permissions.deny` `Edit(…/**)` rule | Claude Code itself, in every mode, no model |
 | `exclusive <a> <b>`: never both in one session | an `autoMode.soft_deny` sentence (keeping `$defaults`) | `/scope add` refuses the partner, plus the auto-mode classifier (a scope set with `/scope set` isn't checked against it) |
+| `forbid <glob> [ops] <reason>`: a standing [path rule](#path-rules) | an `autoMode.soft_deny` sentence | the scope guard's path rules, for every session and agent in the root, plus the auto-mode classifier |
 
-Rules are suggested rather than authored by hand. When the scope guard blocks something, **Rule? (n blocked)** appears on the bar; clicking it sends the blocked calls and the last answer to one Haiku call, which proposes a rule only if one is worth keeping: **add**, **not now** or **never** (never suggested again). Adding writes the settings file and confirms with Claude Code's own permission check that a fence is enforced, trying the other path spelling if not.
+Fences and exclusive pairs are suggested rather than authored by hand (path rules are only ever yours). When the scope guard blocks something, **Rule? (n blocked)** appears on the bar; clicking it sends the blocked calls and the last answer to one Haiku call, which proposes a rule only if one is worth keeping: **add**, **not now** or **never** (never suggested again). Adding writes the settings file and confirms with Claude Code's own permission check that a fence is enforced, trying the other path spelling if not.
 
-`/rules list`, `/rules add fence <folder>`, `/rules add exclusive <a> <b>`, `/rules remove <n>`. Rules stay until removed; each session start makes the settings file match them, and only entries sidekick wrote are ever touched.
+`/rules list`, `/rules add fence <folder>`, `/rules add exclusive <a> <b>`, `/rules add forbid <glob> [ops] <reason>`, `/rules remove <n>`. Rules stay until removed; each session start makes the settings file match them, and only entries sidekick wrote are ever touched.
+
+## Path rules
+
+A path rule names files that may not be created, edited or deleted: a glob, the operations it forbids, and your reason, which Claude is shown. The scope guard enforces them whenever it is on (`scopeGuardEnabled`), with or without a target set. They come from two places:
+
+- **A council order's `forbid`.** Each dispatch Claude proposes to the council may carry `forbid: [{ glob, ops?, reason }]`. Its globs are relative to the order's folder, and only that order's agent is held to them. "Do not edit tests": `{ "glob": "**/*.spec.ts", "reason": "the tests are the spec" }` (no `ops` means create, edit and delete).
+- **Standing rules.** `/rules add forbid <glob> [ops] <reason>`, the glob relative to the session root, held by every session and agent in that root. "No new CSS under any repo's frontend/src": `/rules add forbid */frontend/src/**/*.css create no new CSS; use the theme tokens`. `ops` is a comma list of `create`, `edit` and `delete`, all three when left out.
+
+Globs stay small: `*` and `?` match within one name, `**` spans folders, a glob with no `/` matches the file name at any depth (`*.css` is `**/*.css`), and a trailing `/` means everything under that folder. No braces, character classes or regex. A path is matched relative to the rule's folder in any spelling (drive letters, backslashes, Git Bash's `/c/…`), and case-insensitively on Windows.
+
+| Layer | When | Catches |
+| --- | --- | --- |
+| File tools | before Write, Edit, MultiEdit, NotebookEdit | a create (the file isn't there yet) or an edit (it is) of a matching path |
+
+Every refusal names the change, the rule's glob and operations, where it came from (`order O7` or the standing rule), the layer that fired and your reason, and tells Claude that the path is protected and, if it must change, to stop and report why instead of working around it. A toast says the same to you.
 
 ## TL;DR briefs
 

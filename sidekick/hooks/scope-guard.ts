@@ -224,7 +224,7 @@ export function resolvePath(base: string | undefined, path: string, home?: strin
 }
 
 // A canonical absolute path for display and comparison, or undefined.
-function canonicalAbsolute(path: string, style: PathStyle): string | undefined {
+export function canonicalAbsolute(path: string, style: PathStyle): string | undefined {
   const placed = placeAll(undefined, path, { style, isFileTool: true })[0]
   return placed === UNPLACEABLE ? undefined : placed
 }
@@ -266,6 +266,25 @@ export function relativeTo(root: string, path: string): string {
   const canonicalPath = canonicalAbsolute(path, style)
   const below = canonicalRoot === undefined || canonicalPath === undefined ? undefined : segmentsBelow(canonicalPath, canonicalRoot)
   return below === undefined ? path : below.length === 0 ? '.' : below.join('/')
+}
+
+// A path below a folder, `/`-joined ('' for the folder itself), or undefined
+// when it isn't inside. Both are read in the folder's style; Windows names
+// compare case-insensitively. The path rules match globs against this.
+export function pathBelow(folder: string, path: string): string | undefined {
+  const style = pathStyleOf(folder)
+  const canonicalFolder = canonicalAbsolute(folder, style)
+  const canonicalPath = canonicalAbsolute(path, style)
+  if (canonicalFolder === undefined || canonicalPath === undefined) return undefined
+  return segmentsBelow(canonicalPath, canonicalFolder)?.join('/')
+}
+
+// Every canonical absolute path a file tool's path could mean (only Git
+// Bash's `/c/…` has two). Ones the guard can't place are left out: the scope
+// check blocks those whenever a scope is set.
+export function fileReadings(filePath: string, context: Pick<ScopeContext, 'root' | 'cwd' | 'home'>): string[] {
+  const placed = placeContext({ ...context, folders: [] })
+  return placeAll(placed.cwd, filePath, placingOf(placed, true)).filter((reading): reading is string => reading !== undefined && reading !== UNPLACEABLE)
 }
 
 // The root itself as a scope folder covers only the root's own files (and

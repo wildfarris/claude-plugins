@@ -5,6 +5,8 @@
 // `status` and `concern`. Checked by shape, never trusted; a rename there
 // shows up here as no council.
 
+import { readPathRule, type PathRule } from './scope-rules'
+
 // What sidekick reads of the council mod's state (any plugin may read any
 // value, so this is checked by shape rather than trusted).
 export type CouncilGlimpse = { topic: string; phase: 'briefing' | 'deliberating' | 'done' | 'failed'; finished: number; total: number; gravest: number | null }
@@ -30,15 +32,24 @@ export function councilStatus(glimpse: CouncilGlimpse): string {
   return glimpse.gravest === null ? 'adjourned' : `adjourned · gravest concern ${glimpse.gravest}/5`
 }
 
-// The folder a subagent's council order scopes it to, from the council mod's
-// `court` value: its orders' `agentId`, `status` and `folder`.
-export function orderFolderFor(court: unknown, agentId: string): string | undefined {
+// What a subagent's council order holds it to: its id, its folder, and the
+// path rules in its `forbid` (each checked by shape; a malformed one is
+// dropped). From the council mod's `court` value: its orders' `agentId`,
+// `status`, `id`, `folder` and `forbid`.
+export type CarriedOrder = { id: string; folder: string; forbid: PathRule[] }
+
+export function orderFor(court: unknown, agentId: string): CarriedOrder | undefined {
   if (typeof court !== 'object' || court === null) return undefined
   const orders = (court as { orders?: unknown }).orders
   if (!Array.isArray(orders)) return undefined
   const order = orders.find(
-    (entry): entry is { folder: string } =>
+    (entry): entry is { id?: unknown; folder: string; forbid?: unknown } =>
       typeof entry === 'object' && entry !== null && (entry as { agentId?: unknown }).agentId === agentId && (entry as { status?: unknown }).status === 'dispatched' && typeof (entry as { folder?: unknown }).folder === 'string',
   )
-  return order?.folder
+  if (order === undefined) return undefined
+  const forbid = Array.isArray(order.forbid) ? order.forbid.flatMap(entry => readPathRule(entry) ?? []) : []
+  return { id: typeof order.id === 'string' && /^O\d+$/.test(order.id) ? order.id : 'O?', folder: order.folder, forbid }
 }
+
+// The folder a subagent's council order scopes it to.
+export const orderFolderFor = (court: unknown, agentId: string): string | undefined => orderFor(court, agentId)?.folder
