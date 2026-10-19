@@ -10,7 +10,7 @@
     {
       "name": "sidekick",
       "source": "./sidekick",
-      "description": "A bar above the prompt (TL;DR, heads-up, rules, replay), a multi-repo scope guard, long-lived rules and a resume warning."
+      "description": "A bar above the prompt (TL;DR, heads-up, rules, replay), a multi-repo scope guard, long-lived rules, a resume warning, and asking Codex and Antigravity with your approval."
     },
     {
       "name": "council",

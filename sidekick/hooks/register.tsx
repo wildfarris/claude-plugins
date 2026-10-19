@@ -2,7 +2,8 @@
 // rule suggestions, edit replay, a context readout, a trim offer, a council
 // button), a scope guard
 // for multi-repo sessions, long-lived rules in Claude Code's own settings, a
-// resume warning, and trimming in place of summary compaction.
+// resume warning, trimming in place of summary compaction, and ask_codex and
+// ask_agy (a prompt to another agent's CLI, approved by the person each call).
 // Settings come from plugin.json's userConfig (/plugin configure).
 //
 // Every function that touches `$` is declared at the top level of this file:
@@ -66,6 +67,7 @@ import {
   type LedgerEntry,
 } from './ledger'
 import { REVIEW_OUTCOME_TEXT, REVIEW_SYSTEM_PROMPT, buildReviewPrompt, parseReview, sameTopic, withTopic, type ReviewOutcome } from './long-answer'
+import { ASK_CLIS, ASK_SCHEMA, approvalText, askCli, askCliFor, askDescription, findOnPath, promptOf, type AskCliId, type AskOutcome } from './ask-cli'
 import { isEditTool, stepsForEdit, textField } from './replay-steps'
 import { resumeWarningFrom } from './resume-warning'
 import { redactSecrets } from './secrets'
@@ -189,6 +191,9 @@ let isLedgerFolderProtected = false
 // Chunk summaries by chunk, so pressing again costs only the new part (rebuilt on reload).
 const chunkSummaries = new Map<string, string>()
 const MAX_CHUNK_SUMMARIES = 100
+// Where each ask CLI was found at session start (absolute); a CLI missing
+// then has no entry and no tool.
+const askPaths = new Map<AskCliId, string>()
 
 // ── The bar ───────────────────────────────────────────────────────────────
 
@@ -1236,6 +1241,40 @@ function barHandlers($: EngineInterface, state: BarState): BarHandlers {
   }
 }
 
+// ── Asking Codex and Antigravity ──────────────────────────────────────────
+
+// PATH and PATHEXT as the engine sees them (Windows spells it Path).
+async function pathEnvironment($: EngineInterface): Promise<{ path: string | undefined; pathExt: string | undefined }> {
+  const [upper, mixed, pathExt] = await Promise.all([
+    $.env.get('PATH').catch(() => undefined),
+    $.env.get('Path').catch(() => undefined),
+    $.env.get('PATHEXT').catch(() => undefined),
+  ])
+  return { path: upper || mixed || undefined, pathExt: pathExt || undefined }
+}
+
+// Looks for each CLI once and registers a tool only for those found.
+async function registerAskTools($: EngineInterface): Promise<void> {
+  askPaths.clear()
+  if (!settings.isAskToolsEnabled) return
+  const environment = await pathEnvironment($)
+  const host = { isFile: (path: string) => $.fs.stat(path, { resolve: true }).then(stat => stat.kind === 'file', () => false) }
+  for (const cli of ASK_CLIS) {
+    const found = await findOnPath(host, cli.command, environment).catch(() => undefined)
+    if (found !== undefined) askPaths.set(cli.id, found)
+  }
+  // One literal call per tool: the engine reads the names off the source.
+  if (askPaths.has('codex')) await $.tool.register({ name: 'ask_codex', description: askDescription(askCliFor('codex')), inputSchema: ASK_SCHEMA, isDeferred: false })
+  if (askPaths.has('agy')) await $.tool.register({ name: 'ask_agy', description: askDescription(askCliFor('agy')), inputSchema: ASK_SCHEMA, isDeferred: false })
+}
+
+async function runAsk($: EngineInterface, id: AskCliId, input: Record<string, unknown>): Promise<AskOutcome> {
+  const cwd = await $.session.cwd().catch(() => undefined)
+  return askCli({ run: (argv, init) => $.process.run(argv, init) }, askCliFor(id), askPaths.get(id), promptOf(input), cwd)
+}
+
+const askResult = (outcome: AskOutcome) => (outcome.isError ? { result: outcome.text, isError: true as const } : { result: outcome.text })
+
 // ── Hooks ─────────────────────────────────────────────────────────────────
 
 export const register: Register = (on, options) => {
@@ -1261,8 +1300,35 @@ export const register: Register = (on, options) => {
     await (async () => writeRules($, root, await readRules($, root), await storedStyle($, root)))().catch((error: unknown) =>
       $.ui.toast(`Sidekick could not sync its rules into .claude/settings.local.json, so they are not enforced: ${error instanceof Error ? error.message : String(error)}`),
     )
+    await registerAskTools($).catch(() => undefined)
     return result
   })
+
+  // ask_codex and ask_agy: every call waits for the person, in every mode.
+  // A PreToolUse hook's ask is a floor the engine keeps even in auto mode (its
+  // classifier can't approve past it, and an allow rule doesn't skip it); the
+  // tool.check ask says the same to every other check of the call. Both carry
+  // the full prompt, which the dialog shows. A failure still asks.
+  on('classic.PreToolUse', { tool: 'mcp__sidekick__ask_codex' }, ($, e) => ({ ask: approvalText(askCliFor('codex'), promptOf(e as unknown as Record<string, unknown>)) })).catch(() => ({
+    ask: approvalText(askCliFor('codex'), undefined),
+  }))
+  on('classic.PreToolUse', { tool: 'mcp__sidekick__ask_agy' }, ($, e) => ({ ask: approvalText(askCliFor('agy'), promptOf(e as unknown as Record<string, unknown>)) })).catch(() => ({
+    ask: approvalText(askCliFor('agy'), undefined),
+  }))
+  on('tool.check', { tool: 'mcp__sidekick__ask_codex' }, ($, e) => ({ decision: 'ask' as const, reason: approvalText(askCliFor('codex'), promptOf(e as unknown as Record<string, unknown>)) })).catch(() => ({
+    decision: 'ask' as const,
+  }))
+  on('tool.check', { tool: 'mcp__sidekick__ask_agy' }, ($, e) => ({ decision: 'ask' as const, reason: approvalText(askCliFor('agy'), promptOf(e as unknown as Record<string, unknown>)) })).catch(() => ({
+    decision: 'ask' as const,
+  }))
+  on('tool.call', { tool: 'mcp__sidekick__ask_codex' }, async ($, e) => askResult(await runAsk($, 'codex', e as unknown as Record<string, unknown>))).catch(() => ({
+    result: 'sidekick could not run Codex for this call; tell the person.',
+    isError: true as const,
+  }))
+  on('tool.call', { tool: 'mcp__sidekick__ask_agy' }, async ($, e) => askResult(await runAsk($, 'agy', e as unknown as Record<string, unknown>))).catch(() => ({
+    result: 'sidekick could not run Antigravity for this call; tell the person.',
+    isError: true as const,
+  }))
 
   on('command.run', { command: 'replay' }, async $ => {
     const isOpened = await openReplay($)

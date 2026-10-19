@@ -1,7 +1,7 @@
 {
   "name": "sidekick",
   "version": "0.14.1",
-  "description": "A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard, long-lived rules, a resume warning, and trimming instead of summary compaction.",
+  "description": "A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard, long-lived rules, a resume warning, trimming instead of summary compaction, and tools to ask the Codex and Antigravity CLIs with your approval on every call.",
   "author": {
     "name": "Jeremy Phares"
   },
@@ -127,6 +127,12 @@
       "type": "boolean",
       "title": "Council button",
       "description": "When the council mod is installed, show a ⚜ Council button on the bar.",
+      "default": true
+    },
+    "askToolsEnabled": {
+      "type": "boolean",
+      "title": "Ask Codex and Antigravity",
+      "description": "Offer Claude the ask_codex and ask_agy tools when the codex or agy CLI is on PATH at session start. Every call asks for your approval and bills that CLI's plan.",
       "default": true
     }
   }

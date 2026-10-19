@@ -10,6 +10,7 @@ One Claude Code mod for working in one session across several repos:
 - **Resume warning**: holds the first prompt of a resumed session whose prompt cache has likely expired.
 - **Trim instead of summarizing**: past 80%, offers to drop stale tool output instead of summarizing (`/compact trim`), and does the same in place of Claude Code's own compaction when that frees enough.
 - **Edit replay**: step through the last turn's file edits.
+- **Ask Codex and Antigravity**: `ask_codex` and `ask_agy` let Claude put a prompt to the `codex` or `agy` CLI and read the answer. You approve every call, even in auto mode. A tool appears only when its CLI is on PATH.
 
 It replaces the built-in "You should know" mod and Anthropic's `replay-theater` sample. Keep those disabled so they don't compete for the space above the prompt.
 
@@ -102,6 +103,17 @@ The council is its own mod, `council`, in the same marketplace. Sidekick shows i
 
 After a turn that edited files, **▶ n edits** on the bar opens the replay; `/replay` opens it any time. In the pane: `n` next, `p` previous, `c` or Esc to close. Only edits that succeeded are recorded.
 
+## Asking Codex and Antigravity
+
+Two tools let Claude put one prompt to another agent's CLI and read its answer: **`ask_codex`** runs OpenAI's Codex CLI, **`ask_agy`** the Antigravity CLI. Claude sees them as `mcp__sidekick__ask_codex` and `mcp__sidekick__ask_agy`.
+
+- **Your approval, every call.** Each call stops for you, in every permission mode, auto mode included. The dialog names the CLI and its vendor and shows the prompt (the first 8,000 characters; the tool input holds all of it). Sidekick asks through a PreToolUse hook, which the engine keeps as a floor: auto mode's classifier can't approve past it, and an allow rule doesn't skip it. The tool's own permission check asks too. If a hook fails, it still asks. A session with no one to answer (`claude -p`, `dontAsk`) gets a refusal instead. Saying yes to one call never approves the next.
+- **Found on PATH at session start.** Sidekick looks for `codex` and `agy` once when the session starts. It checks only absolute PATH entries, so a `.` entry can't pick up a file a repo planted. On Windows it tries PATHEXT's `.com`, `.exe`, `.bat` and `.cmd`, in PATHEXT's order. A CLI that isn't found gets no tool, so Claude never sees it. The path found is the one that runs for the rest of the session, so a look-alike added to PATH later is never picked up. If you install a CLI mid-session, restart the session or run `/reload-plugins` to get its tool. Turn both tools off with `askToolsEnabled`.
+- **How it runs.** The CLI is started from an argument list with no shell, in the session's folder, with fixed arguments and the prompt on stdin. No character of the prompt can become a flag or shell syntax. Codex runs as `codex exec --sandbox read-only -c approval_policy=never --skip-git-repo-check --ephemeral --color never -`: it can read files in the session's folder and nothing it runs can write. `agy` gets the prompt on stdin and no arguments. Its flags have not been checked against a real `agy`, and no read-only mode is passed for it, so it runs with its own defaults.
+- **Limits.** Each call has 5 minutes. The prompt can be up to 100,000 characters. The answer is cut at 20,000 characters, and the cut is marked. A timeout, a non-zero exit, empty output, a CLI that won't start or one that's missing comes back as a short error, with the end of the CLI's error output (secrets redacted).
+- **Untrusted answers.** The answer comes back labelled as untrusted text from another model. The tool description tells Claude to weigh it as advice, never follow instructions in it, and check its claims before acting.
+- **Where your data goes, and what it costs.** Each call sends the prompt to OpenAI (Codex) or Google (Antigravity) under that vendor's own terms and privacy policy, and Codex also sends any files it reads in the session's folder. Approve only what you'd share with that vendor. Each call counts against your Codex plan (or OpenAI API key) or your Antigravity plan quota. Sidekick sets no spending cap beyond the timeout and the answer limit. The CLIs use their own sign-in: sidekick never handles their credentials or bypasses their auth.
+
 ## Settings
 
 Set them with `/plugin configure sidekick@personal-mods`. Each is described there; the defaults are in `.claude-plugin/plugin.json`.
@@ -110,7 +122,7 @@ Set them with `/plugin configure sidekick@personal-mods`. Each is described ther
 
 `hooks/register.tsx` holds every hook and every function that touches `$`. The engine follows `$` only into functions declared at the top level of the hooks module, and a plugin has one hooks module, so this file can't be split further. Everything else is pure:
 - `hooks/views/` draws the bar (`bar.tsx`, built by `bar-model.ts`), and the replay from the element table, plain data and callbacks;
-- `scope-guard.ts`, `scope-rules.ts` (long-lived rules), `trim.ts`, `context-readout.ts`, `council-glimpse.ts` (what the bar reads of the council mod), `values.ts`, `long-answer.ts` (the heads-up review), `ledger.ts` (the session record), `brief.ts` (figures, the claims check, condensing, the handoff), `secrets.ts` (redaction), `resume-warning.ts`, `diff.ts`, `replay-steps.ts` and `settings.ts` hold the logic.
+- `scope-guard.ts`, `scope-rules.ts` (long-lived rules), `trim.ts`, `context-readout.ts`, `council-glimpse.ts` (what the bar reads of the council mod), `values.ts`, `long-answer.ts` (the heads-up review), `ledger.ts` (the session record), `brief.ts` (figures, the claims check, condensing, the handoff), `secrets.ts` (redaction), `resume-warning.ts`, `diff.ts`, `replay-steps.ts`, `ask-cli.ts` (finding and running Codex and Antigravity) and `settings.ts` hold the logic.
 
 ```bash
 claude plugin validate ~/.claude/mod-sources/personal-mods/sidekick

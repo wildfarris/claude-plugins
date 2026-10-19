@@ -44,8 +44,8 @@ export function baseStandIn(
     store?: Record<string, unknown>
     // A file system in memory (path → text); absent, file calls go unanswered.
     files?: Map<string, string>
-    // Answers $.process.run; absent, every process fails.
-    run?: (argv: readonly string[]) => { exitCode: number; stdout: string } | undefined
+    // Answers $.process.run (with what the call passed on stdin); absent, every process fails.
+    run?: (argv: readonly string[], stdin?: unknown) => { exitCode: number; stdout: string } | undefined
     // Answers $.env.get (HOME, USERPROFILE); absent, every variable is unset.
     env?: Record<string, string>
   },
@@ -92,7 +92,7 @@ export function baseStandIn(
   })
   if (options.files) memoryFiles(on, options.files)
   on('process.run', ($, e) => {
-    const answer = options.run?.(e.argv) ?? { exitCode: 1, stdout: '' }
+    const answer = options.run?.(e.argv, (e as unknown as { init?: { stdin?: unknown } }).init?.stdin) ?? { exitCode: 1, stdout: '' }
     return { value: { ...answer, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {

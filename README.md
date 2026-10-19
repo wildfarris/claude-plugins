@@ -6,7 +6,7 @@ A Claude Code plugin marketplace, `personal-mods`, holding three plugins: `sidek
 
 ### sidekick
 
-A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard that keeps a session's changes inside its target folder, long-lived rules, a resume warning, and trimming instead of summary compaction. See [sidekick/README.md](sidekick/README.md).
+A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard that keeps a session's changes inside its target folder, long-lived rules, a resume warning, trimming instead of summary compaction, and tools that let Claude ask the Codex and Antigravity CLIs, with your approval on every call. See [sidekick/README.md](sidekick/README.md).
 
 ### council
 
