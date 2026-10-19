@@ -1,7 +1,8 @@
 // sidekick: a bar above the prompt (TL;DR briefs from a turn ledger, heads-up,
 // rule suggestions, edit replay, a context readout, a trim offer, a council
 // button), a scope guard
-// for multi-repo sessions, long-lived rules in Claude Code's own settings, a
+// for multi-repo sessions with path rules (and a git backstop when a council
+// order's agent stops), long-lived rules in Claude Code's own settings, a
 // resume warning, trimming in place of summary compaction, and ask_codex and
 // ask_agy (a prompt to another agent's CLI, approved by the person each call).
 // Settings come from plugin.json's userConfig (/plugin configure).
@@ -69,6 +70,21 @@ import {
 import { REVIEW_OUTCOME_TEXT, REVIEW_SYSTEM_PROMPT, buildReviewPrompt, parseReview, sameTopic, withTopic, type ReviewOutcome } from './long-answer'
 import { ASK_CLIS, ASK_SCHEMA, approvalText, askCli, askCliFor, askDescription, findOnPath, promptOf, type AskCliId, type AskOutcome } from './ask-cli'
 import { isEditTool, stepsForEdit, textField } from './replay-steps'
+import {
+  BACKSTOP_MARK,
+  BACKSTOP_RETENTION_MS,
+  backstopToast,
+  backstopWarning,
+  changesSince,
+  dirtyMatches,
+  flaggedChanges,
+  isBaseline,
+  newSinceStart,
+  parseNameStatus,
+  parseStatus,
+  type Baseline,
+  type Change,
+} from './backstop'
 import { resumeWarningFrom } from './resume-warning'
 import { redactSecrets } from './secrets'
 import {
@@ -199,6 +215,9 @@ let isLedgerFolderProtected = false
 // Chunk summaries by chunk, so pressing again costs only the new part (rebuilt on reload).
 const chunkSummaries = new Map<string, string>()
 const MAX_CHUNK_SUMMARIES = 100
+// Order agents whose path rules' backstop has been looked at (its baseline
+// is in the store, when its rules call for one).
+const backstopsStarted = new Set<string>()
 // Where each ask CLI was found at session start (absolute); a CLI missing
 // then has no entry and no tool.
 const askPaths = new Map<AskCliId, string>()
@@ -952,6 +971,80 @@ async function guardToolCall($: EngineInterface, tool: string, input: Record<str
   return denialMessage(verdict, context, isFileEdit ? 'edit' : 'command')
 }
 
+// ── The path rules' backstop ──────────────────────────────────────────────
+
+const BACKSTOP_STORE_PREFIX = 'backstop:'
+const backstopStoreKey = (agentId: string) => `${BACKSTOP_STORE_PREFIX}${agentId}`
+
+// Raw git output (NUL-separated lists keep their leading spaces), or undefined.
+async function gitOutput($: EngineInterface, folder: string, args: string[]): Promise<string | undefined> {
+  const result = await $.process.run(['git', '-C', folder, ...args], { timeoutMs: 3000 }).catch(() => undefined)
+  return result?.exitCode === 0 ? result.stdout : undefined
+}
+
+// The content hash of each path (relative to the top), '' for one that's gone.
+async function hashesOf($: EngineInterface, top: string, changes: readonly Change[]): Promise<Record<string, string>> {
+  const hashes: Record<string, string> = {}
+  const present = changes.filter(change => change.op !== 'delete').map(change => change.path)
+  for (const change of changes) hashes[change.path] = ''
+  if (present.length === 0) return hashes
+  const lines = ((await gitOutput($, top, ['hash-object', '--', ...present])) ?? '').split('\n')
+  present.forEach((path, index) => (hashes[path] = lines[index]?.trim() ?? ''))
+  return hashes
+}
+
+// At an order agent's first tool call: if its order or the standing rules
+// forbid any paths, record where its repo starts (HEAD, and the matching paths
+// already changed then). Kept in the store, so a reload mid-run keeps it.
+async function startBackstop($: EngineInterface, agentId: string): Promise<void> {
+  const order = await councilOrder($, agentId)
+  if (order === undefined) return
+  backstopsStarted.add(agentId)
+  if ((await $.store.get(backstopStoreKey(agentId))) !== undefined) return
+  const rules = await activePathRules($, await $.session.root(), order)
+  if (rules.length === 0) return
+  const [top, head] = await Promise.all([git($, order.folder, ['rev-parse', '--show-toplevel']), git($, order.folder, ['rev-parse', 'HEAD'])])
+  if (!top || !head) return void $.ui.toast(`Path rules backstop: ${order.id}'s folder is not a git repository with a commit, so what it changes won't be checked when it stops.`)
+  const status = await gitOutput($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+  const dirty = await hashesOf($, top, dirtyMatches(parseStatus(status ?? ''), top, rules))
+  const baseline: Baseline = { orderId: order.id, folder: order.folder, top, start: head, rules, dirty, startedAt: await $.clock.now() }
+  await $.store.set(backstopStoreKey(agentId), baseline)
+}
+
+// When an order's agent stops: what changed since its start that a rule
+// forbids, as the warning for the main session (and a toast), or undefined.
+async function finishBackstop($: EngineInterface, agentId: string): Promise<string | undefined> {
+  backstopsStarted.delete(agentId)
+  const stored = await $.store.get(backstopStoreKey(agentId))
+  if (stored === undefined) return undefined
+  await $.store.delete(backstopStoreKey(agentId))
+  if (!isBaseline(stored)) return undefined
+  const [diff, untracked] = await Promise.all([
+    gitOutput($, stored.top, ['diff', '--name-status', '--no-renames', '-z', stored.start]),
+    gitOutput($, stored.top, ['ls-files', '--others', '--exclude-standard', '-z']),
+  ])
+  if (diff === undefined || untracked === undefined) {
+    $.ui.toast(`Path rules backstop: git could not list what ${stored.orderId} changed, so its forbidden paths were not checked at its stop.`)
+    return undefined
+  }
+  const flagged = flaggedChanges(changesSince(parseNameStatus(diff), untracked.split('\0').filter(Boolean)), stored.top, stored.rules)
+  const wasDirty = flagged.filter(entry => entry.path in stored.dirty)
+  const hashNow = wasDirty.length === 0 ? {} : await hashesOf($, stored.top, wasDirty.map(entry => ({ path: entry.path, op: entry.hits[0]!.op })))
+  const fresh = newSinceStart(flagged, stored.dirty, hashNow, stored.top, stored.rules)
+  const warning = backstopWarning(stored, fresh)
+  if (warning !== undefined) $.ui.toast(backstopToast(stored.orderId, fresh))
+  return warning
+}
+
+// Baselines of agents that never stopped (a crash, a closed session).
+async function pruneBackstops($: EngineInterface): Promise<void> {
+  const [now, keys] = await Promise.all([$.clock.now(), $.store.keys()])
+  for (const key of keys.filter(key => key.startsWith(BACKSTOP_STORE_PREFIX))) {
+    const startedAt = ((await $.store.get(key)) as { startedAt?: unknown } | undefined)?.startedAt
+    if (typeof startedAt !== 'number' || now - startedAt > BACKSTOP_RETENTION_MS) await $.store.delete(key)
+  }
+}
+
 // ── Long-lived rules in Claude Code's own settings ────────────────────────
 
 const settingsLocalPath = (root: string) => `${root}/.claude/settings.local.json`
@@ -1370,6 +1463,7 @@ export const register: Register = (on, options) => {
     if (settings.isSummaryEnabled) await openLedger($).catch(() => undefined)
     const root = await $.session.root()
     await restoreScope($, root)
+    await pruneBackstops($).catch(() => undefined)
     // The rules are the source of truth; the settings file is made to match.
     await (async () => writeRules($, root, await readRules($, root), await storedStyle($, root)))().catch((error: unknown) =>
       $.ui.toast(`Sidekick could not sync its rules into .claude/settings.local.json, so they are not enforced: ${error instanceof Error ? error.message : String(error)}`),
@@ -1447,10 +1541,13 @@ export const register: Register = (on, options) => {
     const isGuarded = settings.isScopeGuardEnabled && (FILE_TOOLS.has(tool) || tool === 'Bash')
     const isRecorded = settings.isReplayEnabled && isEditTool(tool)
     const isLedgered = settings.isSummaryEnabled
+    const agentId = typeof e.agentId === 'string' ? e.agentId : undefined
+    // An order agent's first call (any tool, before it changes anything):
+    // where its repo starts, for the path rules' backstop at its stop.
+    if (agentId !== undefined && settings.isScopeGuardEnabled && !backstopsStarted.has(agentId)) await startBackstop($, agentId).catch(() => undefined)
     // With the TL;DR off, every other tool passes untouched, with no lookups.
     if (!isGuarded && !isRecorded && !isLedgered) return next(e)
     const input = e as unknown as Record<string, unknown>
-    const agentId = typeof e.agentId === 'string' ? e.agentId : undefined
 
     let context: ScopeContext | undefined
     if (isGuarded) {
@@ -1517,8 +1614,17 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // An order agent's stop: the path rules' backstop. Its warning goes to the
+    // main session with the agent's report (and to the council's copy of it).
+    if (e.agentId !== undefined) {
+      const warning = await finishBackstop($, e.agentId).catch(() => undefined)
+      if (warning === undefined) return next(e)
+      const answer = 'answer' in e && typeof e.answer === 'string' ? e.answer : undefined
+      const result = await next(answer !== undefined ? ({ ...e, answer: `${answer}\n\n${warning}` } as typeof e) : e)
+      const text = (result as { text?: unknown }).text
+      return typeof text === 'string' && !text.includes(BACKSTOP_MARK) ? { ...result, text: `${text}\n\n${warning}` } : result
+    }
     const result = await next(e)
-    if (e.agentId !== undefined) return result
     isMainTurnRunning = false
     if (councilChecksLeft > 0) {
       councilChecksLeft--
