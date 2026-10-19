@@ -40,8 +40,16 @@ function filesIn(on: On, given: Map<string, string>): string[] {
     return { value: undefined }
   })
   on('fs.list', () => ({ value: [] }))
+  on('fs.stat', ($, e) => {
+    const key = pathKey(e.path)
+    if (files.has(key)) return { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }
+    if ([...files.keys()].some(path => path.startsWith(`${key}/`))) return { value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false } }
+    throw new Error(`ENOENT: ${String(e.path)}`)
+  })
   return seen
 }
+
+const bash = ($: Engine, command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, ...(agentId ? { agentId } : {}) } as never) as Promise<Denial>
 
 const start = async ($: Engine, root = ROOT) => {
   await $.session.start({ cwd: root, surface: 'desktop', isInteractive: true })
@@ -110,4 +118,55 @@ test('on Windows, an order rule matches however the path is spelled', async ($, 
     expect((await write($, path, 'agent-1')).deny).toContain("order O3's rule")
   }
   expect((await write($, 'C:\\claude\\workspace\\web\\src\\a.ts', 'agent-1')).deny).toBeUndefined()
+})
+
+test("the Bash layer: a knight's rm, mv, sed -i, redirects and git rm of a protected test are refused", async ($, on) => {
+  const harness = baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow' })
+  filesIn(
+    on,
+    new Map([
+      [`${WEB}/src/app.ts`, 'a'],
+      [`${WEB}/src/app.spec.ts`, 'a'],
+    ]),
+  )
+  councilWith(on, { id: 'O7', folder: WEB, forbid: [TESTS_RULE] })
+  await start($)
+
+  const removed = await bash($, 'rm -f src/app.spec.ts', 'agent-1')
+  expect(removed.deny).toContain("Bash layer): deleting src/app.spec.ts is forbidden by order O7's rule `**/*.spec.ts`")
+  expect(removed.deny).toContain('stop and report why instead of working around it')
+  expect((await bash($, 'git rm src/app.spec.ts', 'agent-1')).deny).toContain('deleting src/app.spec.ts')
+  expect((await bash($, 'mv src/app.spec.ts src/old.ts', 'agent-1')).deny).toContain('deleting src/app.spec.ts')
+  expect((await bash($, 'mv src/app.ts src/app2.spec.ts', 'agent-1')).deny).toContain('creating src/app2.spec.ts')
+  expect((await bash($, "sed -i 's|a|b|' src/app.spec.ts", 'agent-1')).deny).toContain('editing src/app.spec.ts')
+  expect((await bash($, 'echo x >> src/app.spec.ts', 'agent-1')).deny).toContain('editing src/app.spec.ts')
+  expect((await bash($, 'cd src && cat > new.spec.ts <<X\nit()\nX', 'agent-1')).deny).toContain('creating src/new.spec.ts')
+  expect(harness.toasts.some(toast => toast.includes('order O7, Bash layer'))).toBe(true)
+
+  for (const allowed of ['rm -f src/app.ts', "sed -i 's|a|b|' src/app.ts", 'echo x > src/new.ts', 'cat src/app.spec.ts', 'npm test']) {
+    expect((await bash($, allowed, 'agent-1')).deny).toBeUndefined()
+  }
+  // Indirect: the Bash layer can't see it (the backstop is there for these).
+  expect((await bash($, 'node scripts/clean-specs.js', 'agent-1')).deny).toBeUndefined()
+})
+
+test('the Bash layer: no new CSS, though an existing file may be appended to, and a copy into a folder counts', async ($, on) => {
+  baseStandIn(on, { root: ROOT, decide: () => 'allow', store: { [`rules:${ROOT}`]: [CSS_RULE] } })
+  filesIn(on, new Map([[`${ROOT}/shop/frontend/src/app.css`, 'a']]))
+  await start($)
+  expect((await bash($, 'echo x > shop/frontend/src/new.css')).deny).toContain('creating shop/frontend/src/new.css is forbidden by the standing rule')
+  expect((await bash($, 'cp ../theme/base.css shop/frontend/src')).deny).toContain('creating shop/frontend/src/base.css')
+  expect((await bash($, 'echo x >> shop/frontend/src/app.css')).deny).toBeUndefined()
+  expect((await bash($, 'rm shop/frontend/src/app.css')).deny).toBeUndefined()
+})
+
+test('on Windows, the Bash layer reads Windows and Git Bash paths', async ($, on) => {
+  const WIN = 'C:\\claude\\workspace'
+  baseStandIn(on, { root: WIN, decide: () => 'allow' })
+  filesIn(on, new Map())
+  councilWith(on, { id: 'O3', folder: `${WIN}/web`, forbid: [TESTS_RULE] })
+  await start($, WIN)
+  expect((await bash($, "rm 'C:\\claude\\workspace\\web\\src\\a.spec.ts'", 'agent-1')).deny).toContain("order O3's rule")
+  expect((await bash($, 'cd /c/claude/workspace/web && rm src/A.SPEC.ts', 'agent-1')).deny).toContain("order O3's rule")
+  expect((await bash($, 'cd /c/claude/workspace/web && rm src/a.ts', 'agent-1')).deny).toBeUndefined()
 })

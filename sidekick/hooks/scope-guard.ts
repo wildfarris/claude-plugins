@@ -612,7 +612,22 @@ type SegmentAnalysis = {
   changesDirectoryTo?: string
   // Interpreter code given inline: unclear wherever it runs.
   isInlineCode?: boolean
+  // The named paths it surely writes or deletes, for the path rules. Only
+  // commands the guard knows: a script's or build tool's arguments aren't here.
+  pathOps?: PathOpToken[]
 }
+
+// A path a command deletes, or writes (a create or an edit, by whether it is
+// there). `into`: the sources a copy or move puts inside it when it is a
+// folder. `isRunRelative`: relative to the folder the tool runs in (`git -C`).
+type PathOpToken = { token: Token; op: 'delete' | 'write'; into?: Token[]; isRunRelative?: boolean }
+
+const writes = (tokens: readonly Token[], extra: Partial<PathOpToken> = {}): PathOpToken[] => tokens.map(token => ({ token, op: 'write', ...extra }))
+const deletes = (tokens: readonly Token[], extra: Partial<PathOpToken> = {}): PathOpToken[] => tokens.map(token => ({ token, op: 'delete', ...extra }))
+// They delete the files they name.
+const DELETERS = new Set(['rm', 'rmdir', 'unlink', 'shred'])
+// git subcommands that change the named files in the working tree.
+const GIT_FILE_CHANGES: Record<string, 'write' | 'delete' | 'move'> = { rm: 'delete', mv: 'move', checkout: 'write', restore: 'write' }
 
 function positionals(family: string, args: Token[]): Token[] {
   const valueOptions = VALUE_OPTIONS[family] ?? []
@@ -638,7 +653,7 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
   while (start < tokens.length && WRAPPERS.has(tokens[start]!.text)) start++
   const head = tokens[start]
   const redirects = segment.tokens.filter(token => token.isRedirect && token.text !== '/dev/null')
-  const base: SegmentAnalysis = { isMutating: redirects.length > 0, isUnknown: false, targets: [...redirects], readPaths: [] }
+  const base: SegmentAnalysis = { isMutating: redirects.length > 0, isUnknown: false, targets: [...redirects], readPaths: [], pathOps: writes(redirects) }
   if (!head) return base
 
   const command = head.text.split('/').pop()!
@@ -666,12 +681,13 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
     if (outputIndex === -1 && !args.some(token => token.text === '-O' || token.text === '--remote-name')) return { ...base, readPaths: [...substituted] }
     const flag = args[outputIndex]
     const value = flag?.text.includes('=') ? { text: flag.text.split('=')[1]!, isQuoted: false } : flag && !(command === 'curl' && flag.text === '-O') ? args[outputIndex + 1] : undefined
-    return { ...base, isMutating: true, targets: [...base.targets, ...(value ? [value] : [])] }
+    return { ...base, isMutating: true, targets: [...base.targets, ...(value ? [value] : [])], pathOps: [...base.pathOps!, ...writes(value ? [value] : [])] }
   }
 
   if (command === 'dd') {
     const output = args.find(token => token.text.startsWith('of='))
-    return output ? { ...base, isMutating: true, targets: [...base.targets, { text: output.text.slice(3), isQuoted: false }] } : { ...base, readPaths: [...substituted] }
+    const file: Token = { text: output?.text.slice(3) ?? '', isQuoted: false }
+    return output ? { ...base, isMutating: true, targets: [...base.targets, file], pathOps: [...base.pathOps!, ...writes([file])] } : { ...base, readPaths: [...substituted] }
   }
 
   if (command === 'cd' || command === 'pushd') {
@@ -687,7 +703,7 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
     }
     // The piped input is xargs' own stdin, so the inner command has no heredocs or substitutions of its own.
     const inner = analyzeSegment({ ...emptySegment(false), tokens: args.slice(commandStart), substitutedPaths: substituted })
-    return { ...inner, targets: [...inner.targets, ...redirects], isMutating: inner.isMutating || base.isMutating }
+    return { ...inner, targets: [...inner.targets, ...redirects], isMutating: inner.isMutating || base.isMutating, pathOps: [...(inner.pathOps ?? []), ...base.pathOps!] }
   }
 
   if (COPIERS.has(command)) {
@@ -695,21 +711,33 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
     const targetIndex = args.findIndex(token => token.text === '-t' || token.text === '--target-directory')
     const destination = targetIndex === -1 ? files.slice(-1) : [args[targetIndex + 1]].filter((token): token is Token => token !== undefined)
     const sources = targetIndex === -1 ? files.slice(0, -1) : files
-    return { ...base, isMutating: true, targets: [...base.targets, ...destination], readPaths: [...sources, ...substituted] }
+    return { ...base, isMutating: true, targets: [...base.targets, ...destination], readPaths: [...sources, ...substituted], pathOps: [...base.pathOps!, ...writes(destination, { into: sources })] }
   }
 
   if (FILE_WRITERS.has(command) || MODE_THEN_FILES.has(command)) {
     const files = positionals(family, args).slice(MODE_THEN_FILES.has(command) ? 1 : 0)
-    return { ...base, isMutating: true, targets: [...base.targets, ...files, ...substituted] }
+    let pathOps = writes(files)
+    if (DELETERS.has(command)) pathOps = deletes(files)
+    if (command === 'mv') {
+      // mv a b, mv a b dir/, mv -t dir a b: the sources go, the destination is written.
+      const targetIndex = args.findIndex(token => token.text === '-t' || token.text === '--target-directory')
+      const destination = targetIndex === -1 ? files.slice(-1) : [args[targetIndex + 1]].filter((token): token is Token => token !== undefined)
+      const sources = targetIndex === -1 ? files.slice(0, -1) : files
+      pathOps = [...deletes(sources), ...writes(destination, { into: sources })]
+    }
+    return { ...base, isMutating: true, targets: [...base.targets, ...files, ...substituted], pathOps: [...base.pathOps!, ...pathOps] }
   }
 
   if (PATTERN_THEN_FILES.has(command)) {
     const valueOptions = VALUE_OPTIONS[family] ?? []
     const suppliesPattern = args.some(token => valueOptions.includes(token.text) && ['-e', '-f', '-E', '--expression', '--file'].includes(token.text))
-    const files = positionals(family, args).filter(token => !token.isQuoted || looksLikePath(token.text)).slice(suppliesPattern ? 0 : 1)
+    // BSD sed's `-i ''` suffix is no file and no pattern; past the pattern, a
+    // quoted word is a file only if it looks like a path.
+    const words = positionals(family, args).filter(token => !(token.isQuoted && token.text === ''))
+    const files = words.slice(suppliesPattern ? 0 : 1).filter(token => !token.isQuoted || looksLikePath(token.text))
     const isInPlace = (command === 'sed' || command === 'perl' || command === 'ruby') && hasInPlaceFlag(args)
     return isInPlace
-      ? { ...base, isMutating: true, targets: [...base.targets, ...files, ...substituted] }
+      ? { ...base, isMutating: true, targets: [...base.targets, ...files, ...substituted], pathOps: [...base.pathOps!, ...writes(files)] }
       : { ...base, readPaths: [...files, ...substituted] }
   }
 
@@ -732,7 +760,7 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
         ? subcommand === undefined || READ_ONLY_GIT.has(subcommand) || (LISTING_GIT[subcommand]?.(rest) ?? false)
         : subcommand !== undefined && READ_ONLY_PACKAGE.has(subcommand)
     const pathArgs = positionals(family, args).slice(1).filter(token => !token.isQuoted && looksLikePath(token.text))
-    return isReadOnly ? base : { ...base, isMutating: true, runTargets: pathArgs, directoryOption }
+    return isReadOnly ? base : { ...base, isMutating: true, runTargets: pathArgs, directoryOption, pathOps: [...base.pathOps!, ...gitFileOps(command, subcommand, rest)] }
   }
 
   if (READ_ONLY.has(command)) {
@@ -741,6 +769,58 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
 
   // Scripts, interpreters, anything unrecognized: can't tell from the words.
   return { ...base, isUnknown: true, targets: [...base.targets, ...args.filter(token => !token.isQuoted && looksLikePath(token.text))] }
+}
+
+// The files a git subcommand changes in the working tree, by name: `git rm`
+// deletes them, `git mv` moves them, `git checkout` / `git restore` rewrite
+// them (a branch name among them matches no file glob).
+function gitFileOps(command: string, subcommand: string | undefined, rest: readonly Token[]): PathOpToken[] {
+  const change = command === 'git' && subcommand !== undefined ? GIT_FILE_CHANGES[subcommand] : undefined
+  if (change === undefined) return []
+  const files = rest.filter(token => !isFlag(token) && token.text !== '--')
+  if (change === 'delete') return deletes(files, { isRunRelative: true })
+  if (change === 'write') return writes(files, { isRunRelative: true })
+  const sources = files.slice(0, -1)
+  return [...deletes(sources, { isRunRelative: true }), ...writes(files.slice(-1), { isRunRelative: true, into: sources })]
+}
+
+// A path a shell command changes, for the path rules: canonical and absolute.
+// `into`: the names a copy or move puts inside it, when it is a folder.
+export type CommandPathOp = { path: string; op: 'delete' | 'write'; into: string[] }
+
+// The paths a command surely changes, by name: what the Bash layer of the
+// path rules matches. It follows `cd`, `git -C`, `$(…)`, `bash -c` and
+// shell heredocs as analyzeCommand does. It can't see indirect writes: a
+// script, a build tool, `xargs` fed paths through a pipe, `find -exec`,
+// interpreter code, or a glob the shell expands to names it doesn't spell.
+export function commandPathOps(command: string, context: Pick<ScopeContext, 'root' | 'cwd' | 'home'>, depth = 0): CommandPathOp[] {
+  if (depth > MAX_NESTING) return []
+  const placed = placeContext({ ...context, folders: [] })
+  let directory: string | undefined = placed.cwd
+  const found: CommandPathOp[] = []
+  const resolve = (base: string | undefined, path: string) => {
+    const reading = placeAll(base, path, placingOf(placed))[0]
+    return reading === UNPLACEABLE ? undefined : reading
+  }
+  const inner = (code: string) => {
+    if (directory !== undefined) found.push(...commandPathOps(code, { ...context, cwd: directory }, depth + 1))
+  }
+  const nameOf = (token: Token) => token.text.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+  for (const segment of parseCommand(command)) {
+    for (const code of segment.substitutions) inner(code)
+    const analysis = analyzeSegment(segment)
+    if (analysis.changesDirectoryTo !== undefined) {
+      directory = analysis.changesDirectoryTo === '' ? placed.home : resolve(directory, analysis.changesDirectoryTo)
+      continue
+    }
+    for (const code of analysis.innerCommands ?? []) inner(code)
+    const runsIn = analysis.directoryOption ? resolve(directory, analysis.directoryOption) : directory
+    for (const entry of analysis.pathOps ?? []) {
+      const path = resolve(entry.isRunRelative ? runsIn : directory, entry.token.text)
+      if (path !== undefined) found.push({ path, op: entry.op, into: (entry.into ?? []).map(nameOf).filter(name => name !== '') })
+    }
+  }
+  return found
 }
 
 // The command a segment runs (past leading assignments and wrappers).

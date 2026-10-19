@@ -71,6 +71,9 @@ Globs stay small: `*` and `?` match within one name, `**` spans folders, a glob 
 | Layer | When | Catches |
 | --- | --- | --- |
 | File tools | before Write, Edit, MultiEdit, NotebookEdit | a create (the file isn't there yet) or an edit (it is) of a matching path |
+| Bash | before a shell command, from the paths it names | `rm`, `rmdir`, `unlink`, `shred` and `git rm` delete; `mv` and `git mv` delete their sources and write their destination; redirects (`>`, `>>`), `tee`, `touch`, `cp`, `ln`, `install`, `rsync`, `sed -i`, `perl -pi`, `chmod`, `truncate`, `patch`, `curl -o`, `dd of=`, `git checkout` and `git restore` write, a create or an edit by whether the file is there. A copy or move into a folder writes the names it puts there. It follows `cd`, `git -C`, `$(…)`, `bash -c` and shell heredocs. |
+
+The Bash layer only sees paths a command spells out. Indirect writes get past it: scripts and build tools (`node gen.js`, `npm run …`, `make`), `xargs` fed paths through a pipe, `find -exec` or `-delete`, interpreter code (`python -c`), `rm -r` of a folder holding protected files, and shell globs that expand to names it doesn't spell (`rm src/*`).
 
 Every refusal names the change, the rule's glob and operations, where it came from (`order O7` or the standing rule), the layer that fired and your reason, and tells Claude that the path is protected and, if it must change, to stop and report why instead of working around it. A toast says the same to you.
 

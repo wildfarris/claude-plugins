@@ -76,6 +76,7 @@ import {
   analyzeCommand,
   buildClassifierPrompt,
   checkFileEdit,
+  commandPathOps,
   denialMessage,
   describeScope,
   fileReadings,
@@ -874,6 +875,29 @@ async function fileToolHits($: EngineInterface, filePath: string, context: Scope
   return readings.flatMap(reading => matchPathRules(reading, ops, rules))
 }
 
+// The path rules a shell command breaks, from the paths it names: `rm` and
+// `git rm` delete; `mv` deletes its sources and writes its destination;
+// redirects, `tee`, `touch`, `cp`, `sed -i` and the like write, a create or an
+// edit by whether the file is there. A copy or move into a folder writes the
+// names it puts there. Indirect writes (scripts, build tools, `xargs` fed by a
+// pipe, `find -exec`) never reach this layer; the backstop looks for them.
+async function bashHits($: EngineInterface, command: string, context: ScopeContext, rules: readonly ActivePathRule[]): Promise<PathRuleHit[]> {
+  if (rules.length === 0) return []
+  const hits: PathRuleHit[] = []
+  for (const change of commandPathOps(command, context).slice(0, 50)) {
+    if (change.op === 'delete') {
+      hits.push(...matchPathRules(change.path, ['delete'], rules))
+      continue
+    }
+    const isFolder = change.into.length > 0 && (await $.fs.stat(change.path).catch(() => undefined))?.kind === 'dir'
+    for (const path of isFolder ? change.into.map(name => `${change.path}/${name}`) : [change.path]) {
+      const candidates = matchPathRules(path, ['create', 'edit', 'delete'], rules)
+      if (candidates.length > 0) hits.push(...matchPathRules(path, await opsForWrite($, path), rules))
+    }
+  }
+  return hits
+}
+
 // A path rule's refusal: a toast naming the rule, its source and the layer,
 // and the denial Claude reads.
 function refusePathRule($: EngineInterface, tool: string, hits: readonly PathRuleHit[], layer: 'file tool' | 'Bash'): string {
@@ -903,6 +927,10 @@ async function guardToolCall($: EngineInterface, tool: string, input: Record<str
     const command = textField(input.command)
     if (!command) return undefined
     verdict = analyzeCommand(command, context)
+    if (verdict.kind !== 'block') {
+      const hits = await bashHits($, command, context, rules)
+      if (hits.length > 0) return refusePathRule($, tool, hits, 'Bash')
+    }
     if (verdict.kind === 'unclear') {
       const judged = await classifyCommand($, command, context)
       if (judged.kind === 'block') verdict = { kind: 'block', target: context.cwd, reason: `${judged.reason} (scope classifier)` }

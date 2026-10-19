@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { orderFor } from '../hooks/council-glimpse'
+import { commandPathOps } from '../hooks/scope-guard'
 import {
   RULE_MARKER,
   builtInEntries,
@@ -19,6 +20,7 @@ import {
 } from '../hooks/scope-rules'
 
 const ROOT = '/dev/work'
+const WEB_DIR = `${ROOT}/web`
 const ALL: PathOp[] = ['create', 'edit', 'delete']
 const TESTS: ActivePathRule = { glob: '**/*.spec.ts', ops: ALL, reason: 'the tests are the spec', base: `${ROOT}/web`, source: { kind: 'order', id: 'O7' } }
 const NO_NEW_CSS: ActivePathRule = { glob: '*/frontend/src/**/*.css', ops: ['create'], reason: 'use the theme tokens', base: ROOT, source: { kind: 'standing' } }
@@ -112,6 +114,47 @@ describe('standing forbid rules', () => {
     expect(sentence.startsWith(RULE_MARKER)).toBe(true)
     expect(sentence).toContain('Creating files matching */frontend/src/**/*.css under /dev/work')
     expect(builtInEntries([css], ROOT, 'absolute').deny).toEqual([])
+  })
+})
+
+describe('the paths a shell command changes', () => {
+  const ops = (command: string, cwd = WEB_DIR) => commandPathOps(command, { root: ROOT, cwd }).map(change => `${change.op} ${change.path}${change.into.length > 0 ? ` into ${change.into.join(',')}` : ''}`)
+
+  test('deleters delete; mv deletes its sources and writes its destination; writers write', () => {
+    expect(ops('rm -f src/a.spec.ts')).toEqual([`delete ${WEB_DIR}/src/a.spec.ts`])
+    expect(ops('mv src/a.spec.ts src/b.ts')).toEqual([`delete ${WEB_DIR}/src/a.spec.ts`, `write ${WEB_DIR}/src/b.ts into a.spec.ts`])
+    expect(ops('mv -t dest a.ts b.ts')).toEqual([`delete ${WEB_DIR}/a.ts`, `delete ${WEB_DIR}/b.ts`, `write ${WEB_DIR}/dest into a.ts,b.ts`])
+    expect(ops('cp ../shared/a.css styles/')).toEqual([`write ${WEB_DIR}/styles into a.css`])
+    expect(ops('echo x > a.css && echo y >> b.css')).toEqual([`write ${WEB_DIR}/a.css`, `write ${WEB_DIR}/b.css`])
+    expect(ops("sed -i 's|a|b|' src/a.spec.ts")).toEqual([`write ${WEB_DIR}/src/a.spec.ts`])
+    expect(ops('touch x.css && echo hi | tee y.css && chmod +x run.sh')).toEqual([`write ${WEB_DIR}/x.css`, `write ${WEB_DIR}/y.css`, `write ${WEB_DIR}/run.sh`])
+    expect(ops('curl -o page.css https://x && dd if=/dev/zero of=blob.bin')).toEqual([`write ${WEB_DIR}/page.css`, `write ${WEB_DIR}/blob.bin`])
+  })
+
+  test('git rm, mv, checkout and restore name files; git -C, cd, bash -c and $(…) are followed', () => {
+    expect(ops('git rm -q src/a.spec.ts')).toEqual([`delete ${WEB_DIR}/src/a.spec.ts`])
+    expect(ops('git -C web checkout -- src/a.spec.ts', ROOT)).toEqual([`write ${WEB_DIR}/src/a.spec.ts`])
+    expect(ops('git mv a.spec.ts b.spec.ts')).toEqual([`delete ${WEB_DIR}/a.spec.ts`, `write ${WEB_DIR}/b.spec.ts into a.spec.ts`])
+    expect(ops('git add src/a.spec.ts && git commit -m x')).toEqual([])
+    expect(ops('cd src && rm a.spec.ts')).toEqual([`delete ${WEB_DIR}/src/a.spec.ts`])
+    expect(ops("bash -c 'rm src/a.spec.ts'")).toEqual([`delete ${WEB_DIR}/src/a.spec.ts`])
+    expect(ops('echo $(rm src/a.spec.ts)')).toEqual([`delete ${WEB_DIR}/src/a.spec.ts`])
+  })
+
+  test('indirect writes are not seen: scripts, build tools, find -delete, xargs fed by a pipe, interpreters', () => {
+    for (const command of ["node scripts/gen.js src/a.spec.ts", 'npm run build', "find . -name '*.spec.ts' -delete", 'git ls-files | xargs rm', "python3 -c 'open(\"a.css\",\"w\")'", 'make clean']) {
+      expect(ops(command)).toEqual([])
+    }
+    // Reads change nothing.
+    expect(ops('cat src/a.spec.ts && grep -rn x src')).toEqual([])
+  })
+
+  test('Windows and Git Bash paths come out canonical', () => {
+    const WIN = 'C:\\claude\\workspace'
+    const win = (command: string) => commandPathOps(command, { root: WIN, cwd: WIN }).map(change => `${change.op} ${change.path}`)
+    expect(win("rm 'C:\\claude\\workspace\\web\\src\\a.spec.ts'")).toEqual(['delete c:/claude/workspace/web/src/a.spec.ts'])
+    expect(win('cd /c/claude/workspace/web && rm src/a.spec.ts')).toEqual(['delete c:/claude/workspace/web/src/a.spec.ts'])
+    expect(win("echo x > 'web\\src\\b.css'")).toEqual(['write c:/claude/workspace/web/src/b.css'])
   })
 })
 
