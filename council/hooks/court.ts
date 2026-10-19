@@ -4,7 +4,7 @@
 // proposal's checks, the brief, the ruling, matching a dispatch to its order,
 // the dispatched agent's instructions, and folding its progress in.
 
-import type { AdvisorId, Council, Court, Order, OrderRole, OrderTodo, Ruling, Seat } from '../types'
+import type { AdvisorId, Council, Court, ForbidOp, ForbidRule, Order, OrderRole, OrderTodo, Ruling, Seat } from '../types'
 import { seatsOf } from './council'
 import { isPathInside, joinUnder, pathStyleOf, relativeToRoot } from './paths'
 
@@ -23,10 +23,52 @@ export const CONDITION_AT = 3
 export const MAX_DISPATCHES = 6
 export const MAX_TODOS = 12
 
-export type ProposedDispatch = { folder: string; role: OrderRole; task: string; todos: string[] }
+export const MAX_FORBID = 8
+
+export type ProposedDispatch = { folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[] }
 export type Proposal = { plan: string; dispatches: ProposedDispatch[] }
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
+
+const FORBID_OPS: readonly ForbidOp[] = ['create', 'edit', 'delete']
+
+// A forbid glob as stored: `/`-separated, no `./`, a trailing `/` spelled
+// `/**`; undefined for one that is empty, absolute or climbs (`..`). (The
+// sidekick mod reads it the same way: scope-rules.ts normalizeGlob.)
+export function forbidGlob(text: string): string | undefined {
+  let glob = text.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/')
+  while (glob.startsWith('./')) glob = glob.slice(2)
+  if (glob.endsWith('/')) glob = `${glob}**`
+  if (glob === '' || glob.startsWith('/') || /^[A-Za-z]:/.test(glob) || glob.startsWith('~')) return undefined
+  return glob.split('/').some(part => part === '..' || part === '.' || part === '') ? undefined : glob
+}
+
+// A dispatch's `forbid`, checked: each entry a glob relative to its folder,
+// the operations (all three when left out) and the reason the agent is shown.
+function readForbid(raw: unknown, label: string): ForbidRule[] | { error: string } {
+  if (raw === undefined || raw === null) return []
+  if (!Array.isArray(raw)) return { error: `${label}: forbid must be a list of { glob, ops?, reason }.` }
+  if (raw.length > MAX_FORBID) return { error: `${label}: at most ${MAX_FORBID} forbid rules.` }
+  const rules: ForbidRule[] = []
+  for (const [index, value] of (raw as unknown[]).entries()) {
+    const entry = (typeof value === 'object' && value !== null ? value : {}) as Record<string, unknown>
+    const where = `${label}, forbid ${index + 1}`
+    const glob = isText(entry.glob) ? forbidGlob(entry.glob) : undefined
+    if (glob === undefined) return { error: `${where}: give a glob relative to the dispatch's folder (e.g. "**/*.spec.ts"), with no "..", drive or leading "/".` }
+    if (entry.ops !== undefined && (!Array.isArray(entry.ops) || entry.ops.length === 0 || !(entry.ops as unknown[]).every(op => FORBID_OPS.includes(op as ForbidOp)))) {
+      return { error: `${where}: ops is a list of "create", "edit" and "delete" (leave it out for all three).` }
+    }
+    if (!isText(entry.reason)) return { error: `${where}: give the reason the agent is shown (the person's words).` }
+    const ops = entry.ops === undefined ? [...FORBID_OPS] : FORBID_OPS.filter(op => (entry.ops as unknown[]).includes(op))
+    rules.push({ glob, ops, reason: oneLine(entry.reason) })
+  }
+  return rules
+}
+
+const forbidOpsText = (ops: readonly ForbidOp[]) => (ops.length === FORBID_OPS.length ? 'create, edit, delete' : ops.join(', '))
+
+// One rule as the advisors, Claude and the agent read it.
+export const forbidText = (rule: ForbidRule) => `${rule.glob} (${forbidOpsText(rule.ops)}): ${rule.reason}`
 
 // A folder as Claude wrote it, relative to the session root, `/`-separated;
 // undefined when it leaves the root or is the root itself (a dispatch is
@@ -67,7 +109,9 @@ export function readProposal(input: Record<string, unknown>, root: string): Prop
     const todos = Array.isArray(entry.todos) ? entry.todos.filter(isText).map(todo => todo.trim()) : []
     if (todos.length === 0) return { error: `${label}: give it a todo list (the steps it will check off).` }
     if (todos.length > MAX_TODOS) return { error: `${label}: at most ${MAX_TODOS} todos.` }
-    dispatches.push({ folder, role: entry.role, task: entry.task.trim(), todos })
+    const forbid = readForbid(entry.forbid, label)
+    if ('error' in forbid) return forbid
+    dispatches.push({ folder, role: entry.role, task: entry.task.trim(), todos, ...(forbid.length > 0 ? { forbid } : {}) })
   }
   return { plan: input.plan.trim(), dispatches }
 }
@@ -77,7 +121,8 @@ const planLines = (proposal: Proposal) => [
   `Claude proposes: ${proposal.plan}`,
   ...proposal.dispatches.map(
     (dispatch, index) =>
-      `${index + 1}. A ${dispatch.role} (${dispatch.role === 'scout' ? 'reads only' : 'may change files and run commands'}) in ${dispatch.folder}/: ${dispatch.task}\n   Todos: ${dispatch.todos.join('; ')}`,
+      `${index + 1}. A ${dispatch.role} (${dispatch.role === 'scout' ? 'reads only' : 'may change files and run commands'}) in ${dispatch.folder}/: ${dispatch.task}\n   Todos: ${dispatch.todos.join('; ')}` +
+      (dispatch.forbid && dispatch.forbid.length > 0 ? `\n   Forbidden paths (under ${dispatch.folder}/): ${dispatch.forbid.map(forbidText).join('; ')}` : ''),
   ),
 ]
 
@@ -254,6 +299,7 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
     task: dispatch.task,
     todos: dispatch.todos.map(content => ({ content, status: 'pending', activeForm: content })),
     conditions,
+    ...(dispatch.forbid && dispatch.forbid.length > 0 ? { forbid: dispatch.forbid } : {}),
     status: 'approved',
     agentId: null,
     steps: 0,
@@ -274,8 +320,11 @@ export function rulingText(result: Ruling & { conditions: string[] }, orders: re
     ...(result.conditions.length > 0 ? ['Conditions:', ...result.conditions.map(condition => `- ${condition}`)] : []),
     ...(notes.length > 0 ? ['Notes (not conditions; the orders do not carry them):', ...notes.map(note => `- ${note}`)] : []),
     'Dispatch each order with the Agent tool, its subagent_type as given, and its order id in the description (e.g. "O1 api limits"). An order you decide not to dispatch, withdraw with mcp__council__withdraw_orders; an undispatched order expires after a day:',
-    ...orders.map(order => `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}`),
-    'Each agent is given its folder, its todos and the conditions; keep your own prompt to the task.',
+    ...orders.map(
+      order =>
+        `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}${order.forbid && order.forbid.length > 0 ? `, forbids: ${order.forbid.map(rule => rule.glob).join(', ')}` : ''}`,
+    ),
+    'Each agent is given its folder, its todos, the conditions and any forbidden paths; keep your own prompt to the task.',
   ].join('\n')
 }
 
@@ -299,6 +348,11 @@ export function dispatchPrompt(order: Order, folderInstructions: string | null, 
     `Work only in ${order.folder}/. ${order.role === 'scout' ? 'You are a scout: read and report; change nothing.' : 'You are a knight: you may change files and run commands inside that folder only; anything outside it is refused.'}`,
     `Report your progress with the ${PROGRESS_TOOL} tool: call it first with this whole list, then again each time you start or finish an item, marking it in_progress then completed (add an item if the work needs one). The council follows your progress by it:\n${order.todos.map(todo => `- ${todo.content}`).join('\n')}`,
     ...(order.conditions.length > 0 ? [`The council's conditions:\n${order.conditions.map(condition => `- ${condition}`).join('\n')}`] : []),
+    ...(order.forbid && order.forbid.length > 0
+      ? [
+          `Forbidden paths (globs under ${order.folder}/; the sidekick mod refuses these changes, and checks what changed when you stop). If one must change, stop and report why instead of working around it:\n${order.forbid.map(rule => `- ${forbidText(rule)}`).join('\n')}`,
+        ]
+      : []),
     ...(folderInstructions ? [`${order.relFolder}/CLAUDE.md (this folder's rules):\n${folderInstructions.slice(0, 6000)}`] : []),
     'End with a short report: what you did or found, what changed, anything left undone.',
     `From Claude:\n${claudePrompt}`,
@@ -490,7 +544,7 @@ export const WITHDRAW_ORDERS_SCHEMA = {
 }
 
 export const PROPOSE_ORDERS_DESCRIPTION =
-  "Put a plan of dispatches to the person's council before doing the work. Each dispatch sends one agent into one subfolder: a scout (council:scout) reads and reports, a knight (council:knight) changes files and runs commands there. The advisors rule on the plan (it takes a minute); approved dispatches become orders O1, O2…, which you then carry out with the Agent tool, naming the order id in the description. Use it for multi-folder work, and always in court mode."
+  "Put a plan of dispatches to the person's council before doing the work. Each dispatch sends one agent into one subfolder: a scout (council:scout) reads and reports, a knight (council:knight) changes files and runs commands there. The advisors rule on the plan (it takes a minute); approved dispatches become orders O1, O2…, which you then carry out with the Agent tool, naming the order id in the description. When the person rules out some paths (\"do not edit tests\", \"no new CSS\"), give the dispatch a forbid list; the order carries it and the agent is held to it. Use it for multi-folder work, and always in court mode."
 
 export const PROPOSE_ORDERS_SCHEMA = {
   type: 'object',
@@ -506,6 +560,19 @@ export const PROPOSE_ORDERS_SCHEMA = {
           role: { type: 'string', enum: ['scout', 'knight'], description: 'scout: reads only; knight: may change files and run commands.' },
           task: { type: 'string', description: 'What it is to do, in one or two sentences.' },
           todos: { type: 'array', items: { type: 'string' }, description: `The steps it will check off (at most ${MAX_TODOS}).` },
+          forbid: {
+            type: 'array',
+            description: `Optional, at most ${MAX_FORBID}: paths the agent may not change, as the person asked (e.g. "do not edit tests", "no new CSS"). The sidekick mod refuses those changes.`,
+            items: {
+              type: 'object',
+              properties: {
+                glob: { type: 'string', description: 'Relative to the folder: * and ? within a name, ** across folders, a bare name at any depth (e.g. "**/*.spec.ts", "*.css").' },
+                ops: { type: 'array', items: { type: 'string', enum: ['create', 'edit', 'delete'] }, description: 'What is forbidden; leave out for all three.' },
+                reason: { type: 'string', description: "The person's reason, shown to the agent." },
+              },
+              required: ['glob', 'reason'],
+            },
+          },
         },
         required: ['folder', 'role', 'task', 'todos'],
       },

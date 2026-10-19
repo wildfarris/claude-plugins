@@ -133,6 +133,13 @@ export type OrderRole = 'scout' | 'knight'
 // was dispatched (Claude withdrew it, or it expired), with `withdrawnReason`.
 export type OrderStatus = 'approved' | 'dispatched' | 'done' | 'failed' | 'withdrawn'
 
+export type ForbidOp = 'create' | 'edit' | 'delete'
+
+// One path rule on an order: a glob relative to the order's folder (`*` and
+// `?` within a name, `**` across folders, a bare name at any depth), the
+// operations it forbids, and the person's reason, shown to the agent.
+export type ForbidRule = { glob: string; ops: ForbidOp[]; reason: string }
+
 export type OrderTodo = {
   content: string
   status: 'pending' | 'in_progress' | 'completed'
@@ -154,6 +161,10 @@ export type Order = {
   todos: OrderTodo[]
   // The council's conditions on this order (concerns of 3 or more).
   conditions: string[]
+  // Paths the order's agent may not create, edit or delete (globs relative to
+  // `folder`), from the dispatch's `forbid`. The sidekick mod enforces them.
+  // Absent when the dispatch named none, and in orders saved before it existed.
+  forbid?: ForbidRule[]
   status: OrderStatus
   agentId: string | null
   steps: number
