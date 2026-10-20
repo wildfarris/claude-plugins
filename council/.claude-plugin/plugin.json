@@ -1,6 +1,6 @@
 {
   "name": "council",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Convene a council of advisors on a question or on a repo's recent work: built-in members plus your own member files, chosen per project, with animated pixel portraits and a brain trust mode.",
   "author": {
     "name": "Jeremy Phares"
