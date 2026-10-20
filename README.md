@@ -6,7 +6,7 @@ A Claude Code plugin marketplace, `personal-mods`, holding three plugins: `sidek
 
 ### sidekick
 
-A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard that keeps a session's changes inside its target folder, long-lived rules, a resume warning, trimming instead of summary compaction, and tools that let Claude ask the Codex and Antigravity CLIs, with your approval on every call. See [sidekick/README.md](sidekick/README.md).
+A bar above the prompt (TL;DR briefs from a session record, heads-up, rules, replay), a multi-repo scope guard that keeps a session's changes inside its target folder, a policy guard for Bash and PowerShell (an inline-code ban and a Haiku judge of plain-language rules, within a call budget), long-lived rules, a resume warning, trimming instead of summary compaction, and tools that let Claude ask the Codex and Antigravity CLIs, with your approval on every call. See [sidekick/README.md](sidekick/README.md).
 
 ### council
 
@@ -33,8 +33,8 @@ Each plugin installs independently of the others. Settings are set with `/plugin
 
 The two work alone, and each does more with the other installed:
 
-- With sidekick installed, its bar shows a council button (`councilButtonEnabled`, on by default), and its scope guard also holds a council knight's shell commands to the knight's folder.
-- Without sidekick, only a knight's file edits are held to the folder, not its shell commands.
+- With sidekick installed, its bar shows a council button (`councilButtonEnabled`, on by default), its scope guard also holds a council knight's shell commands to the knight's folder, and its policy guard holds them to the order's plain-language rules (`forbid: [{ "rule": "…" }]`).
+- Without sidekick, only a knight's file edits are held to the folder, not its shell commands, and an order's plain-language rules are only instructions.
 
 Install both if you use knights.
 
