@@ -341,7 +341,8 @@ export function checkFileEdit(filePath: string, context: ScopeContext): GuardVer
 
 // ── Shell commands ─────────────────────────────────────────────────────────
 
-type Token = { text: string; isQuoted: boolean; isRedirect?: boolean }
+// `isHereString`: the word after `<<<`, which the command reads on stdin (data, not a file).
+export type Token = { text: string; isQuoted: boolean; isRedirect?: boolean; isHereString?: boolean }
 
 export type Segment = {
   tokens: Token[]
@@ -374,7 +375,7 @@ export function parseCommand(command: string): Segment[] {
 
   const pushWord = () => {
     if (!hasWord) return
-    current.tokens.push({ text: word, isQuoted: isWordQuoted || isNextWordValue, isRedirect: pendingRedirect || undefined })
+    current.tokens.push({ text: word, isQuoted: isWordQuoted || isNextWordValue, isRedirect: pendingRedirect || undefined, isHereString: isNextWordValue || undefined })
     pendingRedirect = false
     isNextWordValue = false
     word = ''
@@ -634,7 +635,7 @@ function positionals(family: string, args: Token[]): Token[] {
   const found: Token[] = []
   for (let index = 0; index < args.length; index++) {
     const token = args[index]!
-    if (token.isRedirect) continue
+    if (token.isRedirect || token.isHereString) continue
     if (isFlag(token)) {
       if (valueOptions.includes(token.text)) index++
       continue

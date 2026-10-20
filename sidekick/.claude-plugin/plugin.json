@@ -61,6 +61,12 @@
       "description": "Block changes outside this session's target folders, once set with /scope set or add.",
       "default": true
     },
+    "inlineCodeBanEnabled": {
+      "type": "boolean",
+      "title": "Inline-code ban",
+      "description": "Refuse Bash and PowerShell commands that run interpreter code written into the command line (node -e, python -c, a heredoc piped to node, Invoke-Expression…). A council order's agent is refused; in your own session you are asked.",
+      "default": true
+    },
     "scopeClassifierEnabled": {
       "type": "boolean",
       "title": "Scope classifier",

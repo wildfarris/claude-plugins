@@ -165,11 +165,12 @@ describe("a council order's forbid", () => {
     expect(readPathRule({ glob: '../x' })).toBeUndefined()
     const court = {
       orders: [
-        { id: 'O7', agentId: 'a1', status: 'dispatched', folder: '/w/web', forbid: [{ glob: '**/*.spec.ts', ops: ['edit'], reason: 'tests' }, { glob: '/abs' }, 'junk'] },
-        { id: 'O8', agentId: 'a2', status: 'dispatched', folder: '/w/api' },
+        { id: 'O7', agentId: 'a1', status: 'dispatched', folder: '/w/web', forbid: [{ glob: '**/*.spec.ts', ops: ['edit'], reason: 'tests' }, { glob: '/abs' }, "Don't touch the lockfile.", { rule: '  Push   nothing. ' }, 42] },
+        { id: 'O8', agentId: 'a2', status: 'dispatched', folder: '/w/api', policy: ['Run no servers.', ''] },
       ],
     }
-    expect(orderFor(court, 'a1')).toEqual({ id: 'O7', folder: '/w/web', forbid: [{ glob: '**/*.spec.ts', ops: ['edit'], reason: 'tests' }] })
-    expect(orderFor(court, 'a2')).toEqual({ id: 'O8', folder: '/w/api', forbid: [] })
+    // A sentence in place of a glob (a string, or { rule }) is a plain-language rule for the judge.
+    expect(orderFor(court, 'a1')).toEqual({ id: 'O7', folder: '/w/web', forbid: [{ glob: '**/*.spec.ts', ops: ['edit'], reason: 'tests' }], policy: ["Don't touch the lockfile.", 'Push nothing.'] })
+    expect(orderFor(court, 'a2')).toEqual({ id: 'O8', folder: '/w/api', forbid: [], policy: ['Run no servers.'] })
   })
 })

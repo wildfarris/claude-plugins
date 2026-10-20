@@ -86,10 +86,13 @@ import {
   type Change,
 } from './backstop'
 import { resumeWarningFrom } from './resume-warning'
+import { inlineCodeDenial, inlineCodeQuestion } from './inline-code'
+import { DEFAULT_POLICY } from './policy'
+import { agentIdOf, decideShell, inlineFinding, isShellTool, shellCommandOf, type ShellTool } from './policy-guard'
+import { powerShellPathOps } from './powershell'
 import { redactSecrets } from './secrets'
 import {
   CLASSIFIER_SYSTEM_PROMPT,
-  analyzeCommand,
   buildClassifierPrompt,
   checkFileEdit,
   commandPathOps,
@@ -116,6 +119,7 @@ import {
   standingPathRules,
   syncRules,
   type ActivePathRule,
+  type GuardLayer,
   type LongLivedRule,
   type PathOp,
   type PathRuleHit,
@@ -827,12 +831,12 @@ async function restoreScope($: EngineInterface, root: string): Promise<void> {
 type ClassifierResult = { kind: 'allow' } | { kind: 'block'; reason: string } | { kind: 'skipped'; why: 'off' | 'built-in' | 'usage-cap' | 'failed' }
 
 // Asks the model only when nothing built in will look at the command anyway.
-async function classifyCommand($: EngineInterface, command: string, context: ScopeContext): Promise<ClassifierResult> {
+async function classifyCommand($: EngineInterface, tool: ShellTool, command: string, context: ScopeContext): Promise<ClassifierResult> {
   if (!settings.isScopeClassifierEnabled) return { kind: 'skipped', why: 'off' }
   try {
     // 'ask' goes to the mode's decider (the dialog or the auto-mode
     // classifier, which reads the rules); 'deny' is refused anyway.
-    const check = await $.tool.check({ tool: 'Bash', input: { command } })
+    const check = await $.tool.check({ tool, input: { command } })
     if (check.decision !== 'allow') return { kind: 'skipped', why: 'built-in' }
   } catch {
     // no answer: fall through to the model
@@ -848,7 +852,7 @@ async function classifyCommand($: EngineInterface, command: string, context: Sco
   } catch {
     // no usage figures (an API key, not a subscription): carry on
   }
-  const cacheKey = JSON.stringify([command, context.cwd, context.folders])
+  const cacheKey = JSON.stringify([tool, command, context.cwd, context.folders])
   const cached = classifierCache.get(cacheKey)
   if (cached !== undefined) return cached
   // 4 s: the whole tool.call hook has a 10 s budget.
@@ -900,10 +904,13 @@ async function fileToolHits($: EngineInterface, filePath: string, context: Scope
 // edit by whether the file is there. A copy or move into a folder writes the
 // names it puts there. Indirect writes (scripts, build tools, `xargs` fed by a
 // pipe, `find -exec`) never reach this layer; the backstop looks for them.
-async function bashHits($: EngineInterface, command: string, context: ScopeContext, rules: readonly ActivePathRule[]): Promise<PathRuleHit[]> {
+// PowerShell's file cmdlets (Set-Content, Remove-Item, Move-Item…) are read
+// the same way (powershell.ts).
+async function shellHits($: EngineInterface, tool: ShellTool, command: string, context: ScopeContext, rules: readonly ActivePathRule[]): Promise<PathRuleHit[]> {
   if (rules.length === 0) return []
   const hits: PathRuleHit[] = []
-  for (const change of commandPathOps(command, context).slice(0, 50)) {
+  const changes = tool === 'PowerShell' ? powerShellPathOps(command, context) : commandPathOps(command, context)
+  for (const change of changes.slice(0, 50)) {
     if (change.op === 'delete') {
       hits.push(...matchPathRules(change.path, ['delete'], rules))
       continue
@@ -919,7 +926,7 @@ async function bashHits($: EngineInterface, command: string, context: ScopeConte
 
 // A path rule's refusal: a toast naming the rule, its source and the layer,
 // and the denial Claude reads.
-function refusePathRule($: EngineInterface, tool: string, hits: readonly PathRuleHit[], layer: 'file tool' | 'Bash'): string {
+function refusePathRule($: EngineInterface, tool: string, hits: readonly PathRuleHit[], layer: GuardLayer): string {
   const first = hits[0]!
   const source = first.rule.source.kind === 'order' ? `order ${first.rule.source.id}` : 'a standing rule'
   $.ui.toast(`Path rule (${source}, ${layer} layer) blocked ${tool}: ${first.op} ${first.path} matches ${first.rule.glob}.`)
@@ -930,7 +937,53 @@ function refusePathRule($: EngineInterface, tool: string, hits: readonly PathRul
 // only for the tools it polices, with the context already read. With no scope
 // set (only /scope set or add, or a council order, sets one) and no path
 // rules, nothing is blocked.
-async function guardToolCall($: EngineInterface, tool: string, input: Record<string, unknown>, context: ScopeContext, rules: readonly ActivePathRule[] = []): Promise<string | undefined> {
+// The owner's own shell calls the classic.PreToolUse hook asked about, by
+// tool and command: when one reaches tool.call, the owner approved it.
+const OWNER_ASK_WINDOW_MS = 10 * 60 * 1000
+const ownerAsks = new Map<string, number>()
+const ownerAskKey = (tool: string, command: string) => `${tool}\0${command}`
+
+function rememberOwnerAsk(tool: string, command: string, now: number): void {
+  for (const [key, at] of ownerAsks) if (now - at > OWNER_ASK_WINDOW_MS) ownerAsks.delete(key)
+  if (ownerAsks.size > 100) ownerAsks.delete(ownerAsks.keys().next().value!)
+  ownerAsks.set(ownerAskKey(tool, command), now)
+}
+
+function takeOwnerApproval(tool: string, input: Record<string, unknown>, now: number): boolean {
+  const command = shellCommandOf(input)
+  if (command === undefined) return false
+  const key = ownerAskKey(tool, command)
+  const at = ownerAsks.get(key)
+  ownerAsks.delete(key)
+  return at !== undefined && now - at <= OWNER_ASK_WINDOW_MS
+}
+
+// The owner's own Bash and PowerShell calls, before they run: what the guard
+// would refuse becomes a question (an ask the engine keeps in every mode).
+// A subagent's call is left to tool.call, which denies instead.
+function ownerShellQuestion(tool: ShellTool, input: Record<string, unknown>, now: number): { ask: string } | undefined {
+  if (!settings.isScopeGuardEnabled || agentIdOf(input) !== undefined) return undefined
+  const command = shellCommandOf(input)
+  if (command === undefined) return undefined
+  const finding = settings.isInlineCodeBanEnabled ? inlineFinding(tool, command) : undefined
+  if (finding === undefined) return undefined
+  rememberOwnerAsk(tool, command, now)
+  return { ask: inlineCodeQuestion(finding) }
+}
+
+// Who made a call: a subagent (a council order's agent or any other) can't be
+// asked, so what the guard refuses is denied; the owner's own session is
+// asked instead, once its classic.PreToolUse hook has put the question.
+type CallOrigin = { isAgent: boolean; isOwnerApproved: boolean }
+
+async function guardToolCall(
+  $: EngineInterface,
+  tool: string,
+  input: Record<string, unknown>,
+  context: ScopeContext,
+  rules: readonly ActivePathRule[] = [],
+  origin: CallOrigin = { isAgent: false, isOwnerApproved: false },
+): Promise<string | undefined> {
   let verdict: GuardVerdict = { kind: 'allow' }
   const isFileEdit = FILE_TOOLS.has(tool)
 
@@ -942,16 +995,22 @@ async function guardToolCall($: EngineInterface, tool: string, input: Record<str
       const hits = await fileToolHits($, filePath, context, rules)
       if (hits.length > 0) return refusePathRule($, tool, hits, 'file tool')
     }
-  } else {
-    const command = textField(input.command)
+  } else if (isShellTool(tool)) {
+    const command = shellCommandOf(input)
     if (!command) return undefined
-    verdict = analyzeCommand(command, context)
+    // Deterministic refusals first: the inline-code ban, then the scope.
+    const decision = decideShell(tool, command, context, { isInlineBanEnabled: settings.isInlineCodeBanEnabled && !origin.isOwnerApproved })
+    if (decision.kind === 'refuse' && decision.via === 'inline') {
+      $.ui.toast(`Guard refused ${tool}: inline interpreter code (${decision.finding.shape}).`)
+      return inlineCodeDenial(decision.finding, origin.isAgent)
+    }
+    verdict = decision.kind === 'refuse' ? decision.verdict : decision.kind === 'judge' ? { kind: 'unclear', reason: decision.reason } : { kind: 'allow' }
     if (verdict.kind !== 'block') {
-      const hits = await bashHits($, command, context, rules)
-      if (hits.length > 0) return refusePathRule($, tool, hits, 'Bash')
+      const hits = await shellHits($, tool, command, context, rules)
+      if (hits.length > 0) return refusePathRule($, tool, hits, tool)
     }
     if (verdict.kind === 'unclear') {
-      const judged = await classifyCommand($, command, context)
+      const judged = await classifyCommand($, tool, command, context)
       if (judged.kind === 'block') verdict = { kind: 'block', target: context.cwd, reason: `${judged.reason} (scope classifier)` }
       // The classifier was asked and gave no answer: fail closed, as the guard
       // does on errors. (Turned off, or paused at the usage cap, it's the
@@ -1161,12 +1220,15 @@ async function rulesCommand($: EngineInterface, args: string): Promise<string> {
   const rules = await readRules($, root)
   switch (action) {
     case 'list':
-      return rules.length === 0
-        ? 'No long-lived rules. The bar offers one after the scope guard blocks something; /rules add fence <folder>, /rules add exclusive <a> <b> or /rules add forbid <glob> [create,edit,delete] <reason> adds one.'
-        : `Rules (in .claude/settings.local.json):\n${rules.map((rule, index) => `${index + 1}. ${describeRule(rule, root)}`).join('\n')}`
+      return [
+        rules.length === 0
+          ? 'No long-lived rules. The bar offers one after the scope guard blocks something; /rules add fence <folder>, /rules add exclusive <a> <b>, /rules add forbid <glob> [create,edit,delete] <reason> or /rules add policy <sentence> adds one.'
+          : `Rules (in .claude/settings.local.json; policy sentences are for the guard's judge):\n${rules.map((rule, index) => `${index + 1}. ${describeRule(rule, root)}`).join('\n')}`,
+        `Default policy (ships with sidekick): ${DEFAULT_POLICY.join(' ')}`,
+      ].join('\n')
     case 'add': {
       const rule = parseRule(rest.join(' '), root)
-      return rule === undefined ? 'Usage: /rules add fence <folder> | /rules add exclusive <folder> <folder> | /rules add forbid <glob> [create,edit,delete] <reason>' : addRule($, root, rule)
+      return rule === undefined ? 'Usage: /rules add fence <folder> | /rules add exclusive <folder> <folder> | /rules add forbid <glob> [create,edit,delete] <reason> | /rules add policy <sentence>' : addRule($, root, rule)
     }
     case 'remove': {
       const index = Number(rest[0]) - 1
@@ -1176,7 +1238,7 @@ async function rulesCommand($: EngineInterface, args: string): Promise<string> {
       return `Removed: ${describeRule(removed, root)}. ${await applyRules($, root)}`
     }
     default:
-      return 'Usage: /rules [list | add fence <folder> | add exclusive <folder> <folder> | add forbid <glob> [ops] <reason> | remove <n>]'
+      return 'Usage: /rules [list | add fence <folder> | add exclusive <folder> <folder> | add forbid <glob> [ops] <reason> | add policy <sentence> | remove <n>]'
   }
 }
 
@@ -1459,7 +1521,7 @@ export const register: Register = (on, options) => {
     void detectCouncil($)
       .then(isFound => (isFound ? true : $.clock.sleep(3000).then(() => detectCouncil($))))
       .catch(() => undefined)
-    await $.command.register({ name: 'rules', description: "Long-lived rules in Claude Code's own settings: list, add or remove", argumentHint: '[list|add fence <folder>|add exclusive <a> <b>|add forbid <glob> [ops] <reason>|remove <n>]' })
+    await $.command.register({ name: 'rules', description: "Long-lived rules in Claude Code's own settings: list, add or remove", argumentHint: '[list|add fence <folder>|add exclusive <a> <b>|add forbid <glob> [ops] <reason>|add policy <sentence>|remove <n>]' })
     if (settings.isSummaryEnabled) await openLedger($).catch(() => undefined)
     const root = await $.session.root()
     await restoreScope($, root)
@@ -1497,6 +1559,21 @@ export const register: Register = (on, options) => {
     result: 'sidekick could not run Antigravity for this call; tell the person.',
     isError: true as const,
   }))
+
+  // The owner's own shell calls: what the guard refuses becomes a question
+  // before the call runs (tool.call still denies a subagent's). A failure
+  // here leaves the call to tool.call's checks, which deny rather than ask.
+  on('classic.PreToolUse', { tool: 'Bash' }, async ($, e, next) => ownerShellQuestion('Bash', e as unknown as Record<string, unknown>, await $.clock.now()) ?? next(e)).catch(($, e, next) => next(e))
+  on('classic.PreToolUse', { tool: 'PowerShell' }, async ($, e, next) => ownerShellQuestion('PowerShell', e as unknown as Record<string, unknown>, await $.clock.now()) ?? next(e)).catch(($, e, next) => next(e))
+  // The same question to every permission check of the call.
+  on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
+    const question = ownerShellQuestion('Bash', e as unknown as Record<string, unknown>, await $.clock.now())
+    return question === undefined ? next(e) : { decision: 'ask' as const, reason: question.ask }
+  }).catch(($, e, next) => next(e))
+  on('tool.check', { tool: 'PowerShell' }, async ($, e, next) => {
+    const question = ownerShellQuestion('PowerShell', e as unknown as Record<string, unknown>, await $.clock.now())
+    return question === undefined ? next(e) : { decision: 'ask' as const, reason: question.ask }
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'replay' }, async $ => {
     const isOpened = await openReplay($)
@@ -1538,7 +1615,7 @@ export const register: Register = (on, options) => {
   // Guard first (a blocked call is never recorded), then record successful edits.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    const isGuarded = settings.isScopeGuardEnabled && (FILE_TOOLS.has(tool) || tool === 'Bash')
+    const isGuarded = settings.isScopeGuardEnabled && (FILE_TOOLS.has(tool) || isShellTool(tool))
     const isRecorded = settings.isReplayEnabled && isEditTool(tool)
     const isLedgered = settings.isSummaryEnabled
     const agentId = typeof e.agentId === 'string' ? e.agentId : undefined
@@ -1559,7 +1636,7 @@ export const register: Register = (on, options) => {
         const order = agentId !== undefined ? await councilOrder($, agentId) : undefined
         if (order !== undefined) context = { ...context, folders: [order.folder] }
         const rules = await activePathRules($, context.root, order)
-        denial = await guardToolCall($, tool, input, context, rules)
+        denial = await guardToolCall($, tool, input, context, rules, { isAgent: agentId !== undefined, isOwnerApproved: agentId === undefined && takeOwnerApproval(tool, input, await $.clock.now()) })
       } catch {
         // A guard that can't check fails closed. Claude can retry; if it keeps
         // failing, the user turns the guard off (scopeGuardEnabled) or clears the scope.
@@ -1591,7 +1668,7 @@ export const register: Register = (on, options) => {
     // The hook failed or ran out of time: a guarded call it hadn't let through
     // is refused (fail closed); anything else goes on.
     if (next.called) return next(e)
-    const isGuarded = settings.isScopeGuardEnabled && (FILE_TOOLS.has(String(e.tool)) || e.tool === 'Bash')
+    const isGuarded = settings.isScopeGuardEnabled && (FILE_TOOLS.has(String(e.tool)) || isShellTool(String(e.tool)))
     return isGuarded ? { deny: 'The sidekick scope guard could not finish checking this call in time and blocked it to be safe. Retry it once; if it is blocked again, tell the user.' } : next(e)
   })
 

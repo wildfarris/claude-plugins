@@ -5,6 +5,7 @@
 // `status` and `concern`. Checked by shape, never trusted; a rename there
 // shows up here as no council.
 
+import { policySentence } from './policy'
 import { readPathRule, type PathRule } from './scope-rules'
 
 // What sidekick reads of the council mod's state (any plugin may read any
@@ -32,23 +33,30 @@ export function councilStatus(glimpse: CouncilGlimpse): string {
   return glimpse.gravest === null ? 'adjourned' : `adjourned · gravest concern ${glimpse.gravest}/5`
 }
 
-// What a subagent's council order holds it to: its id, its folder, and the
+// What a subagent's council order holds it to: its id, its folder, the
 // path rules in its `forbid` (each checked by shape; a malformed one is
 // dropped). From the council mod's `court` value: its orders' `agentId`,
-// `status`, `id`, `folder` and `forbid`.
-export type CarriedOrder = { id: string; folder: string; forbid: PathRule[] }
+// `status`, `id`, `folder`, `forbid` and `policy`. Its plain-language rules
+// (for the policy judge) are its `policy` sentences, and any `forbid` entry
+// that is a sentence rather than a glob (a string, or `{ rule }`).
+export type CarriedOrder = { id: string; folder: string; forbid: PathRule[]; policy: string[] }
 
 export function orderFor(court: unknown, agentId: string): CarriedOrder | undefined {
   if (typeof court !== 'object' || court === null) return undefined
   const orders = (court as { orders?: unknown }).orders
   if (!Array.isArray(orders)) return undefined
   const order = orders.find(
-    (entry): entry is { id?: unknown; folder: string; forbid?: unknown } =>
+    (entry): entry is { id?: unknown; folder: string; forbid?: unknown; policy?: unknown } =>
       typeof entry === 'object' && entry !== null && (entry as { agentId?: unknown }).agentId === agentId && (entry as { status?: unknown }).status === 'dispatched' && typeof (entry as { folder?: unknown }).folder === 'string',
   )
   if (order === undefined) return undefined
   const forbid = Array.isArray(order.forbid) ? order.forbid.flatMap(entry => readPathRule(entry) ?? []) : []
-  return { id: typeof order.id === 'string' && /^O\d+$/.test(order.id) ? order.id : 'O?', folder: order.folder, forbid }
+  const sentences = [
+    ...(Array.isArray(order.policy) ? (order.policy as unknown[]) : []),
+    ...(Array.isArray(order.forbid) ? (order.forbid as unknown[]).map(entry => (typeof entry === 'object' && entry !== null && !('glob' in entry) ? (entry as { rule?: unknown }).rule : entry)) : []),
+  ]
+  const policy = [...new Set(sentences.flatMap(entry => policySentence(entry) ?? []))].slice(0, 12)
+  return { id: typeof order.id === 'string' && /^O\d+$/.test(order.id) ? order.id : 'O?', folder: order.folder, forbid, policy }
 }
 
 // The folder a subagent's council order scopes it to.

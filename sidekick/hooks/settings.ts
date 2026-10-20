@@ -19,6 +19,7 @@ export type SidekickSettings = {
   isContextReadoutEnabled: boolean
   isCouncilButtonEnabled: boolean
   isAskToolsEnabled: boolean
+  isInlineCodeBanEnabled: boolean
   trimAtPercent: number
   trimTargetPercent: number
   trimKeepTurns: number
@@ -59,6 +60,7 @@ export function readSettings(options: PluginOptions): SidekickSettings {
     isContextReadoutEnabled: booleanOption(options.contextReadoutEnabled, true),
     isCouncilButtonEnabled: booleanOption(options.councilButtonEnabled, true),
     isAskToolsEnabled: booleanOption(options.askToolsEnabled, true),
+    isInlineCodeBanEnabled: booleanOption(options.inlineCodeBanEnabled, true),
     trimAtPercent: integerOption(options.trimAtPercent, 80, 50, 99),
     trimTargetPercent: integerOption(options.trimTargetPercent, 50, 10, 90),
     trimKeepTurns: integerOption(options.trimKeepTurns, 1, 1, 10),
