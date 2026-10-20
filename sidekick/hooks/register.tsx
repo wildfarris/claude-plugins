@@ -87,7 +87,8 @@ import {
 } from './backstop'
 import { resumeWarningFrom } from './resume-warning'
 import { inlineCodeDenial, inlineCodeQuestion } from './inline-code'
-import { RECENT_COMMANDS } from './judge'
+import { REVIEW_MARK, REVIEW_MAX_TOKENS, REVIEW_TIMEOUT_MS, RECENT_COMMANDS, buildStopReviewPrompt, parseReviewAnswer, reviewNote, reviewSystemPrompt } from './judge'
+import { METRICS_RETENTION_MS, countDecision, emptyMetrics, metricsText, readMetrics, type GuardMetrics } from './guard-metrics'
 import { DEFAULT_POLICY, assemblePolicy } from './policy'
 import {
   decideCall,
@@ -228,6 +229,11 @@ const SNAPSHOT_CACHE_MS = 2000
 // The commands run, per agent id (and 'owner'), for the judge and the stop review.
 const recentCommands = new Map<string, string[]>()
 const MAX_REMEMBERED_COMMANDS = 200
+// The order each agent carried at its first guarded call, for its stop review.
+const agentOrders = new Map<string, CarriedOrder>()
+// This session's guard metrics, written to the store every few changes.
+let guardMetrics: GuardMetrics = emptyMetrics()
+let metricsChanges = 0
 // Turns left to look for the council mod (it may register late; not forever).
 let councilChecksLeft = 3
 // The open ledger: its session folder, the segment being filled (its entries
@@ -893,6 +899,75 @@ async function processSnapshot($: EngineInterface): Promise<ProcessSnapshot | un
   return value
 }
 
+// ── The guard's metrics and the stop review ───────────────────────────────
+
+const METRICS_STORE_PREFIX = 'guardMetrics:'
+const metricsStoreKey = (sessionId: string) => `${METRICS_STORE_PREFIX}${sessionId}`
+const METRICS_FLUSH_EVERY = 20
+
+// Loads this session's metrics (and with them the judge's spent budgets, so
+// a reload doesn't reset them), and deletes other sessions' past retention.
+async function restoreMetrics($: EngineInterface): Promise<void> {
+  const [sessionId, now, keys] = await Promise.all([$.session.id(), $.clock.now(), $.store.keys()])
+  guardMetrics = readMetrics(await $.store.get(metricsStoreKey(sessionId)))
+  for (const [budget, calls] of Object.entries(guardMetrics.callsByBudget)) judgeState.calls.set(budget, calls)
+  for (const key of keys.filter(key => key.startsWith(METRICS_STORE_PREFIX) && key !== metricsStoreKey(sessionId))) {
+    const savedAt = readMetrics(await $.store.get(key)).savedAt
+    if (now - savedAt > METRICS_RETENTION_MS) await $.store.delete(key)
+  }
+}
+
+async function flushMetrics($: EngineInterface): Promise<void> {
+  if (metricsChanges === 0) return
+  metricsChanges = 0
+  guardMetrics.savedAt = await $.clock.now()
+  await $.store.set(metricsStoreKey(await $.session.id()), guardMetrics)
+}
+
+function countGuardDecision($: EngineInterface, decision: ShellDecision, event: JudgeEvent, budgetKey: string): void {
+  countDecision(guardMetrics, decision, event, budgetKey)
+  if (++metricsChanges >= METRICS_FLUSH_EVERY) void flushMetrics($).catch(() => undefined)
+}
+
+// When an order's agent stops: one judge call over its whole command log
+// (redacted, as data), for what only the sequence shows. A note for the main
+// session, or undefined when there's nothing to say.
+async function reviewAgentRun($: EngineInterface, agentId: string): Promise<string | undefined> {
+  const order = agentOrders.get(agentId)
+  agentOrders.delete(agentId)
+  const commands = recentCommands.get(agentId) ?? []
+  recentCommands.delete(agentId)
+  if (order === undefined || commands.length < 2 || !isJudging(agentId)) return undefined
+  const spent = judgeState.calls.get(agentId) ?? 0
+  if (spent >= settings.judgeBudgetAgent) return reviewNote(order.id, { kind: 'skipped', why: "the judge's budget for this agent was spent" })
+  const paused = await judgePause($)
+  if (paused !== undefined) return reviewNote(order.id, { kind: 'skipped', why: paused })
+  judgeState.calls.set(agentId, spent + 1)
+  const context = await scopeContext($)
+  const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), { id: order.id, sentences: order.policy })
+  const reply = await $.model
+    .complete({
+      model: settings.model,
+      system: reviewSystemPrompt(policy),
+      prompt: buildStopReviewPrompt({ commands, agent: agentLabelOf(agentId, order), folders: [order.folder] }, context.home),
+      maxTokens: REVIEW_MAX_TOKENS,
+      timeoutMs: REVIEW_TIMEOUT_MS,
+    })
+    .catch(() => undefined)
+  guardMetrics.reviews++
+  metricsChanges++
+  if (reply === undefined || !reply.isAnswered) return reviewNote(order.id, { kind: 'failed', why: reply === undefined ? 'the review call failed' : `the review gave no answer: ${modelFailureText(reply)}` })
+  guardMetrics.inputTokens += reply.usage?.input_tokens ?? 0
+  guardMetrics.outputTokens += reply.usage?.output_tokens ?? 0
+  guardMetrics.cacheReadTokens += reply.usage?.cache_read_input_tokens ?? 0
+  const answer = parseReviewAnswer(reply.text, reply.usage?.output_tokens)
+  if (answer.kind === 'warn') {
+    guardMetrics.reviewWarnings++
+    $.ui.toast(`Stop review: order ${order.id}'s commands, read together, may break the policy.`)
+  }
+  return reviewNote(order.id, answer)
+}
+
 const JUDGE_OFF_STORE_PREFIX = 'judgeOff:'
 const judgeOffStoreKey = (sessionId: string) => `${JUDGE_OFF_STORE_PREFIX}${sessionId}`
 
@@ -959,6 +1034,7 @@ async function judgeShellCall(
   }
   const event: JudgeEvent = { judged: false }
   const decision = await decideCall(call, options, judgeState, judgeHost($), event)
+  countGuardDecision($, decision, event, budgetKey)
   return decision
 }
 
@@ -1104,6 +1180,7 @@ async function guardToolCall(
     if (!command) return undefined
     // Deterministic refusals first: the inline-code ban, the scope, the path rules.
     const first = decideShell(tool, command, context, { isInlineBanEnabled: settings.isInlineCodeBanEnabled })
+    if (first.kind === 'refuse') countGuardDecision($, first, { judged: false }, origin.agentId ?? 'owner')
     if (first.kind === 'refuse' && first.via === 'inline') {
       if (isAgent) $.ui.toast(`Guard refused ${tool}: inline interpreter code (${first.finding.shape}).`)
       return isAgent ? inlineCodeDenial(first.finding, true) : { ask: inlineCodeQuestion(first.finding), deny: inlineCodeDenial(first.finding, false) }
@@ -1355,6 +1432,7 @@ async function scopeCommand($: EngineInterface, args: string): Promise<string> {
         `Scope: ${describeScope({ root, folders: scope.folders })}. Guard ${settings.isScopeGuardEnabled ? 'on' : 'off'}${scope.folders.length === 0 ? ', idle until /scope set or add' : ''}.`,
         `Inline-code ban ${settings.isInlineCodeBanEnabled ? 'on' : 'off'}. Policy judge: ${judgeStatusText()}.`,
         `Policy (${policy.length}): ${policy.map(rule => rule.text).join(' ')}`,
+        metricsText(guardMetrics),
       ].join('\n')
     }
     case 'judge': {
@@ -1645,6 +1723,9 @@ export const register: Register = (on, options) => {
     pendingOwnerAsks.clear()
     recentCommands.clear()
     judgeState = newJudgeState()
+    agentOrders.clear()
+    metricsChanges = 0
+    await restoreMetrics($).catch(() => undefined)
     await pruneBackstops($).catch(() => undefined)
     // The rules are the source of truth; the settings file is made to match.
     await (async () => writeRules($, root, await readRules($, root), await storedStyle($, root)))().catch((error: unknown) =>
@@ -1751,6 +1832,10 @@ export const register: Register = (on, options) => {
         // and to its order's path rules beside the standing ones.
         const order = agentId !== undefined ? await councilOrder($, agentId) : undefined
         if (order !== undefined) context = { ...context, folders: [order.folder] }
+        if (order !== undefined && agentId !== undefined && !agentOrders.has(agentId)) {
+          if (agentOrders.size > 50) agentOrders.delete(agentOrders.keys().next().value!)
+          agentOrders.set(agentId, order)
+        }
         const rules = await activePathRules($, context.root, order)
         const verdict = await guardToolCall($, tool, input, context, rules, { agentId, order })
         if (typeof verdict === 'object') {
@@ -1821,15 +1906,20 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     // An order agent's stop: the path rules' backstop. Its warning goes to the
     // main session with the agent's report (and to the council's copy of it).
+    // Beside it, the policy judge's review of its whole command log.
     if (e.agentId !== undefined) {
-      const warning = await finishBackstop($, e.agentId).catch(() => undefined)
-      if (warning === undefined) return next(e)
+      const [backstop, review] = await Promise.all([finishBackstop($, e.agentId).catch(() => undefined), reviewAgentRun($, e.agentId).catch(() => undefined)])
+      await flushMetrics($).catch(() => undefined)
+      const warnings = [backstop, review].filter((note): note is string => note !== undefined)
+      if (warnings.length === 0) return next(e)
+      const warning = warnings.join('\n\n')
       const answer = 'answer' in e && typeof e.answer === 'string' ? e.answer : undefined
       const result = await next(answer !== undefined ? ({ ...e, answer: `${answer}\n\n${warning}` } as typeof e) : e)
       const text = (result as { text?: unknown }).text
-      return typeof text === 'string' && !text.includes(BACKSTOP_MARK) ? { ...result, text: `${text}\n\n${warning}` } : result
+      return typeof text === 'string' && !text.includes(BACKSTOP_MARK) && !text.includes(REVIEW_MARK) ? { ...result, text: `${text}\n\n${warning}` } : result
     }
     const result = await next(e)
+    await flushMetrics($).catch(() => undefined)
     isMainTurnRunning = false
     if (councilChecksLeft > 0) {
       councilChecksLeft--

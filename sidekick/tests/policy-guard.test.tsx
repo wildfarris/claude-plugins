@@ -177,3 +177,66 @@ test('/scope judge off turns the judge off for the session; the ban still holds;
   await $.command.run(composer('scope', 'judge on'))
   expect((await call($, 'Bash', 'nvm use 22', 'agent-1')).deny).toContain('Blocked by the sidekick policy judge: no.')
 })
+
+// ── Stage 3: the stop review and the metrics ───────────────────────────────
+
+const stop = ($: Engine) => $.turn.complete({ agentId: 'agent-1', answer: 'Done.', durationMs: 10, isAborted: false, turnId: 'a1', reason: 'answer' } as never) as Promise<{ text?: string }>
+
+test("an order's stop: one review of its whole command log, and its warning reaches the main session", async ($, on) => {
+  const harness = baseStandIn(on, {
+    root: ROOT,
+    cwd: WEB,
+    decide: () => 'allow',
+    complete: request => (request.system.startsWith('You review the whole run') ? 'WARN: wrote a script, then ran it to stop processes outside the session.' : 'ALLOW'),
+  })
+  councilWith(on, { id: 'O5', folder: WEB, policy: ['Push nothing.'] })
+  await start($)
+  await call($, 'Bash', "cat <<'EOF' > stop.sh\ntaskkill /IM msedge.exe\nEOF", 'agent-1')
+  await call($, 'Bash', 'bash stop.sh', 'agent-1')
+  await call($, 'Bash', 'node -e 1', 'agent-1')
+  const result = await stop($)
+  expect(result.text).toContain("[sidekick stop review] Order O5's commands, read together, may break the policy: wrote a script, then ran it to stop processes outside the session.")
+  const review = harness.completions.find(request => request.system.startsWith('You review the whole run'))!
+  expect(review.system).toContain('Push nothing. (order O5)')
+  expect(review.prompt).toContain("1. cat <<'EOF' > stop.sh")
+  expect(review.prompt).toContain('2. bash stop.sh')
+  expect(review.prompt).toContain('3. (refused) node -e 1')
+  expect(harness.toasts.some(toast => toast.includes("Stop review: order O5's commands"))).toBe(true)
+  const shown = String((await $.command.run(composer('scope', 'show'))).text)
+  expect(shown).toContain('Guard this session: 1 cleared by code')
+  expect(shown).toContain('1 inline-code refusals')
+  expect(shown).toContain('Judge: 1 calls')
+  expect(shown).toContain('Stop reviews: 1, 1 with a warning.')
+})
+
+test("a clean run's review adds nothing; an agent that ran one command isn't reviewed", async ($, on) => {
+  const harness = baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow', complete: request => (request.system.startsWith('You review') ? 'OK' : 'ALLOW') })
+  councilWith(on, { id: 'O5', folder: WEB })
+  await start($)
+  await call($, 'Bash', 'git status', 'agent-1')
+  expect((await stop($)).text).toBe('Done.')
+  expect(harness.completions.length).toBe(0)
+  await call($, 'Bash', 'git status', 'agent-1')
+  await call($, 'Bash', 'npm run build', 'agent-1')
+  expect((await stop($)).text).toBe('Done.')
+  expect(harness.completions.length).toBe(2)
+})
+
+test('a review that gets no answer says so', async ($, on) => {
+  baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow', complete: request => (request.system.startsWith('You review') ? 'Looks fine to me' : 'ALLOW') })
+  councilWith(on, { id: 'O5', folder: WEB })
+  await start($)
+  await call($, 'Bash', 'git status', 'agent-1')
+  await call($, 'Bash', 'git log -3', 'agent-1')
+  expect((await stop($)).text).toContain("Order O5's commands were not reviewed as a sequence (the answer was not OK or WARN: <reason>)")
+})
+
+test("the metrics are kept in the store, and a session's spent budget survives a reload", async ($, on) => {
+  const harness = baseStandIn(on, { root: ROOT, decide: () => 'allow', complete: () => 'ALLOW', store: { 'guardMetrics:session-1': { judgeCalls: 1000, callsByBudget: { owner: 1000 }, savedAt: 999_000 }, 'guardMetrics:old': { savedAt: 1 } } })
+  await start($)
+  const refused = await call($, 'Bash', 'make deploy')
+  expect(refused.deny).toContain("the policy judge's budget for this session is spent (1000 calls)")
+  expect(harness.completions.length).toBe(0)
+  const shown = String((await $.command.run(composer('scope', 'show'))).text)
+  expect(shown).toContain('1 refused past the budget or usage cap')
+})
