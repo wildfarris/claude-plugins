@@ -25,7 +25,7 @@ export const MAX_TODOS = 12
 
 export const MAX_FORBID = 8
 
-export type ProposedDispatch = { folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[] }
+export type ProposedDispatch = { folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[] }
 export type Proposal = { plan: string; dispatches: ProposedDispatch[] }
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
@@ -43,16 +43,27 @@ export function forbidGlob(text: string): string | undefined {
   return glob.split('/').some(part => part === '..' || part === '.' || part === '') ? undefined : glob
 }
 
-// A dispatch's `forbid`, checked: each entry a glob relative to its folder,
-// the operations (all three when left out) and the reason the agent is shown.
-function readForbid(raw: unknown, label: string): ForbidRule[] | { error: string } {
-  if (raw === undefined || raw === null) return []
-  if (!Array.isArray(raw)) return { error: `${label}: forbid must be a list of { glob, ops?, reason }.` }
+export const MAX_POLICY_SENTENCE = 300
+
+// A dispatch's `forbid`, checked: each entry either a path rule (a glob
+// relative to its folder, the operations, all three when left out, and the
+// reason the agent is shown) or a plain-language rule (`{ rule }`, or a bare
+// sentence), which the sidekick mod's policy judge holds the agent to.
+function readForbid(raw: unknown, label: string): { rules: ForbidRule[]; policy: string[] } | { error: string } {
+  if (raw === undefined || raw === null) return { rules: [], policy: [] }
+  if (!Array.isArray(raw)) return { error: `${label}: forbid must be a list of { glob, ops?, reason } or { rule }.` }
   if (raw.length > MAX_FORBID) return { error: `${label}: at most ${MAX_FORBID} forbid rules.` }
   const rules: ForbidRule[] = []
+  const policy: string[] = []
   for (const [index, value] of (raw as unknown[]).entries()) {
     const entry = (typeof value === 'object' && value !== null ? value : {}) as Record<string, unknown>
     const where = `${label}, forbid ${index + 1}`
+    const sentence = typeof value === 'string' ? value : entry.glob === undefined ? entry.rule : undefined
+    if (sentence !== undefined) {
+      if (!isText(sentence)) return { error: `${where}: a plain-language rule is a sentence, e.g. { "rule": "Don't run Python." }.` }
+      policy.push(oneLine(sentence).slice(0, MAX_POLICY_SENTENCE))
+      continue
+    }
     const glob = isText(entry.glob) ? forbidGlob(entry.glob) : undefined
     if (glob === undefined) return { error: `${where}: give a glob relative to the dispatch's folder (e.g. "**/*.spec.ts"), with no "..", drive or leading "/".` }
     if (entry.ops !== undefined && (!Array.isArray(entry.ops) || entry.ops.length === 0 || !(entry.ops as unknown[]).every(op => FORBID_OPS.includes(op as ForbidOp)))) {
@@ -62,7 +73,7 @@ function readForbid(raw: unknown, label: string): ForbidRule[] | { error: string
     const ops = entry.ops === undefined ? [...FORBID_OPS] : FORBID_OPS.filter(op => (entry.ops as unknown[]).includes(op))
     rules.push({ glob, ops, reason: oneLine(entry.reason) })
   }
-  return rules
+  return { rules, policy }
 }
 
 const forbidOpsText = (ops: readonly ForbidOp[]) => (ops.length === FORBID_OPS.length ? 'create, edit, delete' : ops.join(', '))
@@ -111,7 +122,7 @@ export function readProposal(input: Record<string, unknown>, root: string): Prop
     if (todos.length > MAX_TODOS) return { error: `${label}: at most ${MAX_TODOS} todos.` }
     const forbid = readForbid(entry.forbid, label)
     if ('error' in forbid) return forbid
-    dispatches.push({ folder, role: entry.role, task: entry.task.trim(), todos, ...(forbid.length > 0 ? { forbid } : {}) })
+    dispatches.push({ folder, role: entry.role, task: entry.task.trim(), todos, ...(forbid.rules.length > 0 ? { forbid: forbid.rules } : {}), ...(forbid.policy.length > 0 ? { policy: forbid.policy } : {}) })
   }
   return { plan: input.plan.trim(), dispatches }
 }
@@ -122,7 +133,8 @@ const planLines = (proposal: Proposal) => [
   ...proposal.dispatches.map(
     (dispatch, index) =>
       `${index + 1}. A ${dispatch.role} (${dispatch.role === 'scout' ? 'reads only' : 'may change files and run commands'}) in ${dispatch.folder}/: ${dispatch.task}\n   Todos: ${dispatch.todos.join('; ')}` +
-      (dispatch.forbid && dispatch.forbid.length > 0 ? `\n   Forbidden paths (under ${dispatch.folder}/): ${dispatch.forbid.map(forbidText).join('; ')}` : ''),
+      (dispatch.forbid && dispatch.forbid.length > 0 ? `\n   Forbidden paths (under ${dispatch.folder}/): ${dispatch.forbid.map(forbidText).join('; ')}` : '') +
+      (dispatch.policy && dispatch.policy.length > 0 ? `\n   Rules (plain language): ${dispatch.policy.join(' ')}` : ''),
   ),
 ]
 
@@ -300,6 +312,7 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
     todos: dispatch.todos.map(content => ({ content, status: 'pending', activeForm: content })),
     conditions,
     ...(dispatch.forbid && dispatch.forbid.length > 0 ? { forbid: dispatch.forbid } : {}),
+    ...(dispatch.policy && dispatch.policy.length > 0 ? { policy: dispatch.policy } : {}),
     status: 'approved',
     agentId: null,
     steps: 0,
@@ -322,7 +335,7 @@ export function rulingText(result: Ruling & { conditions: string[] }, orders: re
     'Dispatch each order with the Agent tool, its subagent_type as given, and its order id in the description (e.g. "O1 api limits"). An order you decide not to dispatch, withdraw with mcp__council__withdraw_orders; an undispatched order expires after a day:',
     ...orders.map(
       order =>
-        `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}${order.forbid && order.forbid.length > 0 ? `, forbids: ${order.forbid.map(rule => rule.glob).join(', ')}` : ''}`,
+        `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}${order.forbid && order.forbid.length > 0 ? `, forbids: ${order.forbid.map(rule => rule.glob).join(', ')}` : ''}${order.policy && order.policy.length > 0 ? `, rules: ${order.policy.join(' ')}` : ''}`,
     ),
     'Each agent is given its folder, its todos, the conditions and any forbidden paths; keep your own prompt to the task.',
   ].join('\n')
@@ -351,6 +364,11 @@ export function dispatchPrompt(order: Order, folderInstructions: string | null, 
     ...(order.forbid && order.forbid.length > 0
       ? [
           `Forbidden paths (globs under ${order.folder}/; the sidekick mod refuses these changes, and checks what changed when you stop). If one must change, stop and report why instead of working around it:\n${order.forbid.map(rule => `- ${forbidText(rule)}`).join('\n')}`,
+        ]
+      : []),
+    ...(order.policy && order.policy.length > 0
+      ? [
+          `Rules for this order (plain language; the sidekick mod's policy judge holds your shell commands to them). If one stands in the way, stop and report why instead of working around it:\n${order.policy.map(rule => `- ${rule}`).join('\n')}`,
         ]
       : []),
     ...(folderInstructions ? [`${order.relFolder}/CLAUDE.md (this folder's rules):\n${folderInstructions.slice(0, 6000)}`] : []),
@@ -562,15 +580,15 @@ export const PROPOSE_ORDERS_SCHEMA = {
           todos: { type: 'array', items: { type: 'string' }, description: `The steps it will check off (at most ${MAX_TODOS}).` },
           forbid: {
             type: 'array',
-            description: `Optional, at most ${MAX_FORBID}: paths the agent may not change, as the person asked (e.g. "do not edit tests", "no new CSS"). The sidekick mod refuses those changes.`,
+            description: `Optional, at most ${MAX_FORBID}: what the agent may not do, as the person asked. A path rule ({ glob, ops?, reason }: "do not edit tests", "no new CSS") is refused by the sidekick mod when a change matches; a plain-language rule ({ rule }: "Push nothing.", "Don't restart the dev server.") is read by the sidekick mod's policy judge against the agent's shell commands.`,
             items: {
               type: 'object',
               properties: {
-                glob: { type: 'string', description: 'Relative to the folder: * and ? within a name, ** across folders, a bare name at any depth (e.g. "**/*.spec.ts", "*.css").' },
-                ops: { type: 'array', items: { type: 'string', enum: ['create', 'edit', 'delete'] }, description: 'What is forbidden; leave out for all three.' },
-                reason: { type: 'string', description: "The person's reason, shown to the agent." },
+                glob: { type: 'string', description: 'A path rule: relative to the folder, * and ? within a name, ** across folders, a bare name at any depth (e.g. "**/*.spec.ts", "*.css").' },
+                ops: { type: 'array', items: { type: 'string', enum: ['create', 'edit', 'delete'] }, description: 'For a path rule: what is forbidden; leave out for all three.' },
+                reason: { type: 'string', description: "For a path rule: the person's reason, shown to the agent." },
+                rule: { type: 'string', description: 'Instead of a glob: a plain-language rule, one sentence in the person\'s words (e.g. "Push nothing.").' },
               },
-              required: ['glob', 'reason'],
             },
           },
         },

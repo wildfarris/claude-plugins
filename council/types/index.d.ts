@@ -165,6 +165,10 @@ export type Order = {
   // `folder`), from the dispatch's `forbid`. The sidekick mod enforces them.
   // Absent when the dispatch named none, and in orders saved before it existed.
   forbid?: ForbidRule[]
+  // Plain-language rules for the order's agent (the dispatch's `forbid`
+  // entries given as `{ rule }`), which the sidekick mod's policy judge reads
+  // against its shell commands. Absent when there are none.
+  policy?: string[]
   status: OrderStatus
   agentId: string | null
   steps: number

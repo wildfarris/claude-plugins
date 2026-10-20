@@ -21,6 +21,23 @@ describe("a dispatch's forbid", () => {
     ])
   })
 
+  test('takes plain-language rules beside the globs, as { rule } or a bare sentence', () => {
+    const proposal = read([TESTS, { rule: '  Push   nothing. ' }, "Don't run Python."]) as Proposal
+    expect(proposal.dispatches[0]!.forbid).toEqual([{ glob: '**/*.spec.ts', ops: ['create', 'edit', 'delete'], reason: 'the tests are the spec' }])
+    expect(proposal.dispatches[0]!.policy).toEqual(['Push nothing.', "Don't run Python."])
+    expect(read([{ rule: 'Push nothing.' }]) as Proposal).toEqual({ plan: 'p', dispatches: [{ folder: 'web', role: 'knight', task: 'Fix the form.', todos: ['fix it'], policy: ['Push nothing.'] }] })
+    expect((read([{ rule: '  ' }]) as { error: string }).error).toContain('forbid 1: a plain-language rule is a sentence')
+    expect((read([{}]) as { error: string }).error).toContain('forbid 1: give a glob')
+    expect(proposalBrief(proposal, null)).toContain("Rules (plain language): Push nothing. Don't run Python.")
+    const [order] = newOrders(emptyCourt(), proposal, ROOT, [])
+    expect(order!.policy).toEqual(['Push nothing.', "Don't run Python."])
+    expect(newOrders(emptyCourt(), read([TESTS]) as Proposal, ROOT, [])[0]).not.toHaveProperty('policy')
+    expect(rulingText({ plan: 'p', isApproved: true, gravest: 1, reason: '', conditions: [] }, [order!])).toContain("rules: Push nothing. Don't run Python.")
+    const prompt = dispatchPrompt(order!, null, 'Go.')
+    expect(prompt).toContain("Rules for this order (plain language; the sidekick mod's policy judge holds your shell commands to them)")
+    expect(prompt).toContain('- Push nothing.')
+  })
+
   test('refuses globs that leave the folder, unknown ops, a missing reason, or too many rules', () => {
     expect((read('**/*.ts') as { error: string }).error).toContain('forbid must be a list')
     expect((read([{ glob: '../api/*.ts', reason: 'r' }]) as { error: string }).error).toContain('Dispatch 1, forbid 1: give a glob relative')

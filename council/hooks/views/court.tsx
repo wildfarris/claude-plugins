@@ -74,6 +74,11 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
           {`forbids ${order.forbid.map(rule => (rule.ops.length === 3 ? rule.glob : `${rule.glob} (${rule.ops.join(', ')})`)).join(' · ')}`}
         </Text>
       )}
+      {order.policy && order.policy.length > 0 && (
+        <Text key={`order-policy-${order.id}`} dimColor wrap="truncate-end">
+          {`rules: ${order.policy.join(' · ')}`}
+        </Text>
+      )}
     </Box>
   )
 }
