@@ -121,7 +121,7 @@ test('on Windows, an order rule matches however the path is spelled', async ($, 
 })
 
 test("the Bash layer: a knight's rm, mv, sed -i, redirects and git rm of a protected test are refused", async ($, on) => {
-  const harness = baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow' })
+  const harness = baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow', complete: () => 'ALLOW' })
   filesIn(
     on,
     new Map([
@@ -146,7 +146,7 @@ test("the Bash layer: a knight's rm, mv, sed -i, redirects and git rm of a prote
   for (const allowed of ['rm -f src/app.ts', "sed -i 's|a|b|' src/app.ts", 'echo x > src/new.ts', 'cat src/app.spec.ts', 'npm test']) {
     expect((await bash($, allowed, 'agent-1')).deny).toBeUndefined()
   }
-  // Indirect: the Bash layer can't see it (the backstop is there for these).
+  // Indirect: the Bash layer can't see it (the policy judge, here a fake that allows, and the backstop are there for these).
   expect((await bash($, 'node scripts/clean-specs.js', 'agent-1')).deny).toBeUndefined()
 })
 

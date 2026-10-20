@@ -11,7 +11,7 @@
 // aliases and parameter prefixes; a native command (git, npm, rg…) is read as
 // the Bash reader would read it. Anything else is unknown.
 
-import { analyzeCommand, commandPathOps, isOutOfScope, resolvePath, UNPLACEABLE, type CommandPathOp, type GuardVerdict, type ScopeContext } from './scope-guard'
+import { analyzeCommand, clearCommand, commandPathOps, isInsideArea, isOutOfScope, resolvePath, UNPLACEABLE, type Clearance, type ClearedSegment, type CommandPathOp, type GuardVerdict, type ScopeContext } from './scope-guard'
 
 export type PsToken = { text: string; isQuoted: boolean; isRedirect?: boolean; isHereString?: boolean; isBlock?: boolean }
 
@@ -497,6 +497,50 @@ export function analyzePowerShell(command: string, context: ScopeContext, depth 
     }
   }
   return unclear ? { kind: 'unclear', reason: unclear } : { kind: 'allow' }
+}
+
+// The fast path for PowerShell (see clearCommand): read-only cmdlets and
+// expressions, location changes, and file cmdlets whose every path lands in
+// the area clear; a native command clears as the Bash reader clears it; code
+// in blocks and subexpressions clears on its own. Everything else (Stop-
+// Process, Start-Process, Set-ItemProperty, a .NET method call…) goes to the
+// judge.
+export function clearPowerShell(command: string, context: Omit<ScopeContext, 'cwd'> & { cwd?: string }, depth = 0): Clearance {
+  if (depth > 2) return { segments: [{ text: command.trim(), isCleared: false }], opaque: 'shells nested several deep' }
+  let directory: string | undefined = context.cwd === undefined ? undefined : resolvePath(undefined, context.cwd, context.home)
+  if (directory === UNPLACEABLE) directory = undefined
+  const segments: ClearedSegment[] = []
+  let opaque: string | undefined
+  const { cwd: _cwd, ...rest } = context
+  const at = () => (directory === undefined ? rest : { ...rest, cwd: directory })
+  const take = (clearance: Clearance) => {
+    segments.push(...clearance.segments)
+    opaque ??= clearance.opaque
+  }
+  for (const segment of parsePowerShell(command)) {
+    for (const code of segment.inner) take(clearPowerShell(code, at(), depth + 1))
+    const action = psAction(segment, directory, context.home)
+    if (action.kind === 'location') {
+      directory = action.to
+      segments.push({ text: segment.text, isCleared: true })
+    } else if (action.kind === 'read') {
+      // A static .NET call ([IO.File]::Delete(…)) or a method on an object ($p.Kill()) can change anything.
+      segments.push({ text: segment.text, isCleared: !/::|\.\s*[A-Za-z_]\w*\s*(\(|\$\(…\))/.test(segment.tokens.map(token => (token.isQuoted ? "''" : token.text)).join(' ')) })
+    } else if (action.kind === 'write') {
+      segments.push({ text: segment.text, isCleared: action.changes.length > 0 && action.changes.every(change => isInsideArea(change.path, context)) })
+    } else if (action.kind === 'native') {
+      take(clearCommand(action.text, at(), depth))
+    } else if (action.kind === 'bash') {
+      take(clearCommand(action.code, at(), depth + 1))
+      segments.push({ text: segment.text, isCleared: true })
+    } else if (action.kind === 'powershell') {
+      take(clearPowerShell(action.code, at(), depth + 1))
+      segments.push({ text: segment.text, isCleared: true })
+    } else {
+      segments.push({ text: segment.text, isCleared: false })
+    }
+  }
+  return { segments, ...(opaque === undefined ? {} : { opaque }) }
 }
 
 // The paths a PowerShell command surely changes, by name: what the path

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { analyzeCommand, checkFileEdit, denialMessage, describeScope, parseClassifierAnswer, resolvePath, scopeFolderCandidate, topLevelFolder, type ScopeContext } from '../hooks/scope-guard'
+import { analyzeCommand, checkFileEdit, denialMessage, describeScope, resolvePath, scopeFolderCandidate, topLevelFolder, type ScopeContext } from '../hooks/scope-guard'
 import { RULE_MARKER, builtInEntries, exclusiveConflict, parseRule, parseSettingsText, ruleKey, ruleSpec, syncRules } from '../hooks/scope-rules'
 
 const ROOT = '/dev/work'
@@ -138,12 +138,6 @@ describe('shell commands', () => {
     expect(kindOf('git worktree remove other')).toBe('block')
     expect(kindOf('git stash push')).toBe('block')
     expect(kindOf('git symbolic-ref HEAD refs/heads/x')).toBe('block')
-  })
-
-  test('reads classifier answers', () => {
-    expect(parseClassifierAnswer('ALLOW')).toEqual({ kind: 'allow' })
-    expect(parseClassifierAnswer('BLOCK: writes into ../other')).toEqual({ kind: 'block', reason: 'writes into ../other' })
-    expect(parseClassifierAnswer('maybe')).toBeUndefined()
   })
 })
 

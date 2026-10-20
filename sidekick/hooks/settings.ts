@@ -2,6 +2,10 @@ import type { PluginOptions } from 'claude-code'
 
 export type NoteLength = 'brief' | 'standard' | 'detailed'
 
+// Whose shell commands the policy judge reads: every session's, subagents' only, or none.
+export type PolicyJudgeMode = 'all' | 'agents' | 'off'
+const POLICY_JUDGE_MODES: readonly PolicyJudgeMode[] = ['all', 'agents', 'off']
+
 export type SidekickSettings = {
   model: string
   isReplayEnabled: boolean
@@ -11,7 +15,10 @@ export type SidekickSettings = {
   focusTopics: string
   ignoreTopics: string
   isScopeGuardEnabled: boolean
-  isScopeClassifierEnabled: boolean
+  policyJudge: PolicyJudgeMode
+  judgeBudgetAgent: number
+  judgeBudgetSession: number
+  judgeMaxSegments: number
   classifierUsageCap: number
   isResumeWarningEnabled: boolean
   isRuleSuggestionsEnabled: boolean
@@ -52,7 +59,10 @@ export function readSettings(options: PluginOptions): SidekickSettings {
     focusTopics: textOption(options.focusTopics),
     ignoreTopics: textOption(options.ignoreTopics),
     isScopeGuardEnabled: booleanOption(options.scopeGuardEnabled, true),
-    isScopeClassifierEnabled: booleanOption(options.scopeClassifierEnabled, true),
+    policyJudge: pickOption(POLICY_JUDGE_MODES, options.policyJudge, 'all'),
+    judgeBudgetAgent: integerOption(options.judgeBudgetAgent, 300, 0, 100_000),
+    judgeBudgetSession: integerOption(options.judgeBudgetSession, 1000, 0, 100_000),
+    judgeMaxSegments: integerOption(options.judgeMaxSegments, 4, 1, 20),
     classifierUsageCap: integerOption(options.classifierUsageCap, 90, 0, 100),
     isResumeWarningEnabled: booleanOption(options.resumeWarningEnabled, true),
     isRuleSuggestionsEnabled: booleanOption(options.ruleSuggestionsEnabled, true),

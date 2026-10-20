@@ -87,19 +87,34 @@ import {
 } from './backstop'
 import { resumeWarningFrom } from './resume-warning'
 import { inlineCodeDenial, inlineCodeQuestion } from './inline-code'
-import { DEFAULT_POLICY } from './policy'
-import { agentIdOf, decideShell, inlineFinding, isShellTool, shellCommandOf, type ShellTool } from './policy-guard'
+import { RECENT_COMMANDS } from './judge'
+import { DEFAULT_POLICY, assemblePolicy } from './policy'
+import {
+  decideCall,
+  decideShell,
+  isShellTool,
+  newJudgeState,
+  policyDenial,
+  policyQuestion,
+  shellCommandOf,
+  type JudgeEvent,
+  type JudgeHost,
+  type JudgeState,
+  type ModelReply,
+  type ShellCall,
+  type ShellDecision,
+  type ShellTool,
+} from './policy-guard'
+import { POSIX_SNAPSHOT_ARGV, WINDOWS_SNAPSHOT_ARGV, parsePosixSnapshot, parseWindowsSnapshot, type ProcessSnapshot } from './processes'
 import { powerShellPathOps } from './powershell'
 import { redactSecrets } from './secrets'
 import {
-  CLASSIFIER_SYSTEM_PROMPT,
-  buildClassifierPrompt,
   checkFileEdit,
   commandPathOps,
   denialMessage,
   describeScope,
   fileReadings,
-  parseClassifierAnswer,
+  pathStyleOf,
   relativeTo,
   scopeFolderCandidate,
   type GuardVerdict,
@@ -117,6 +132,7 @@ import {
   ruleKey,
   ruleSpec,
   standingPathRules,
+  standingPolicy,
   syncRules,
   type ActivePathRule,
   type GuardLayer,
@@ -197,13 +213,21 @@ let isMainTurnRunning = false
 let compactedSays = new Set<string>()
 let isReviewRunning = false
 let isBriefRunning = false
-let hasToastedClassifierPause = false
+let hasToastedJudgePause = false
 // The home folder, for the guard's `~` paths (undefined until read, '' if unknown).
 let homeFolder: string | undefined
-// Classifier answers by command, folder and scope, so a repeated unclear
-// command costs one model call (rebuilt on reload).
-const classifierCache = new Map<string, ClassifierResult>()
-const MAX_CLASSIFIER_CACHE = 200
+// The policy judge's memory for this process: the segments it allowed, and
+// the calls each budget has spent (rebuilt on reload, so a reload starts the
+// budgets over; the ledger's metrics keep the session's totals).
+let judgeState: JudgeState = newJudgeState()
+// /scope judge off: this session's commands skip the judge (the inline-code
+// ban, the scope and the path rules still hold).
+let isJudgeOffForSession = false
+let snapshotCache: { at: number; value: ProcessSnapshot | undefined } | undefined
+const SNAPSHOT_CACHE_MS = 2000
+// The commands run, per agent id (and 'owner'), for the judge and the stop review.
+const recentCommands = new Map<string, string[]>()
+const MAX_REMEMBERED_COMMANDS = 200
 // Turns left to look for the council mod (it may register late; not forever).
 let councilChecksLeft = 3
 // The open ledger: its session folder, the segment being filled (its entries
@@ -828,42 +852,114 @@ async function restoreScope($: EngineInterface, root: string): Promise<void> {
   showScopeStatus($, scope, root)
 }
 
-type ClassifierResult = { kind: 'allow' } | { kind: 'block'; reason: string } | { kind: 'skipped'; why: 'off' | 'built-in' | 'usage-cap' | 'failed' }
+// ── The policy judge ──────────────────────────────────────────────────────
 
-// Asks the model only when nothing built in will look at the command anyway.
-async function classifyCommand($: EngineInterface, tool: ShellTool, command: string, context: ScopeContext): Promise<ClassifierResult> {
-  if (!settings.isScopeClassifierEnabled) return { kind: 'skipped', why: 'off' }
-  try {
-    // 'ask' goes to the mode's decider (the dialog or the auto-mode
-    // classifier, which reads the rules); 'deny' is refused anyway.
-    const check = await $.tool.check({ tool, input: { command } })
-    if (check.decision !== 'allow') return { kind: 'skipped', why: 'built-in' }
-  } catch {
-    // no answer: fall through to the model
+// The judge's model call, through the engine's own $.model.complete: the
+// Claude Code session's sign-in pays for it, as for every other sidekick
+// call (a subscription's usage, or the API key the session runs on).
+// 4 s: the whole tool.call hook has a 10 s budget, and the snapshot may take 1-2 s.
+function judgeHost($: EngineInterface): JudgeHost {
+  return {
+    complete: request => $.model.complete({ model: settings.model, system: request.system, prompt: request.prompt, maxTokens: request.maxTokens, timeoutMs: request.timeoutMs }) as Promise<ModelReply>,
+    snapshot: () => processSnapshot($),
+    pausedBecause: () => judgePause($),
   }
+}
+
+// Paused once the 5-hour usage passes the cap (with no figures, an API key
+// session, it never pauses). Paused, it fails closed like a spent budget.
+async function judgePause($: EngineInterface): Promise<string | undefined> {
   try {
     const usage = await $.session.usage()
     const fiveHour = usage.rateLimits.find(limit => limit.kind === 'five_hour')
-    if (fiveHour !== undefined && fiveHour.percentUsed >= settings.classifierUsageCap) {
-      if (!hasToastedClassifierPause) $.ui.toast(`Scope classifier paused: 5-hour usage is at ${fiveHour.percentUsed}%.`)
-      hasToastedClassifierPause = true
-      return { kind: 'skipped', why: 'usage-cap' }
-    }
+    if (fiveHour === undefined || fiveHour.percentUsed < settings.classifierUsageCap) return undefined
+    if (!hasToastedJudgePause) $.ui.toast(`Policy judge paused: 5-hour usage is at ${fiveHour.percentUsed}%. Commands it would judge are refused (agents) or asked about (you).`)
+    hasToastedJudgePause = true
+    return `the policy judge is paused: the 5-hour usage is at ${fiveHour.percentUsed}% (the cap is ${settings.classifierUsageCap}%)`
   } catch {
-    // no usage figures (an API key, not a subscription): carry on
+    return undefined
   }
-  const cacheKey = JSON.stringify([tool, command, context.cwd, context.folders])
-  const cached = classifierCache.get(cacheKey)
-  if (cached !== undefined) return cached
-  // 4 s: the whole tool.call hook has a 10 s budget.
-  const reply = await $.model.complete({ model: settings.model, system: CLASSIFIER_SYSTEM_PROMPT, prompt: buildClassifierPrompt(command.slice(0, 2000), context), maxTokens: 60, timeoutMs: 4000 })
-  if (!reply.isAnswered) return { kind: 'skipped', why: 'failed' }
-  const result: ClassifierResult = parseClassifierAnswer(reply.text) ?? { kind: 'skipped', why: 'failed' }
-  if (result.kind !== 'skipped') {
-    if (classifierCache.size >= MAX_CLASSIFIER_CACHE) classifierCache.delete(classifierCache.keys().next().value!)
-    classifierCache.set(cacheKey, result)
+}
+
+// One query, cached for 2 s: every process with its parent, name, start and
+// command line (cut to 200 characters), read in processes.ts.
+async function processSnapshot($: EngineInterface): Promise<ProcessSnapshot | undefined> {
+  const now = await $.clock.now()
+  if (snapshotCache !== undefined && now - snapshotCache.at < SNAPSHOT_CACHE_MS) return snapshotCache.value
+  const isWindows = pathStyleOf(await $.session.root()) === 'windows'
+  const result = await $.process.run(isWindows ? [...WINDOWS_SNAPSHOT_ARGV] : [...POSIX_SNAPSHOT_ARGV], { timeoutMs: 3000 }).catch(() => undefined)
+  const value = result === undefined || result.exitCode !== 0 || result.isStdoutTruncated ? undefined : isWindows ? parseWindowsSnapshot(result.stdout) : parsePosixSnapshot(result.stdout)
+  snapshotCache = { at: now, value }
+  return value
+}
+
+const JUDGE_OFF_STORE_PREFIX = 'judgeOff:'
+const judgeOffStoreKey = (sessionId: string) => `${JUDGE_OFF_STORE_PREFIX}${sessionId}`
+
+function judgeStatusText(): string {
+  if (settings.policyJudge === 'off') return 'off (the policyJudge setting)'
+  if (isJudgeOffForSession) return 'off for this session (/scope judge on turns it back on)'
+  const spent = [...judgeState.calls.values()].reduce((sum, calls) => sum + calls, 0)
+  return `on for ${settings.policyJudge === 'all' ? 'every session' : "subagents' commands"} (${settings.model}; at most ${settings.judgeBudgetAgent} calls per agent, ${settings.judgeBudgetSession} for your own session; ${spent} spent since sidekick loaded)`
+}
+
+// Restores /scope judge off for this session, and prunes old entries.
+async function restoreJudgeOff($: EngineInterface): Promise<void> {
+  const [sessionId, now, keys] = await Promise.all([$.session.id(), $.clock.now(), $.store.keys()])
+  isJudgeOffForSession = false
+  for (const key of keys.filter(key => key.startsWith(JUDGE_OFF_STORE_PREFIX))) {
+    const savedAt = ((await $.store.get(key)) as { savedAt?: unknown } | undefined)?.savedAt
+    if (key === judgeOffStoreKey(sessionId)) isJudgeOffForSession = true
+    else if (typeof savedAt !== 'number' || now - savedAt > SCOPE_RETENTION_MS) await $.store.delete(key)
   }
-  return result
+}
+
+// Whether a call's commands go to the judge: policyJudge `all` (every
+// session), `agents` (subagents only) or `off`, and not turned off for this
+// session with /scope judge off.
+const isJudging = (agentId: string | undefined) => !isJudgeOffForSession && (settings.policyJudge === 'all' || (settings.policyJudge === 'agents' && agentId !== undefined))
+
+const agentLabelOf = (agentId: string | undefined, order: CarriedOrder | undefined) =>
+  order !== undefined ? `a council order's agent (order ${order.id})` : agentId !== undefined ? "a subagent of the owner's session" : "the owner's own interactive session"
+
+// The commands a session (or each of its agents) ran, newest last: the
+// judge reads the last few; the stop review reads an agent's whole run.
+function rememberCommand(key: string, tool: string, command: string, outcome: 'ran' | 'refused'): void {
+  const list = recentCommands.get(key) ?? []
+  list.push(`${outcome === 'refused' ? '(refused) ' : ''}${tool === 'PowerShell' ? 'PS> ' : ''}${command.slice(0, 600)}`)
+  if (list.length > MAX_REMEMBERED_COMMANDS) list.splice(0, list.length - MAX_REMEMBERED_COMMANDS)
+  recentCommands.set(key, list)
+  if (recentCommands.size > 50) recentCommands.delete(recentCommands.keys().next().value!)
+}
+
+// The policy decision for a shell call: the judge (and its fast path, cache,
+// complexity rule and budget), after the deterministic checks.
+async function judgeShellCall(
+  $: EngineInterface,
+  tool: ShellTool,
+  command: string,
+  context: ScopeContext,
+  who: { agentId: string | undefined; order: CarriedOrder | undefined },
+): Promise<ShellDecision> {
+  const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), who.order === undefined ? undefined : { id: who.order.id, sentences: who.order.policy })
+  const budgetKey = who.agentId ?? 'owner'
+  const call: ShellCall = {
+    tool,
+    command,
+    context,
+    isAgent: who.agentId !== undefined,
+    agentLabel: agentLabelOf(who.agentId, who.order),
+    budgetKey,
+    policy,
+    recent: (recentCommands.get(budgetKey) ?? []).slice(-RECENT_COMMANDS),
+  }
+  const options = {
+    isInlineBanEnabled: settings.isInlineCodeBanEnabled,
+    judge: { isEnabled: isJudging(who.agentId), maxSegments: settings.judgeMaxSegments, budget: who.agentId !== undefined ? settings.judgeBudgetAgent : settings.judgeBudgetSession },
+  }
+  const event: JudgeEvent = { judged: false }
+  const decision = await decideCall(call, options, judgeState, judgeHost($), event)
+  return decision
 }
 
 // The council order a subagent carries, if it carries one (read from the
@@ -933,59 +1029,67 @@ function refusePathRule($: EngineInterface, tool: string, hits: readonly PathRul
   return pathRuleDenial(hits, layer)
 }
 
-// Returns the denial Claude reads, or undefined to let the call run. Called
-// only for the tools it polices, with the context already read. With no scope
-// set (only /scope set or add, or a council order, sets one) and no path
-// rules, nothing is blocked.
-// The owner's own shell calls the classic.PreToolUse hook asked about, by
-// tool and command: when one reaches tool.call, the owner approved it.
-const OWNER_ASK_WINDOW_MS = 10 * 60 * 1000
-const ownerAsks = new Map<string, number>()
-const ownerAskKey = (tool: string, command: string) => `${tool}\0${command}`
+// Asking the owner. The engine fires classic.PreToolUse inside tool.call's
+// next(e), carrying the call's tool_use_id but not its agent: so tool.call
+// (which knows the agent) decides, and for the owner's own call leaves the
+// question here for the PreToolUse hook to put. Its ask is a floor the engine
+// keeps in every mode. Until a PreToolUse has been seen in this process, an
+// owner's refused call is denied instead (with the way out), so a call is
+// never let through unasked on an engine that doesn't fire the hook.
+const pendingOwnerAsks = new Map<string, string>()
+let hasSeenPreToolUse = false
 
-function rememberOwnerAsk(tool: string, command: string, now: number): void {
-  for (const [key, at] of ownerAsks) if (now - at > OWNER_ASK_WINDOW_MS) ownerAsks.delete(key)
-  if (ownerAsks.size > 100) ownerAsks.delete(ownerAsks.keys().next().value!)
-  ownerAsks.set(ownerAskKey(tool, command), now)
+const askKeysOf = (tool: string, input: Record<string, unknown>): string[] => {
+  const command = shellCommandOf(input)
+  return [...(typeof input.tool_use_id === 'string' ? [`id:${input.tool_use_id}`] : []), ...(command === undefined ? [] : [`cmd:${tool}\0${command}`])]
 }
 
-function takeOwnerApproval(tool: string, input: Record<string, unknown>, now: number): boolean {
-  const command = shellCommandOf(input)
-  if (command === undefined) return false
-  const key = ownerAskKey(tool, command)
-  const at = ownerAsks.get(key)
-  ownerAsks.delete(key)
-  return at !== undefined && now - at <= OWNER_ASK_WINDOW_MS
+function leaveOwnerAsk(tool: string, input: Record<string, unknown>, question: string): void {
+  if (pendingOwnerAsks.size > 50) pendingOwnerAsks.clear()
+  for (const key of askKeysOf(tool, input)) pendingOwnerAsks.set(key, question)
 }
 
-// The owner's own Bash and PowerShell calls, before they run: what the guard
-// would refuse becomes a question (an ask the engine keeps in every mode).
-// A subagent's call is left to tool.call, which denies instead.
-function ownerShellQuestion(tool: ShellTool, input: Record<string, unknown>, now: number): { ask: string } | undefined {
-  if (!settings.isScopeGuardEnabled || agentIdOf(input) !== undefined) return undefined
-  const command = shellCommandOf(input)
-  if (command === undefined) return undefined
-  const finding = settings.isInlineCodeBanEnabled ? inlineFinding(tool, command) : undefined
-  if (finding === undefined) return undefined
-  rememberOwnerAsk(tool, command, now)
-  return { ask: inlineCodeQuestion(finding) }
+// Whether the question left for this call is still waiting (then forgets it).
+function takeOwnerAsk(tool: string, input: Record<string, unknown>): string | undefined {
+  let question: string | undefined
+  for (const key of askKeysOf(tool, input)) {
+    question ??= pendingOwnerAsks.get(key)
+    pendingOwnerAsks.delete(key)
+  }
+  return question
+}
+
+// The classic.PreToolUse hook for Bash and PowerShell: puts a question left for this call.
+function preToolUseQuestion(tool: ShellTool, input: Record<string, unknown>): { ask: string } | undefined {
+  hasSeenPreToolUse = true
+  const question = takeOwnerAsk(tool, input)
+  return question === undefined ? undefined : { ask: question }
 }
 
 // Who made a call: a subagent (a council order's agent or any other) can't be
-// asked, so what the guard refuses is denied; the owner's own session is
-// asked instead, once its classic.PreToolUse hook has put the question.
-type CallOrigin = { isAgent: boolean; isOwnerApproved: boolean }
+// asked, so what the guard refuses is denied; the owner is asked instead.
+type CallOrigin = { agentId: string | undefined; order: CarriedOrder | undefined }
 
+// What the guard says about a call: nothing (it runs), a denial, or (for the
+// owner's own shell call) a question, with the denial to give instead when
+// the question can't be put.
+type GuardResult = undefined | string | { ask: string; deny: string }
+
+// Returns the denial Claude reads, or undefined to let the call run. Called
+// only for the tools it polices, with the context already read. File tools:
+// the scope and the path rules. Shell tools: the inline-code ban, the scope,
+// the path rules, then the policy judge.
 async function guardToolCall(
   $: EngineInterface,
   tool: string,
   input: Record<string, unknown>,
   context: ScopeContext,
   rules: readonly ActivePathRule[] = [],
-  origin: CallOrigin = { isAgent: false, isOwnerApproved: false },
-): Promise<string | undefined> {
+  origin: CallOrigin = { agentId: undefined, order: undefined },
+): Promise<GuardResult> {
   let verdict: GuardVerdict = { kind: 'allow' }
   const isFileEdit = FILE_TOOLS.has(tool)
+  const isAgent = origin.agentId !== undefined
 
   if (isFileEdit) {
     const filePath = textField(input.file_path) ?? textField(input.notebook_path)
@@ -998,25 +1102,21 @@ async function guardToolCall(
   } else if (isShellTool(tool)) {
     const command = shellCommandOf(input)
     if (!command) return undefined
-    // Deterministic refusals first: the inline-code ban, then the scope.
-    const decision = decideShell(tool, command, context, { isInlineBanEnabled: settings.isInlineCodeBanEnabled && !origin.isOwnerApproved })
-    if (decision.kind === 'refuse' && decision.via === 'inline') {
-      $.ui.toast(`Guard refused ${tool}: inline interpreter code (${decision.finding.shape}).`)
-      return inlineCodeDenial(decision.finding, origin.isAgent)
+    // Deterministic refusals first: the inline-code ban, the scope, the path rules.
+    const first = decideShell(tool, command, context, { isInlineBanEnabled: settings.isInlineCodeBanEnabled })
+    if (first.kind === 'refuse' && first.via === 'inline') {
+      if (isAgent) $.ui.toast(`Guard refused ${tool}: inline interpreter code (${first.finding.shape}).`)
+      return isAgent ? inlineCodeDenial(first.finding, true) : { ask: inlineCodeQuestion(first.finding), deny: inlineCodeDenial(first.finding, false) }
     }
-    verdict = decision.kind === 'refuse' ? decision.verdict : decision.kind === 'judge' ? { kind: 'unclear', reason: decision.reason } : { kind: 'allow' }
-    if (verdict.kind !== 'block') {
+    if (first.kind === 'refuse' && first.via === 'scope') verdict = first.verdict
+    else {
       const hits = await shellHits($, tool, command, context, rules)
       if (hits.length > 0) return refusePathRule($, tool, hits, tool)
-    }
-    if (verdict.kind === 'unclear') {
-      const judged = await classifyCommand($, tool, command, context)
-      if (judged.kind === 'block') verdict = { kind: 'block', target: context.cwd, reason: `${judged.reason} (scope classifier)` }
-      // The classifier was asked and gave no answer: fail closed, as the guard
-      // does on errors. (Turned off, or paused at the usage cap, it's the
-      // user's choice to let unclear commands through.)
-      else if (judged.kind === 'skipped' && judged.why === 'failed') {
-        verdict = { kind: 'block', target: context.cwd, reason: `${verdict.reason}, and the scope classifier could not judge it` }
+      // Then the judge.
+      const decision = await judgeShellCall($, tool, command, context, origin)
+      if (decision.kind === 'refuse' && decision.via !== 'inline' && decision.via !== 'scope') {
+        if (isAgent) $.ui.toast(`Policy guard refused ${tool}: ${decision.reason}.`)
+        return isAgent ? policyDenial(decision, true) : { ask: policyQuestion(decision), deny: policyDenial(decision, false) }
       }
     }
   }
@@ -1249,8 +1349,23 @@ async function scopeCommand($: EngineInterface, args: string): Promise<string> {
   const scope = await read($, scopeAtom)
 
   switch (action) {
-    case 'show':
-      return `Scope: ${describeScope({ root, folders: scope.folders })}. Guard ${settings.isScopeGuardEnabled ? 'on' : 'off'}${scope.folders.length === 0 ? ', idle until /scope set or add' : ''}.`
+    case 'show': {
+      const policy = assemblePolicy(standingPolicy(await readRules($, root)))
+      return [
+        `Scope: ${describeScope({ root, folders: scope.folders })}. Guard ${settings.isScopeGuardEnabled ? 'on' : 'off'}${scope.folders.length === 0 ? ', idle until /scope set or add' : ''}.`,
+        `Inline-code ban ${settings.isInlineCodeBanEnabled ? 'on' : 'off'}. Policy judge: ${judgeStatusText()}.`,
+        `Policy (${policy.length}): ${policy.map(rule => rule.text).join(' ')}`,
+      ].join('\n')
+    }
+    case 'judge': {
+      const word = rest[0]?.toLowerCase()
+      if (word !== 'on' && word !== 'off') return `Usage: /scope judge on|off. Policy judge: ${judgeStatusText()}.`
+      isJudgeOffForSession = word === 'off'
+      const key = judgeOffStoreKey(await $.session.id())
+      if (isJudgeOffForSession) await $.store.set(key, { savedAt: await $.clock.now() })
+      else await $.store.delete(key)
+      return `Policy judge: ${judgeStatusText()}.${isJudgeOffForSession ? ' The inline-code ban, the scope and the path rules still hold.' : ''}`
+    }
     case 'set':
     case 'add': {
       if (!argument) return `Usage: /scope ${action} <folder> (or . for the root's own files)`
@@ -1277,7 +1392,7 @@ async function scopeCommand($: EngineInterface, args: string): Promise<string> {
       await saveScope($, { folders: [] }, root)
       return 'Scope cleared; the guard is idle until /scope set or add.'
     default:
-      return 'Usage: /scope [show | set <folder> | add <folder> | remove <folder> | clear]'
+      return 'Usage: /scope [show | set <folder> | add <folder> | remove <folder> | clear | judge on|off]'
   }
 }
 
@@ -1515,7 +1630,7 @@ export const register: Register = (on, options) => {
     if (settings.isReplayEnabled) await $.command.register({ name: 'replay', description: "Step through the last turn's file edits" })
     if (settings.isSummaryEnabled) await $.command.register({ name: 'tldr', description: 'Brief what happened: the last turn, since the last brief, or the whole session', argumentHint: '[last|since|full]' })
     await $.command.register({ name: 'heads-up', description: 'Review the last answer for something you should know, or list/forget topics marked known', argumentHint: '[now|known|forget]' })
-    await $.command.register({ name: 'scope', description: "Show or change this session's target folders", argumentHint: '[show|set <folder>|add <folder>|remove <folder>|clear]' })
+    await $.command.register({ name: 'scope', description: "Show or change this session's target folders and its policy judge", argumentHint: '[show|set <folder>|add <folder>|remove <folder>|clear|judge on|off]' })
     // Looked for afresh each start (the council mod may have been turned off).
     await update($, hasCouncilAtom, () => false)
     void detectCouncil($)
@@ -1525,6 +1640,11 @@ export const register: Register = (on, options) => {
     if (settings.isSummaryEnabled) await openLedger($).catch(() => undefined)
     const root = await $.session.root()
     await restoreScope($, root)
+    await restoreJudgeOff($).catch(() => undefined)
+    hasSeenPreToolUse = false
+    pendingOwnerAsks.clear()
+    recentCommands.clear()
+    judgeState = newJudgeState()
     await pruneBackstops($).catch(() => undefined)
     // The rules are the source of truth; the settings file is made to match.
     await (async () => writeRules($, root, await readRules($, root), await storedStyle($, root)))().catch((error: unknown) =>
@@ -1560,20 +1680,15 @@ export const register: Register = (on, options) => {
     isError: true as const,
   }))
 
-  // The owner's own shell calls: what the guard refuses becomes a question
-  // before the call runs (tool.call still denies a subagent's). A failure
-  // here leaves the call to tool.call's checks, which deny rather than ask.
-  on('classic.PreToolUse', { tool: 'Bash' }, async ($, e, next) => ownerShellQuestion('Bash', e as unknown as Record<string, unknown>, await $.clock.now()) ?? next(e)).catch(($, e, next) => next(e))
-  on('classic.PreToolUse', { tool: 'PowerShell' }, async ($, e, next) => ownerShellQuestion('PowerShell', e as unknown as Record<string, unknown>, await $.clock.now()) ?? next(e)).catch(($, e, next) => next(e))
-  // The same question to every permission check of the call.
-  on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
-    const question = ownerShellQuestion('Bash', e as unknown as Record<string, unknown>, await $.clock.now())
-    return question === undefined ? next(e) : { decision: 'ask' as const, reason: question.ask }
-  }).catch(($, e, next) => next(e))
-  on('tool.check', { tool: 'PowerShell' }, async ($, e, next) => {
-    const question = ownerShellQuestion('PowerShell', e as unknown as Record<string, unknown>, await $.clock.now())
-    return question === undefined ? next(e) : { decision: 'ask' as const, reason: question.ask }
-  }).catch(($, e, next) => next(e))
+  // The owner's own shell calls: a question tool.call left for this call is
+  // put here, before the tool runs (see leaveOwnerAsk). A failure here asks
+  // anyway when a question was left, rather than letting the call through.
+  on('classic.PreToolUse', { tool: 'Bash' }, ($, e, next) => preToolUseQuestion('Bash', e as unknown as Record<string, unknown>) ?? next(e)).catch(($, e, next) =>
+    takeOwnerAsk('Bash', e as unknown as Record<string, unknown>) !== undefined ? { ask: 'Sidekick could not finish checking this command. Allow it?' } : next(e),
+  )
+  on('classic.PreToolUse', { tool: 'PowerShell' }, ($, e, next) => preToolUseQuestion('PowerShell', e as unknown as Record<string, unknown>) ?? next(e)).catch(($, e, next) =>
+    takeOwnerAsk('PowerShell', e as unknown as Record<string, unknown>) !== undefined ? { ask: 'Sidekick could not finish checking this command. Allow it?' } : next(e),
+  )
 
   on('command.run', { command: 'replay' }, async $ => {
     const isOpened = await openReplay($)
@@ -1627,6 +1742,7 @@ export const register: Register = (on, options) => {
     const input = e as unknown as Record<string, unknown>
 
     let context: ScopeContext | undefined
+    let askedOwner = false
     if (isGuarded) {
       let denial: string | undefined
       try {
@@ -1636,7 +1752,15 @@ export const register: Register = (on, options) => {
         const order = agentId !== undefined ? await councilOrder($, agentId) : undefined
         if (order !== undefined) context = { ...context, folders: [order.folder] }
         const rules = await activePathRules($, context.root, order)
-        denial = await guardToolCall($, tool, input, context, rules, { isAgent: agentId !== undefined, isOwnerApproved: agentId === undefined && takeOwnerApproval(tool, input, await $.clock.now()) })
+        const verdict = await guardToolCall($, tool, input, context, rules, { agentId, order })
+        if (typeof verdict === 'object') {
+          // The owner's own call: asked by the PreToolUse hook inside next(e),
+          // once that hook is known to fire; refused until then.
+          if (hasSeenPreToolUse) {
+            leaveOwnerAsk(tool, input, verdict.ask)
+            askedOwner = true
+          } else denial = verdict.deny
+        } else denial = verdict
       } catch {
         // A guard that can't check fails closed. Claude can retry; if it keeps
         // failing, the user turns the guard off (scopeGuardEnabled) or clears the scope.
@@ -1644,13 +1768,15 @@ export const register: Register = (on, options) => {
           'The sidekick scope guard hit an internal error while checking this call and blocked it to be safe. Retry it once; if it is blocked again, stop and tell the user the scope guard is failing (they can run /scope clear or turn off scopeGuardEnabled).'
         $.ui.toast('Scope guard error: the call was blocked.')
       }
+      const command = isShellTool(tool) ? shellCommandOf(input) : undefined
+      if (command !== undefined) rememberCommand(agentId ?? 'owner', tool, command, denial === undefined ? 'ran' : 'refused')
       if (denial !== undefined) {
         if (isLedgered) await recordCall($, { tool, input, agentId, startedAt: undefined, steps: [], result: { deny: denial } }).catch(() => undefined)
         return { deny: denial }
       }
     }
 
-    if (!isRecorded && !isLedgered) return next(e)
+    if (!isRecorded && !isLedgered && !askedOwner) return next(e)
     let steps: ReplayStep[] = []
     if (isEditTool(tool)) {
       try {
@@ -1661,6 +1787,8 @@ export const register: Register = (on, options) => {
     }
     const startedAt = isLedgered ? await ledgerNow($) : undefined
     const result = await next(e)
+    // The question was never put: the engine ran the call without its PreToolUse hook.
+    if (askedOwner && takeOwnerAsk(tool, input) !== undefined) $.ui.toast(`Sidekick could not ask you about that ${tool} call before it ran (no PreToolUse hook fired).`)
     if (isRecorded && result.deny === undefined && result.isError !== true) pendingSteps.push(...steps)
     if (isLedgered) await recordCall($, { tool, input, agentId, startedAt, steps, result }).catch(() => undefined)
     return result

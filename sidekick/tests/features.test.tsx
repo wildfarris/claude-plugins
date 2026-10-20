@@ -657,14 +657,20 @@ test('a scope an earlier version inferred is not restored', async ($, on) => {
   expect(sibling.deny).toBeUndefined()
 })
 
-test('when the scope classifier cannot answer, an unclear command is blocked', async ($, on) => {
+test('when the policy judge cannot answer, the command is refused: asked of the owner, denied if unasked', async ($, on) => {
   const harness = baseStandIn(on, { root: ROOT, complete: () => '', decide: () => 'allow' })
   on('fs.list', () => ({ value: [] }))
   await $.command.run(composer('scope', 'set project'))
   await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/project/a.ts`, old_string: 'a', new_string: 'b' })
-  const unclear = await $.tool.call({ tool: 'Bash', command: './scripts/deploy.sh' })
-  expect(unclear.deny).toContain('could not judge it')
+  // Before the PreToolUse hook is known to fire, the owner's call is denied.
+  const unasked = await $.tool.call({ tool: 'Bash', command: './scripts/release.sh' })
+  expect(unasked.deny).toContain('the policy judge gave no usable answer (the answer was empty)')
+  expect(unasked.deny).toContain('fails closed')
   expect(harness.tools).toEqual(['Edit'])
+  // After it, the question is left for that hook; never let through unasked.
+  await $.tool.call({ tool: 'Bash', command: 'ls project' })
+  await $.tool.call({ tool: 'Bash', command: './scripts/deploy.sh' })
+  expect(harness.toasts.some(toast => toast.includes('could not ask you'))).toBe(false)
 })
 
 test('/clear drops the old conversation from the bar', async ($, on) => {

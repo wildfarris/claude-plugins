@@ -11,7 +11,7 @@
     "model": {
       "type": "string",
       "title": "Model",
-      "description": "Model for TL;DR briefs, heads-up notes and the scope classifier.",
+      "description": "Model for TL;DR briefs, heads-up notes and the policy judge.",
       "default": "claude-haiku-5-5"
     },
     "replayEnabled": {
@@ -67,16 +67,45 @@
       "description": "Refuse Bash and PowerShell commands that run interpreter code written into the command line (node -e, python -c, a heredoc piped to node, Invoke-Expression…). A council order's agent is refused; in your own session you are asked.",
       "default": true
     },
-    "scopeClassifierEnabled": {
-      "type": "boolean",
-      "title": "Scope classifier",
-      "description": "Ask the model about shell commands the guard can't judge, when nothing built in will review them.",
-      "default": true
+    "policyJudge": {
+      "type": "string",
+      "title": "Policy judge",
+      "description": "Which Bash and PowerShell commands the model judges against the policy when code can't clear them: every session's (all), subagents' only (agents), or none (off). One call per command, on this session's sign-in; an agent is refused what it blocks, you are asked.",
+      "options": [
+        "all",
+        "agents",
+        "off"
+      ],
+      "default": "all"
+    },
+    "judgeBudgetAgent": {
+      "type": "number",
+      "title": "Judge calls per agent",
+      "description": "The most policy-judge calls one subagent may use; past it, its uncleared commands are refused until the session restarts.",
+      "default": 300,
+      "min": 0,
+      "max": 100000
+    },
+    "judgeBudgetSession": {
+      "type": "number",
+      "title": "Judge calls for your session",
+      "description": "The most policy-judge calls your own session may use; past it, you are asked about each uncleared command instead.",
+      "default": 1000,
+      "min": 0,
+      "max": 100000
+    },
+    "judgeMaxSegments": {
+      "type": "number",
+      "title": "Uncleared parts per command",
+      "description": "A command with more parts than this that code can't clear is refused without a model call, with a request to split it.",
+      "default": 4,
+      "min": 1,
+      "max": 20
     },
     "classifierUsageCap": {
       "type": "number",
-      "title": "Classifier usage cap (%)",
-      "description": "Pause the scope classifier once your 5-hour usage passes this percentage.",
+      "title": "Judge usage cap (%)",
+      "description": "Pause the policy judge once your 5-hour usage passes this percentage; paused, the commands it would judge are refused for agents and asked about for you.",
       "default": 90,
       "min": 0,
       "max": 100

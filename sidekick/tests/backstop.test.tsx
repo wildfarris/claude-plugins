@@ -86,7 +86,7 @@ function gitStandIn(repo: Repo) {
 }
 
 function orderStandIn(on: Parameters<typeof baseStandIn>[0], repo: Repo) {
-  const harness = baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow', run: gitStandIn(repo), store: { [`rules:${ROOT}`]: [{ kind: 'forbid', glob: '*/src/**/*.css', ops: ['create'], reason: 'use the theme tokens' }] } })
+  const harness = baseStandIn(on, { root: ROOT, cwd: WEB, decide: () => 'allow', complete: () => 'ALLOW', run: gitStandIn(repo), store: { [`rules:${ROOT}`]: [{ kind: 'forbid', glob: '*/src/**/*.css', ops: ['create'], reason: 'use the theme tokens' }] } })
   on('command.list', () => ({ value: [{ name: 'council', description: '', source: 'plugin' }] }))
   on('state.get', ($, e, next) =>
     String(e.plugin) === 'council' && String(e.key) === 'court'

@@ -1,6 +1,5 @@
 // The scope guard's deterministic half: decides whether a change stays inside
-// the session's target folders. Pure; the model is asked only about commands
-// this cannot judge.
+// the session's target folders, and what code clears for the policy judge. Pure.
 //
 // Policed: paths inside the session root but outside every scope folder.
 // Anything outside the session root (temp files, ~/.claude) is left alone.
@@ -354,6 +353,8 @@ export type Segment = {
   heredocs: string[]
   // Joined to the previous segment by a pipe.
   isPiped: boolean
+  // The segment as written (without heredoc bodies), for the judge and its cache.
+  text?: string
 }
 
 const emptySegment = (isPiped: boolean): Segment => ({ tokens: [], substitutedPaths: [], substitutions: [], heredocs: [], isPiped })
@@ -372,6 +373,7 @@ export function parseCommand(command: string): Segment[] {
   let pendingRedirect = false
   let isNextWordValue = false
   const pendingHeredocDelimiters: string[] = []
+  let segmentStart = 0
 
   const pushWord = () => {
     if (!hasWord) return
@@ -382,8 +384,10 @@ export function parseCommand(command: string): Segment[] {
     isWordQuoted = false
     hasWord = false
   }
-  const endSegment = (separator: string) => {
+  const endSegment = (separator: string, end = command.length, next = end + 1) => {
     pushWord()
+    current.text = command.slice(segmentStart, end).trim()
+    segmentStart = next
     if (current.tokens.length > 0 || current.substitutedPaths.length > 0 || current.substitutions.length > 0) segments.push(current)
     current = emptySegment(separator === '|')
   }
@@ -457,8 +461,9 @@ export function parseCommand(command: string): Segment[] {
       }
     } else if (char === '\n' && pendingHeredocDelimiters.length > 0) {
       const owner = current.tokens.length > 0 ? current : segments[segments.length - 1]
-      endSegment('\n')
+      endSegment('\n', index)
       index = readHeredocBodies(index + 1, owner)
+      segmentStart = index + 1
     } else if (char === '\\' && nextChar !== undefined) {
       word += nextChar
       hasWord = true
@@ -507,13 +512,13 @@ export function parseCommand(command: string): Segment[] {
       }
       if (isOutput) pendingRedirect = true
     } else if (char === '&' && nextChar === '&') {
-      endSegment('&&')
+      endSegment('&&', index, index + 2)
       index++
     } else if (char === '|' && nextChar === '|') {
-      endSegment('||')
+      endSegment('||', index, index + 2)
       index++
     } else if (SEPARATORS.has(char)) {
-      endSegment(char)
+      endSegment(char, index)
     } else {
       word += char
       hasWord = true
@@ -616,6 +621,8 @@ type SegmentAnalysis = {
   // The named paths it surely writes or deletes, for the path rules. Only
   // commands the guard knows: a script's or build tool's arguments aren't here.
   pathOps?: PathOpToken[]
+  // A directory tool (git, npm…), its subcommand and what follows it.
+  tool?: { command: string; subcommand?: string; rest: Token[] }
 }
 
 // A path a command deletes, or writes (a create or an edit, by whether it is
@@ -761,7 +768,8 @@ function analyzeSegment(segment: Segment): SegmentAnalysis {
         ? subcommand === undefined || READ_ONLY_GIT.has(subcommand) || (LISTING_GIT[subcommand]?.(rest) ?? false)
         : subcommand !== undefined && READ_ONLY_PACKAGE.has(subcommand)
     const pathArgs = positionals(family, args).slice(1).filter(token => !token.isQuoted && looksLikePath(token.text))
-    return isReadOnly ? base : { ...base, isMutating: true, runTargets: pathArgs, directoryOption, pathOps: [...base.pathOps!, ...gitFileOps(command, subcommand, rest)] }
+    const tool = { command, ...(subcommand === undefined ? {} : { subcommand }), rest }
+    return isReadOnly ? { ...base, tool, directoryOption } : { ...base, isMutating: true, runTargets: pathArgs, directoryOption, tool, pathOps: [...base.pathOps!, ...gitFileOps(command, subcommand, rest)] }
   }
 
   if (READ_ONLY.has(command)) {
@@ -875,8 +883,8 @@ export function analyzeCommand(command: string, context: ScopeContext, depth = 0
 
     if (analysis.changesDirectoryTo !== undefined) {
       // A bare `cd` goes home.
-      const next = analysis.changesDirectoryTo === '' ? placed.home : resolve(directory, analysis.changesDirectoryTo)
-      directory = next === UNPLACEABLE ? undefined : next
+      const to = analysis.changesDirectoryTo === '' ? placed.home : resolve(directory, analysis.changesDirectoryTo)
+      directory = to === UNPLACEABLE ? undefined : to
       continue
     }
     for (const inner of analysis.innerCommands ?? []) {
@@ -909,6 +917,127 @@ export function analyzeCommand(command: string, context: ScopeContext, depth = 0
     }
   }
   return unclearReason ? { kind: 'unclear', reason: unclearReason } : { kind: 'allow' }
+}
+
+// ── The fast path ──────────────────────────────────────────────────────────
+//
+// What code clears without asking the policy judge: commands that only read
+// (flag-aware: sed without -i, find without -delete or -exec, read-only git,
+// a package tool's listings), `cd`, the local git steps (add, commit, mv,
+// rm, restore, stash) inside the area, and file writes this analysis proves
+// land inside it. The area is the target folders, or the session root when
+// there are none. Code here only ever clears: anything else goes to the judge.
+
+export type ClearedSegment = {
+  // As written, for the judge and its cache.
+  text: string
+  isCleared: boolean
+}
+
+export type Clearance = {
+  segments: ClearedSegment[]
+  // A construct too opaque to judge (eval, decode-and-run, shells nested
+  // deep): refused without a model call.
+  opaque?: string
+}
+
+const LOCAL_GIT = new Set(['add', 'commit', 'mv', 'rm', 'restore', 'stash'])
+const PACKAGE_LISTINGS = new Set(['list', 'ls', 'outdated', 'view', 'info', 'why', 'help', 'version', '--version', '-v', 'search', 'show', 'tree', 'env'])
+// Read-only by the scope guard's measure, but not for the policy: they run
+// scripts, reach other machines, or are agents of their own.
+const JUDGED_READERS = new Set(['claude', 'source', 'wget', 'ssh', 'scp', 'sftp', 'nc', 'ncat', 'telnet', 'ftp'])
+// curl options that send or change something rather than fetch.
+const CURL_SENDS = /^(-X|--request|-d|--data.*|-F|--form.*|-T|--upload-file|-K|--config|--json|-u|--user)$/
+// Shells nested deeper than this (bash -c 'bash -c "…"') are opaque.
+const MAX_CLEAR_DEPTH = 2
+
+// Inside the area: a scope folder covers it, or (with none) the root holds it.
+function isInArea(path: string | undefined, placed: Placed): boolean {
+  if (path === undefined || path === UNPLACEABLE) return false
+  const below = segmentsBelow(path, placed.root)
+  if (below === undefined) return false
+  return placed.folders.length === 0 || !outOfScope(path, placed)
+}
+
+// The same, for a path from elsewhere (the PowerShell reader).
+export function isInsideArea(path: string | undefined, context: Pick<ScopeContext, 'root' | 'folders'>): boolean {
+  if (path === undefined) return false
+  const placed = placeContext(context)
+  return isInArea(path === UNPLACEABLE ? path : (canonicalAbsolute(path, placed.style) ?? UNPLACEABLE), placed)
+}
+
+function isGhReadOnly(tokens: readonly Token[]): boolean {
+  const words = tokens.filter(token => !token.isRedirect).map(token => token.text)
+  const start = words.indexOf('gh')
+  const [noun, verb] = [words[start + 1], words[start + 2]]
+  if (noun === 'auth' || noun === 'status') return verb === undefined || verb === 'status'
+  return ['view', 'list', 'status', 'diff', 'checks'].includes(verb ?? '')
+}
+
+export function clearCommand(command: string, context: Omit<ScopeContext, 'cwd'> & { cwd?: string }, depth = 0): Clearance {
+  if (depth > MAX_CLEAR_DEPTH) return { segments: [{ text: command.trim(), isCleared: false }], opaque: 'shells nested several deep' }
+  const placed = placeContext(context)
+  let directory: string | undefined = placed.cwd
+  const segments: ClearedSegment[] = []
+  let opaque: string | undefined
+  const resolve = (base: string | undefined, path: string) => placeAll(base, path, placingOf(placed))[0]
+  const inner = (code: string) => {
+    const { cwd: _cwd, ...rest } = context
+    const nested = clearCommand(code, directory === undefined ? rest : { ...rest, cwd: directory }, depth + 1)
+    segments.push(...nested.segments)
+    opaque ??= nested.opaque
+  }
+  const parsed = parseCommand(command)
+  parsed.forEach((segment, index) => {
+    for (const code of segment.substitutions) inner(code)
+    const analysis = analyzeSegment(segment)
+    const head = commandName(segment)
+    const text = segment.text ?? segment.tokens.map(token => token.text).join(' ')
+    // base64 -d | sh: text decoded and run.
+    const next = parsed[index + 1]
+    if (/^(base64|certutil|openssl)$/.test(head) && segment.tokens.some(token => /^(-d|--decode|-D|-decode|enc)$/.test(token.text)) && next?.isPiped) {
+      const nextHead = commandName(next)
+      if (SHELLS.has(nextHead) || INTERPRETERS.has(nextHead) || nextHead === 'eval') opaque ??= 'decodes text and runs it'
+    }
+    if (head === 'eval') {
+      opaque ??= 'eval'
+      segments.push({ text, isCleared: false })
+      return
+    }
+    if (analysis.changesDirectoryTo !== undefined) {
+      const to = analysis.changesDirectoryTo === '' ? placed.home : resolve(directory, analysis.changesDirectoryTo)
+      directory = to === UNPLACEABLE ? undefined : to
+      segments.push({ text, isCleared: true })
+      return
+    }
+    if (analysis.innerCommands !== undefined && analysis.innerCommands.length > 0) {
+      // bash -c '…', a heredoc fed to a shell: the code is judged, not the wrapper.
+      for (const code of analysis.innerCommands) inner(code)
+      segments.push({ text, isCleared: true })
+      return
+    }
+    const runsIn = analysis.directoryOption ? resolve(directory, analysis.directoryOption) : directory
+    let isCleared = false
+    const isElevated = segment.tokens.some(token => !token.isQuoted && (token.text === 'sudo' || token.text === 'doas' || token.text === 'runas'))
+    if (analysis.isInlineCode || analysis.isUnknown || isElevated || JUDGED_READERS.has(head)) isCleared = false
+    else if (analysis.tool !== undefined) {
+      const { command: tool, subcommand } = analysis.tool
+      if (tool === 'git') isCleared = !analysis.isMutating || (subcommand !== undefined && LOCAL_GIT.has(subcommand) && isInArea(runsIn, placed))
+      else isCleared = !analysis.isMutating && subcommand !== undefined && PACKAGE_LISTINGS.has(subcommand)
+      // Redirects out of a listing are writes like any other.
+      if (isCleared) isCleared = analysis.targets.every(token => isInArea(resolve(directory, token.text), placed))
+    } else if (head === 'gh') isCleared = !analysis.isMutating && isGhReadOnly(segment.tokens)
+    else if (head === 'curl') isCleared = !analysis.isMutating && !segment.tokens.some(token => !token.isQuoted && CURL_SENDS.test(token.text))
+    else if (head === 'xargs' || head === 'find') isCleared = !analysis.isMutating
+    else if (!analysis.isMutating) isCleared = true
+    else {
+      // A writer the analysis knows: every path it names, inside the area.
+      const targets = [...analysis.targets.map(token => resolve(directory, token.text)), ...(analysis.runTargets ?? []).map(token => resolve(runsIn, token.text))]
+      isCleared = targets.length > 0 && targets.every(path => isInArea(path, placed))
+    }
+    segments.push({ text, isCleared })
+  })
+  return { segments, ...(opaque === undefined ? {} : { opaque }) }
 }
 
 // ── Messages ───────────────────────────────────────────────────────────────
@@ -957,24 +1086,4 @@ export function denialMessage(verdict: { target: string; reason: string }, conte
     ...reCommand,
     `If the task needs this change, stop and ask the user to run \`/scope add ${addSpec}\`${addSpec === '.' ? " (the root's own files)" : ''}, or \`/scope clear\` to stop guarding this session.`,
   ].join(' ')
-}
-
-export const CLASSIFIER_SYSTEM_PROMPT =
-  'You check shell commands for one specific accident: changing files outside the folder a coding session is meant to work in. Reading files anywhere is fine. Answer with exactly one line: ALLOW, or BLOCK: <reason in at most 15 words>.'
-
-export function buildClassifierPrompt(command: string, context: ScopeContext): string {
-  return [
-    `Session root: ${context.root}`,
-    `Target folders (changes allowed only inside these): ${context.folders.join(', ')}`,
-    `The command runs in: ${context.cwd}`,
-    `Command:\n${command}`,
-    'Would running this command create, modify or delete files inside the session root but outside every target folder?',
-  ].join('\n')
-}
-
-export function parseClassifierAnswer(text: string): { kind: 'allow' } | { kind: 'block'; reason: string } | undefined {
-  const line = text.trim().split('\n')[0]?.trim() ?? ''
-  if (/^allow\b/i.test(line)) return { kind: 'allow' }
-  const block = /^block\b[:\s-]*(.*)$/i.exec(line)
-  return block ? { kind: 'block', reason: block[1]!.trim() || 'the classifier judged it to change files outside the target folder' } : undefined
 }

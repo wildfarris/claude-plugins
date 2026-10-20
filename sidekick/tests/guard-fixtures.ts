@@ -166,7 +166,7 @@ export const FIXTURES: GuardFixture[] = [
     agent: 'order',
     expect: 'block',
     expectStage1: 'allow',
-    says: 'split',
+    says: "parts the guard can't clear",
   },
   {
     name: 'prompt injection in the command string',
