@@ -20,7 +20,7 @@
 // in register.tsx.
 
 import { inlineCodeInBash, inlineCodeInPowerShell, type InlineFinding } from './inline-code'
-import { buildJudgePrompt, judgeSystemPrompt, parseJudgeAnswer, JUDGE_MAX_TOKENS, JUDGE_TIMEOUT_MS, type JudgeRequest } from './judge'
+import { buildJudgePrompt, judgeSystemPrompt, parseJudgeAnswer, JUDGE_EFFORT, JUDGE_MAX_TOKENS, JUDGE_TIMEOUT_MS, type JudgeRequest } from './judge'
 import { policyVersion, type PolicyRule } from './policy'
 import { namesProcesses, processTargets, resolveTargets, treeLines, type ProcessSnapshot } from './processes'
 import { analyzePowerShell, clearPowerShell } from './powershell'
@@ -95,7 +95,7 @@ export function decideShell(tool: ShellTool, command: string, context: ScopeCont
 export type ModelReply = { isAnswered: true; text: string; usage?: { output_tokens?: number; input_tokens?: number; cache_read_input_tokens?: number } } | { isAnswered: false; reason: string }
 
 export type JudgeHost = {
-  complete: (request: { system: string; prompt: string; maxTokens: number; timeoutMs: number }) => Promise<ModelReply>
+  complete: (request: { system: string; prompt: string; maxTokens: number; timeoutMs: number; effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' }) => Promise<ModelReply>
   // The process snapshot (cached by the host); undefined when it can't be taken.
   snapshot: () => Promise<ProcessSnapshot | undefined>
   // Why the judge is paused (the 5-hour usage cap), if it is.
@@ -177,7 +177,7 @@ export async function decideCall(call: ShellCall, options: ShellOptions & { judg
   state.calls.set(call.budgetKey, spent + 1)
   event.judged = true
   const reply = await host
-    .complete({ system: judgeSystemPrompt(call.policy), prompt: buildJudgePrompt(request, call.context.home), maxTokens: JUDGE_MAX_TOKENS, timeoutMs: JUDGE_TIMEOUT_MS })
+    .complete({ system: judgeSystemPrompt(call.policy), prompt: buildJudgePrompt(request, call.context.home), maxTokens: JUDGE_MAX_TOKENS, timeoutMs: JUDGE_TIMEOUT_MS, effort: JUDGE_EFFORT })
     .catch((error: unknown): ModelReply => ({ isAnswered: false, reason: error instanceof Error ? error.message : String(error) }))
   if (!reply.isAnswered) return { kind: 'refuse', via: 'fail-closed', reason: `the policy judge gave no answer (${reply.reason})`, ...shape }
   if (reply.usage) event.usage = { input: reply.usage.input_tokens ?? 0, output: reply.usage.output_tokens ?? 0, cacheRead: reply.usage.cache_read_input_tokens ?? 0 }

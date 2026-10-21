@@ -867,7 +867,7 @@ async function restoreScope($: EngineInterface, root: string): Promise<void> {
 // 4 s: the whole tool.call hook has a 10 s budget, and the snapshot may take 1-2 s.
 function judgeHost($: EngineInterface): JudgeHost {
   return {
-    complete: request => $.model.complete({ model: settings.model, system: request.system, prompt: request.prompt, maxTokens: request.maxTokens, timeoutMs: request.timeoutMs }) as Promise<ModelReply>,
+    complete: request => $.model.complete({ model: settings.model, system: request.system, prompt: request.prompt, maxTokens: request.maxTokens, timeoutMs: request.timeoutMs, effort: request.effort }) as Promise<ModelReply>,
     snapshot: () => processSnapshot($),
     pausedBecause: () => judgePause($),
   }

@@ -42,8 +42,8 @@ describe('stage 1: the inline-code ban and the scope guard', () => {
 })
 
 // A fake model: answers `answer`, and records what it was sent.
-function fakeHost(answer: string | ModelReply, snapshot = SNAPSHOT): JudgeHost & { calls: Array<{ system: string; prompt: string; maxTokens: number; timeoutMs: number }> } {
-  const calls: Array<{ system: string; prompt: string; maxTokens: number; timeoutMs: number }> = []
+function fakeHost(answer: string | ModelReply, snapshot = SNAPSHOT): JudgeHost & { calls: Array<{ system: string; prompt: string; maxTokens: number; timeoutMs: number; effort?: string }> } {
+  const calls: Array<{ system: string; prompt: string; maxTokens: number; timeoutMs: number; effort?: string }> = []
   return {
     calls,
     complete: async request => {
@@ -88,6 +88,7 @@ describe('stage 2: the fast path, the complexity rule and the judge', () => {
         expect(outcome).toBe(fixture.outcome!)
         for (const text of fixture.promptHas ?? []) expect(host.calls[0]!.prompt).toContain(text)
         expect(host.calls[0]!.maxTokens).toBe(100)
+        expect(host.calls[0]!.effort).toBe('low')
       }
     })
   }
@@ -110,7 +111,9 @@ describe('the judge fails closed', () => {
     const cut = await refusalOf({ isAnswered: true, text: 'ALLOW because it only reads the', usage: { output_tokens: 100 } })
     expect(cut).toEqual({ kind: 'refuse', via: 'fail-closed', reason: 'the policy judge gave no usable answer (the answer was cut off at the token limit: "ALLOW because it only reads the")' })
     expect(parseJudgeAnswer('ALLOW', 40).kind).toBe('allow')
-    expect(parseJudgeAnswer('ALLOW', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit: "ALLOW"' })
+    expect(parseJudgeAnswer('ALLOW', 100)).toEqual({ kind: 'allow' })
+    expect(parseJudgeAnswer('ALLOW ', 99).kind).toBe('allow')
+    expect(parseJudgeAnswer('ALLOW\n\nbut it reads', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit: "ALLOW but it reads"' })
     expect(parseJudgeAnswer('', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit' })
     const long = parseJudgeAnswer(`Thinking it over: stops processes by name\n${'x'.repeat(300)}`, 100)
     expect(long.kind).toBe('malformed')
@@ -133,13 +136,27 @@ describe('the judge fails closed', () => {
     expect(reason.length).toBe(121)
     // A cut-off ALLOW is never an allow, nor an empty answer or a bare prefix.
     expect(parseJudgeAnswer('ALLOW, since it only reads the status of', 100).kind).toBe('malformed')
-    expect(parseJudgeAnswer('ALLOW', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('ALLOW\n\nbut…', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('ALLOWING this', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('Allow', 100).kind).toBe('malformed')
     expect(parseJudgeAnswer('', 100).kind).toBe('malformed')
     expect(parseJudgeAnswer('BLOCK:   \n  ', 100).kind).toBe('malformed')
     expect(parseJudgeAnswer('  BLOCK: x', 100)).toEqual({ kind: 'block', reason: 'x…' })
     expect(parseJudgeAnswer('Blocked: x', 100).kind).toBe('malformed')
     // Not cut off, the strict reading holds: a two-line BLOCK is no answer.
     expect(parseJudgeAnswer('BLOCK: x\ny', 40).kind).toBe('malformed')
+  })
+  test('an exact ALLOW at the token limit is an allow: thinking counts toward the output tokens, and the verdict is complete', async () => {
+    // The call is asked for low effort, and a reply that used the whole budget is still taken when it is exactly ALLOW.
+    const host = fakeHost({ isAnswered: true, text: 'ALLOW', usage: { output_tokens: 100 } })
+    const decision = await decideCall(callOf(judged), SETTINGS, newJudgeState(), host)
+    expect(decision).toEqual({ kind: 'allow', via: 'judge' })
+    expect(host.calls[0]!.effort).toBe('low')
+    expect(host.calls[0]!.maxTokens).toBe(100)
+    for (const text of ['ALLOW\n\nbut…', 'ALLOWING this', '', 'Allow']) {
+      const cut = await refusalOf({ isAnswered: true, text, usage: { output_tokens: 100 } })
+      expect([text, cut.kind, cut.kind === 'refuse' ? cut.via : '']).toEqual([text, 'refuse', 'fail-closed'])
+    }
   })
   test('the prompt asks for the offending part, never the whole command', () => {
     const system = judgeSystemPrompt(assemblePolicy([]))

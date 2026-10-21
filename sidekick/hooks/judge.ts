@@ -11,14 +11,17 @@
 //
 // The answer must be exactly `ALLOW` or `BLOCK: <reason>`; anything else
 // (empty, malformed, cut off at the token limit) is no answer, and the guard
-// fails closed on it. One exception: an answer cut off after it already said
-// `BLOCK:` is a block, its reason cut short.
+// fails closed on it. Two exceptions at the token limit: an answer cut off
+// after it already said `BLOCK:` is a block, its reason cut short, and an
+// answer that is exactly `ALLOW` is an allow (see parseJudgeAnswer).
 
 import { policyLines, type PolicyRule } from './policy'
 import { REDACTED, redactSecrets } from './secrets'
 
 export const JUDGE_MAX_TOKENS = 100
 export const JUDGE_TIMEOUT_MS = 4000
+// The judge's thinking effort: a one-word verdict needs none to speak of.
+export const JUDGE_EFFORT = 'low' as const
 export const RECENT_COMMANDS = 5
 const RECENT_COMMAND_LIMIT = 200
 const COMMAND_LIMIT = 3000
@@ -152,9 +155,14 @@ function cutOffVerdict(text: string, prefix: 'BLOCK:' | 'WARN:'): string | undef
 
 // Exactly `ALLOW`, or `BLOCK: <reason>` on one line. An answer that used the
 // whole token budget may be cut off: not an answer, unless it had already
-// said BLOCK (then it is a block, its reason cut short).
+// said BLOCK (then it is a block, its reason cut short), or its whole text is
+// exactly `ALLOW`. The model's thinking counts toward output_tokens, so a
+// complete one-word verdict can still land at the cap; the strict match is
+// what makes it complete (`ALLOW` plus anything else, or a longer word that
+// starts with it, stays no answer).
 export function parseJudgeAnswer(text: string, outputTokens?: number, maxTokens = JUDGE_MAX_TOKENS): JudgeAnswer {
   if (outputTokens !== undefined && outputTokens >= maxTokens) {
+    if (text.trim() === 'ALLOW') return { kind: 'allow' }
     const reason = cutOffVerdict(text, 'BLOCK:')
     return reason === undefined ? { kind: 'malformed', why: cutOffWhy(text) } : { kind: 'block', reason }
   }
