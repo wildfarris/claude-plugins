@@ -16,7 +16,7 @@
 import { policyLines, type PolicyRule } from './policy'
 import { REDACTED, redactSecrets } from './secrets'
 
-export const JUDGE_MAX_TOKENS = 40
+export const JUDGE_MAX_TOKENS = 100
 export const JUDGE_TIMEOUT_MS = 4000
 export const RECENT_COMMANDS = 5
 const RECENT_COMMAND_LIMIT = 200
@@ -126,10 +126,19 @@ export function buildJudgePrompt(request: JudgeRequest, home?: string): string {
 
 export type JudgeAnswer = { kind: 'allow' } | { kind: 'block'; reason: string } | { kind: 'malformed'; why: string }
 
+// What a cut-off answer says in its `why`: the start of what the model wrote,
+// on one line, so the owner sees what it was saying. Still no answer.
+const CUT_OFF_SHOWN = 120
+export function cutOffWhy(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  const shown = flat.length > CUT_OFF_SHOWN ? `${flat.slice(0, CUT_OFF_SHOWN).trimEnd()}…` : flat
+  return shown === '' ? 'the answer was cut off at the token limit' : `the answer was cut off at the token limit: "${shown}"`
+}
+
 // Exactly `ALLOW`, or `BLOCK: <reason>` on one line. An answer that used the
 // whole token budget may be cut off: not an answer.
 export function parseJudgeAnswer(text: string, outputTokens?: number, maxTokens = JUDGE_MAX_TOKENS): JudgeAnswer {
-  if (outputTokens !== undefined && outputTokens >= maxTokens) return { kind: 'malformed', why: 'the answer was cut off at the token limit' }
+  if (outputTokens !== undefined && outputTokens >= maxTokens) return { kind: 'malformed', why: cutOffWhy(text) }
   const trimmed = text.trim()
   if (trimmed === 'ALLOW') return { kind: 'allow' }
   const block = /^BLOCK: ([^\n]{1,200})$/.exec(trimmed)
@@ -143,7 +152,7 @@ export function parseJudgeAnswer(text: string, outputTokens?: number, maxTokens 
 // for what only the sequence shows. Advice for the main session, never a
 // block (the commands have run).
 
-export const REVIEW_MAX_TOKENS = 80
+export const REVIEW_MAX_TOKENS = 160
 export const REVIEW_TIMEOUT_MS = 8000
 const REVIEW_COMMANDS = 200
 
@@ -177,7 +186,7 @@ export function buildStopReviewPrompt(request: { commands: readonly string[]; ag
 export type ReviewAnswer = { kind: 'ok' } | { kind: 'warn'; reason: string } | { kind: 'malformed'; why: string }
 
 export function parseReviewAnswer(text: string, outputTokens?: number, maxTokens = REVIEW_MAX_TOKENS): ReviewAnswer {
-  if (outputTokens !== undefined && outputTokens >= maxTokens) return { kind: 'malformed', why: 'the answer was cut off at the token limit' }
+  if (outputTokens !== undefined && outputTokens >= maxTokens) return { kind: 'malformed', why: cutOffWhy(text) }
   const trimmed = text.trim()
   if (trimmed === 'OK') return { kind: 'ok' }
   const warn = /^WARN: ([^\n]{1,300})$/.exec(trimmed)

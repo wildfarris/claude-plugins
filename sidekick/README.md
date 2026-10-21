@@ -113,7 +113,7 @@ The system prompt holds the instructions and the policy, byte for byte the same 
 
 The **process snapshot** is one query: on Windows `Get-CimInstance Win32_Process` through `powershell.exe` (about 1.2 s for some 360 processes), elsewhere `ps -A` (which reads `/proc` on Linux), cached for 2 s. From it the judge sees this session's own process tree (the processes descended from the Claude Code process: id, parent, name, start time and command line cut to 200 characters, newest first, at most 25) and every process the command names by id or program name, each marked inside or outside the tree: `msedge.exe (by name): 9 running; 1 inside this session's process tree (pid 4200); 8 outside it`. If the snapshot can't be taken the judge is told so.
 
-The answer must be exactly `ALLOW` or `BLOCK: <reason in at most 15 words>`, within 40 tokens and 4 seconds. Anything else fails closed: a timeout, an API error, an empty or malformed answer, or one that used the whole 40 tokens (it may be cut off). An unparsed answer is never taken as an allow.
+The answer must be exactly `ALLOW` or `BLOCK: <reason in at most 15 words>`, within 100 tokens and 4 seconds. Anything else fails closed: a timeout, an API error, an empty or malformed answer, or one that used the whole 100 tokens (it may be cut off; the refusal then quotes the first 120 characters of what the judge wrote). An unparsed answer is never taken as an allow.
 
 ### Asking, denying and the way out
 
@@ -123,7 +123,7 @@ The answer must be exactly `ALLOW` or `BLOCK: <reason in at most 15 words>`, wit
 
 ### The budget and what it costs
 
-The judge's call goes through the engine's own model call (`$.model.complete`), signed in as the Claude Code session is: on a subscription it counts against that plan's usage; on an API key (`ANTHROPIC_API_KEY`) it is billed to that key, like every other sidekick model call. There is no separate key. The model is the `model` setting (`claude-haiku-5-5` by default). A call sends about one to two thousand tokens (more with a process snapshot) and gets back at most 40.
+The judge's call goes through the engine's own model call (`$.model.complete`), signed in as the Claude Code session is: on a subscription it counts against that plan's usage; on an API key (`ANTHROPIC_API_KEY`) it is billed to that key, like every other sidekick model call. There is no separate key. The model is the `model` setting (`claude-haiku-5-5` by default). A call sends about one to two thousand tokens (more with a process snapshot) and gets back at most 100.
 
 Hard ceilings, each failing closed (an agent is refused, you are asked):
 

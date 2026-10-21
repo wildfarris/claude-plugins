@@ -87,7 +87,7 @@ describe('stage 2: the fast path, the complexity rule and the judge', () => {
         expect(host.calls.length).toBe(1)
         expect(outcome).toBe(fixture.outcome!)
         for (const text of fixture.promptHas ?? []) expect(host.calls[0]!.prompt).toContain(text)
-        expect(host.calls[0]!.maxTokens).toBe(40)
+        expect(host.calls[0]!.maxTokens).toBe(100)
       }
     })
   }
@@ -107,9 +107,18 @@ describe('the judge fails closed', () => {
     expect(((await refusalOf({ isAnswered: false, reason: 'aborted' })) as { via: string }).via).toBe('fail-closed')
     const host: JudgeHost = { complete: async () => Promise.reject(new Error('network down')), snapshot: async () => undefined }
     expect(((await decideCall(callOf(judged), SETTINGS, newJudgeState(), host)) as { via: string }).via).toBe('fail-closed')
-    const cut = await refusalOf({ isAnswered: true, text: 'BLOCK: changes the', usage: { output_tokens: 40 } })
-    expect(cut).toEqual({ kind: 'refuse', via: 'fail-closed', reason: 'the policy judge gave no usable answer (the answer was cut off at the token limit)' })
-    expect(parseJudgeAnswer('ALLOW', 40)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit' })
+    const cut = await refusalOf({ isAnswered: true, text: 'BLOCK: changes the', usage: { output_tokens: 100 } })
+    expect(cut).toEqual({ kind: 'refuse', via: 'fail-closed', reason: 'the policy judge gave no usable answer (the answer was cut off at the token limit: "BLOCK: changes the")' })
+    expect(parseJudgeAnswer('ALLOW', 40).kind).toBe('allow')
+    expect(parseJudgeAnswer('ALLOW', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit: "ALLOW"' })
+    expect(parseJudgeAnswer('', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit' })
+    const long = parseJudgeAnswer(`BLOCK: stops processes by name\n${'x'.repeat(300)}`, 100)
+    expect(long.kind).toBe('malformed')
+    const why = (long as { why: string }).why
+    expect(why).not.toContain('\n')
+    expect(why.startsWith('the answer was cut off at the token limit: "BLOCK: stops processes by name xxx')).toBe(true)
+    expect(why.endsWith('…"')).toBe(true)
+    expect(why.length).toBeLessThan(200)
   })
   test('for the owner too: asked, never let through', async () => {
     const owner = { ...callOf(judged), isAgent: false, budgetKey: 'owner' }
