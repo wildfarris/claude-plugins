@@ -5,7 +5,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { buildJudgePrompt, judgeSystemPrompt, parseJudgeAnswer, redactForJudge } from '../hooks/judge'
 import { assemblePolicy } from '../hooks/policy'
-import { decideCall, decideShell, newJudgeState, outcomeFor, type JudgeHost, type ModelReply, type ShellCall, type ShellDecision } from '../hooks/policy-guard'
+import { decideCall, decideShell, newJudgeState, outcomeFor, policyDenial, policyQuestion, policyToast, type JudgeHost, type ModelReply, type ShellCall, type ShellDecision } from '../hooks/policy-guard'
 import { checkFileEdit, type ScopeContext } from '../hooks/scope-guard'
 import { FIXTURES, FOLDER, HOME, ROOT, SNAPSHOT, type Expect, type GuardFixture } from './guard-fixtures'
 
@@ -107,18 +107,104 @@ describe('the judge fails closed', () => {
     expect(((await refusalOf({ isAnswered: false, reason: 'aborted' })) as { via: string }).via).toBe('fail-closed')
     const host: JudgeHost = { complete: async () => Promise.reject(new Error('network down')), snapshot: async () => undefined }
     expect(((await decideCall(callOf(judged), SETTINGS, newJudgeState(), host)) as { via: string }).via).toBe('fail-closed')
-    const cut = await refusalOf({ isAnswered: true, text: 'BLOCK: changes the', usage: { output_tokens: 100 } })
-    expect(cut).toEqual({ kind: 'refuse', via: 'fail-closed', reason: 'the policy judge gave no usable answer (the answer was cut off at the token limit: "BLOCK: changes the")' })
+    const cut = await refusalOf({ isAnswered: true, text: 'ALLOW because it only reads the', usage: { output_tokens: 100 } })
+    expect(cut).toEqual({ kind: 'refuse', via: 'fail-closed', reason: 'the policy judge gave no usable answer (the answer was cut off at the token limit: "ALLOW because it only reads the")' })
     expect(parseJudgeAnswer('ALLOW', 40).kind).toBe('allow')
     expect(parseJudgeAnswer('ALLOW', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit: "ALLOW"' })
     expect(parseJudgeAnswer('', 100)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit' })
-    const long = parseJudgeAnswer(`BLOCK: stops processes by name\n${'x'.repeat(300)}`, 100)
+    const long = parseJudgeAnswer(`Thinking it over: stops processes by name\n${'x'.repeat(300)}`, 100)
     expect(long.kind).toBe('malformed')
     const why = (long as { why: string }).why
     expect(why).not.toContain('\n')
-    expect(why.startsWith('the answer was cut off at the token limit: "BLOCK: stops processes by name xxx')).toBe(true)
+    expect(why.startsWith('the answer was cut off at the token limit: "Thinking it over: stops processes by name xxx')).toBe(true)
     expect(why.endsWith('…"')).toBe(true)
     expect(why.length).toBeLessThan(200)
+  })
+  test('an answer cut off after it said BLOCK: is a block, its reason cut short; any other cut-off answer is none', async () => {
+    // The judge quoting the whole command in its reason ran into the token limit.
+    const cut = await refusalOf({ isAnswered: true, text: 'BLOCK: changes the', usage: { output_tokens: 100 } })
+    expect(cut).toEqual({ kind: 'refuse', via: 'judge', reason: 'changes the…' })
+    const long = parseJudgeAnswer(`BLOCK: reads outside the target folders\n(ls ~/git; ${'x'.repeat(300)}`, 100)
+    expect(long.kind).toBe('block')
+    const reason = (long as { reason: string }).reason
+    expect(reason).not.toContain('\n')
+    expect(reason.startsWith('reads outside the target folders (ls ~/git; xxx')).toBe(true)
+    expect(reason.endsWith('…')).toBe(true)
+    expect(reason.length).toBe(121)
+    // A cut-off ALLOW is never an allow, nor an empty answer or a bare prefix.
+    expect(parseJudgeAnswer('ALLOW, since it only reads the status of', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('ALLOW', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('BLOCK:   \n  ', 100).kind).toBe('malformed')
+    expect(parseJudgeAnswer('  BLOCK: x', 100)).toEqual({ kind: 'block', reason: 'x…' })
+    expect(parseJudgeAnswer('Blocked: x', 100).kind).toBe('malformed')
+    // Not cut off, the strict reading holds: a two-line BLOCK is no answer.
+    expect(parseJudgeAnswer('BLOCK: x\ny', 40).kind).toBe('malformed')
+  })
+  test('the prompt asks for the offending part, never the whole command', () => {
+    const system = judgeSystemPrompt(assemblePolicy([]))
+    expect(system).toContain('never quote or restate the whole command')
+    expect(system).toContain('BLOCK: <reason in at most 15 words>')
+    expect(judgeSystemPrompt(assemblePolicy([]))).toBe(system)
+    const prompt = buildJudgePrompt({ tool: 'Bash', command: 'ls', uncleared: ['ls'], cwd: '/w', folders: [], agent: 'x', recent: [] })
+    expect(prompt.endsWith('naming the offending part briefly, never the whole command.')).toBe(true)
+  })
+  test('on a compound or long command, the refusal says to split it rather than retry it', async () => {
+    const sweep = 'git status --short; ls ~/git; node --version; source ~/.profile; sudo -n cat /etc/os-release; grep -c x README.md; sed -n 1,5p README.md'
+    const cutOff: ModelReply = { isAnswered: true, text: 'The command chains several reads and one of them', usage: { output_tokens: 100 } }
+    const decision = await decideCall({ ...callOf(judged), command: sweep }, SETTINGS, newJudgeState(), fakeHost(cutOff))
+    expect(decision).toEqual({
+      kind: 'refuse',
+      via: 'fail-closed',
+      reason: 'the policy judge gave no usable answer (the answer was cut off at the token limit: "The command chains several reads and one of them")',
+      shape: { parts: 7, length: sweep.length, uncleared: ['node --version', 'source ~/.profile', 'sudo -n cat /etc/os-release'] },
+    })
+    const refusal = decision as Parameters<typeof policyDenial>[0]
+    const agent = policyDenial(refusal, true)
+    expect(agent).toContain('"The command chains several reads and one of them"')
+    expect(agent).toContain(`it is compound (7 parts, ${sweep.length} characters)`)
+    expect(agent).toContain("The parts it couldn't clear in code: `node --version`, `source ~/.profile`, `sudo -n cat /etc/os-release`.")
+    expect(agent).toContain("Don't retry this command as it is: split it into separate simple commands, one step each.")
+    expect(agent).toContain('Read-only commands (git status or log, ls, cat, grep) clear in code without the judge')
+    expect(agent).toContain('stop and report.')
+    expect(agent).not.toContain('Retry once')
+    expect(agent).not.toMatch(/used up|token budget/)
+    expect(policyDenial(refusal, false)).toContain('If a part is still blocked on its own, tell the owner.')
+    const question = policyQuestion(refusal)
+    expect(question).toContain(`The command is compound (7 parts, ${sweep.length} characters), too much to judge as one. Allow it anyway?`)
+    expect(question).toContain('Claude is told to run the parts as separate simple commands')
+    expect(policyToast('Bash', refusal)).toContain('and the agent is told to split it.')
+
+    // An error or a timeout reads the same; a long one-part command is "long".
+    const errored = await decideCall({ ...callOf(judged), command: sweep }, SETTINGS, newJudgeState(), fakeHost({ isAnswered: false, reason: 'timed out' }))
+    expect(policyDenial(errored as Parameters<typeof policyDenial>[0], true)).toContain("Don't retry this command as it is")
+    const longOne = `npm run lint -- ${'src/a.ts '.repeat(40)}`.trim()
+    const long = await decideCall({ ...callOf(judged), command: longOne }, SETTINGS, newJudgeState(), fakeHost(''))
+    expect(policyDenial(long as Parameters<typeof policyDenial>[0], true)).toContain(`it is long (1 part, ${longOne.length} characters)`)
+
+    // More than three uncleared parts: the first three, each cut short, and a count.
+    const many = await decideCall({ ...callOf(judged), command: `make ${'d'.repeat(120)}; make b; make c; make e` }, SETTINGS, newJudgeState(), fakeHost(''))
+    const listed = policyDenial(many as Parameters<typeof policyDenial>[0], true)
+    expect(listed).toContain(`\`make ${'d'.repeat(75)}…\`, \`make b\`, \`make c\` and 1 more.`)
+
+    // A simple command keeps the plain wording: retry once, then report.
+    const simple = await decideCall(callOf(judged), SETTINGS, newJudgeState(), fakeHost(''))
+    expect((simple as { shape?: unknown }).shape).toBeUndefined()
+    expect(policyDenial(simple as Parameters<typeof policyDenial>[0], true)).toBe('Blocked by the sidekick guard: the policy judge gave no usable answer (the answer was empty), and it fails closed. Retry once; if it is blocked again, stop and report.')
+    expect(policyQuestion(simple as Parameters<typeof policyDenial>[0])).toBe('Sidekick guard: the policy judge gave no usable answer (the answer was empty). Allow it anyway?')
+  })
+  test('the complexity refusal speaks with the same voice', async () => {
+    const decision = await decideCall({ ...callOf(judged), command: 'make a && make b && make c && make d && make e && git status' }, SETTINGS, newJudgeState(), fakeHost('NOT EXPECTED'))
+    const refusal = decision as Parameters<typeof policyDenial>[0]
+    expect(refusal.via).toBe('complexity')
+    const denial = policyDenial(refusal, true)
+    expect(denial).toContain("it has 5 parts the guard can't clear on its own (the limit is 4), so the judge was not asked.")
+    expect(denial).toContain("The parts it couldn't clear in code: `make a`, `make b`, `make c` and 2 more.")
+    expect(denial).toContain("Don't retry this command as it is: split it into separate simple commands, one step each.")
+    expect(policyQuestion(refusal)).toContain('Claude is told to run the parts as separate simple commands')
+    // An opaque construct keeps its own wording.
+    const opaque = await decideCall({ ...callOf(judged), command: "eval 'ls'" }, SETTINGS, newJudgeState(), fakeHost('NOT EXPECTED'))
+    expect(policyDenial(opaque as Parameters<typeof policyDenial>[0], true)).toContain('Split it into smaller commands, one step each, so each can be checked.')
   })
   test('for the owner too: asked, never let through', async () => {
     const owner = { ...callOf(judged), isAgent: false, budgetKey: 'owner' }

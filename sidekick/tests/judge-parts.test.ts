@@ -90,9 +90,15 @@ describe('the stop review and the metrics', () => {
     expect(parseReviewAnswer('OK')).toEqual({ kind: 'ok' })
     expect(parseReviewAnswer('WARN: retried a refused kill as a script')).toEqual({ kind: 'warn', reason: 'retried a refused kill as a script' })
     expect(parseReviewAnswer('ok').kind).toBe('malformed')
-    expect(parseReviewAnswer('WARN: x', 160).kind).toBe('malformed')
     expect(parseReviewAnswer('WARN: x', 80).kind).toBe('warn')
-    expect(parseReviewAnswer('WARN: wrote a script then\nran it', 160)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit: "WARN: wrote a script then ran it"' })
+    // Cut off after WARN: still a warning, its reason on one line and marked cut short.
+    expect(parseReviewAnswer('WARN: x', 160)).toEqual({ kind: 'warn', reason: 'x…' })
+    expect(parseReviewAnswer('WARN: wrote a script then\nran it', 160)).toEqual({ kind: 'warn', reason: 'wrote a script then ran it…' })
+    expect((parseReviewAnswer(`WARN: ${'y'.repeat(300)}`, 160) as { reason: string }).reason).toBe(`${'y'.repeat(120)}…`)
+    // Anything else cut off is no answer: a cut-off OK is never taken as OK.
+    expect(parseReviewAnswer('OK, nothing in the sequence', 160)).toEqual({ kind: 'malformed', why: 'the answer was cut off at the token limit: "OK, nothing in the sequence"' })
+    expect(parseReviewAnswer('WARN:  ', 160).kind).toBe('malformed')
+    expect(parseReviewAnswer('', 160).kind).toBe('malformed')
     expect(REVIEW_MAX_TOKENS).toBe(160)
     expect(JUDGE_MAX_TOKENS).toBe(100)
     expect(reviewNote('O1', { kind: 'ok' })).toBeUndefined()

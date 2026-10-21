@@ -97,6 +97,7 @@ import {
   newJudgeState,
   policyDenial,
   policyQuestion,
+  policyToast,
   shellCommandOf,
   type JudgeEvent,
   type JudgeHost,
@@ -1192,7 +1193,7 @@ async function guardToolCall(
       // Then the judge.
       const decision = await judgeShellCall($, tool, command, context, origin)
       if (decision.kind === 'refuse' && decision.via !== 'inline' && decision.via !== 'scope') {
-        if (isAgent) $.ui.toast(`Policy guard refused ${tool}: ${decision.reason}.`)
+        if (isAgent) $.ui.toast(policyToast(tool, decision))
         return isAgent ? policyDenial(decision, true) : { ask: policyQuestion(decision), deny: policyDenial(decision, false) }
       }
     }

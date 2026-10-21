@@ -11,7 +11,8 @@
 //
 // The answer must be exactly `ALLOW` or `BLOCK: <reason>`; anything else
 // (empty, malformed, cut off at the token limit) is no answer, and the guard
-// fails closed on it.
+// fails closed on it. One exception: an answer cut off after it already said
+// `BLOCK:` is a block, its reason cut short.
 
 import { policyLines, type PolicyRule } from './policy'
 import { REDACTED, redactSecrets } from './secrets'
@@ -33,6 +34,7 @@ const JUDGE_INSTRUCTIONS = [
   '- If you cannot tell whether the command breaks the policy, answer BLOCK.',
   '',
   'Answer with exactly one line and nothing else: ALLOW, or BLOCK: <reason in at most 15 words>.',
+  'A BLOCK reason names the offending part briefly; never quote or restate the whole command. For example: BLOCK: stops a process outside this session (pkill node)',
 ].join('\n')
 
 export function judgeSystemPrompt(policy: readonly PolicyRule[]): string {
@@ -118,7 +120,7 @@ export function buildJudgePrompt(request: JudgeRequest, home?: string): string {
           ].join('\n')
     parts.push(section('processes', body))
   }
-  parts.push('Judge the command in <untrusted-command> against the policy. Answer exactly ALLOW, or BLOCK: <reason in at most 15 words>.')
+  parts.push('Judge the command in <untrusted-command> against the policy. Answer exactly ALLOW, or BLOCK: <reason in at most 15 words>, naming the offending part briefly, never the whole command.')
   return parts.join('\n\n')
 }
 
@@ -129,16 +131,33 @@ export type JudgeAnswer = { kind: 'allow' } | { kind: 'block'; reason: string } 
 // What a cut-off answer says in its `why`: the start of what the model wrote,
 // on one line, so the owner sees what it was saying. Still no answer.
 const CUT_OFF_SHOWN = 120
+const flatten = (text: string) => text.replace(/\s+/g, ' ').trim()
 export function cutOffWhy(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
+  const flat = flatten(text)
   const shown = flat.length > CUT_OFF_SHOWN ? `${flat.slice(0, CUT_OFF_SHOWN).trimEnd()}…` : flat
   return shown === '' ? 'the answer was cut off at the token limit' : `the answer was cut off at the token limit: "${shown}"`
 }
 
+// A cut-off answer that had already given a refusing verdict (`BLOCK:`, or
+// the review's `WARN:`) keeps it: its reason on one line, at most 120
+// characters, ending in "…" to show it was cut off. Undefined for anything
+// else, which stays no answer (a cut-off `ALLOW` or `OK` is never taken).
+function cutOffVerdict(text: string, prefix: 'BLOCK:' | 'WARN:'): string | undefined {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith(prefix)) return undefined
+  const reason = flatten(trimmed.slice(prefix.length))
+  if (reason === '') return undefined
+  return `${reason.length > CUT_OFF_SHOWN ? reason.slice(0, CUT_OFF_SHOWN).trimEnd() : reason}…`
+}
+
 // Exactly `ALLOW`, or `BLOCK: <reason>` on one line. An answer that used the
-// whole token budget may be cut off: not an answer.
+// whole token budget may be cut off: not an answer, unless it had already
+// said BLOCK (then it is a block, its reason cut short).
 export function parseJudgeAnswer(text: string, outputTokens?: number, maxTokens = JUDGE_MAX_TOKENS): JudgeAnswer {
-  if (outputTokens !== undefined && outputTokens >= maxTokens) return { kind: 'malformed', why: cutOffWhy(text) }
+  if (outputTokens !== undefined && outputTokens >= maxTokens) {
+    const reason = cutOffVerdict(text, 'BLOCK:')
+    return reason === undefined ? { kind: 'malformed', why: cutOffWhy(text) } : { kind: 'block', reason }
+  }
   const trimmed = text.trim()
   if (trimmed === 'ALLOW') return { kind: 'allow' }
   const block = /^BLOCK: ([^\n]{1,200})$/.exec(trimmed)
@@ -186,7 +205,10 @@ export function buildStopReviewPrompt(request: { commands: readonly string[]; ag
 export type ReviewAnswer = { kind: 'ok' } | { kind: 'warn'; reason: string } | { kind: 'malformed'; why: string }
 
 export function parseReviewAnswer(text: string, outputTokens?: number, maxTokens = REVIEW_MAX_TOKENS): ReviewAnswer {
-  if (outputTokens !== undefined && outputTokens >= maxTokens) return { kind: 'malformed', why: cutOffWhy(text) }
+  if (outputTokens !== undefined && outputTokens >= maxTokens) {
+    const reason = cutOffVerdict(text, 'WARN:')
+    return reason === undefined ? { kind: 'malformed', why: cutOffWhy(text) } : { kind: 'warn', reason }
+  }
   const trimmed = text.trim()
   if (trimmed === 'OK') return { kind: 'ok' }
   const warn = /^WARN: ([^\n]{1,300})$/.exec(trimmed)

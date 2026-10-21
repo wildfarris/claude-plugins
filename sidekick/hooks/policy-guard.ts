@@ -14,6 +14,7 @@
 //   7. the policy judge (judge.ts): one call for the whole command; ALLOW
 //      runs, BLOCK is refused, and anything else (an error, a timeout, an
 //      empty, malformed or cut-off answer) is refused too: it fails closed.
+//      On a compound or long command that refusal says to split it.
 //
 // The path rules (globs) need the disk (create or edit) and run beside this
 // in register.tsx.
@@ -52,11 +53,19 @@ export function clearanceOf(tool: ShellTool, command: string, context: ScopeCont
   return tool === 'PowerShell' ? clearPowerShell(command, context) : clearCommand(command, context)
 }
 
+// A command with several parts, or a long one: how many parts the guard read,
+// how long it is, and the parts it couldn't clear in code. Carried by a
+// complexity refusal and a fail-closed one, so the refusal can say to split it.
+export type CommandShape = { parts: number; length: number; uncleared: readonly string[] }
+
+// Past this many characters a one-part command is long.
+export const LONG_COMMAND = 300
+
 export type ShellDecision =
   | { kind: 'allow'; via: 'code' | 'fast-path' | 'cache' | 'judge' | 'off' }
   | { kind: 'refuse'; via: 'inline'; finding: InlineFinding }
   | { kind: 'refuse'; via: 'scope'; verdict: Extract<GuardVerdict, { kind: 'block' }> }
-  | { kind: 'refuse'; via: 'complexity' | 'judge' | 'fail-closed' | 'budget'; reason: string }
+  | { kind: 'refuse'; via: 'complexity' | 'judge' | 'fail-closed' | 'budget'; reason: string; shape?: CommandShape }
   | { kind: 'judge'; reason: string }
 
 // What a decision means for the call: a scope refusal is denied for anyone
@@ -130,9 +139,13 @@ export async function decideCall(call: ShellCall, options: ShellOptions & { judg
   if (clearance.opaque !== undefined) return { kind: 'refuse', via: 'complexity', reason: `it uses ${clearance.opaque}, which the guard can't check` }
   const uncleared = [...new Set(clearance.segments.filter(segment => !segment.isCleared).map(segment => normalizeSegment(segment.text)))].filter(Boolean)
   if (uncleared.length === 0) return { kind: 'allow', via: 'fast-path' }
+  const parts = clearance.segments.length
+  const fullShape: CommandShape = { parts, length: call.command.length, uncleared }
   if (uncleared.length > options.judge.maxSegments) {
-    return { kind: 'refuse', via: 'complexity', reason: `it has ${uncleared.length} parts the guard can't clear on its own (the limit is ${options.judge.maxSegments})` }
+    return { kind: 'refuse', via: 'complexity', reason: `it has ${uncleared.length} parts the guard can't clear on its own (the limit is ${options.judge.maxSegments})`, shape: fullShape }
   }
+  // A judge that gives no answer on a compound or long command: say to split it.
+  const shape = parts > 1 || call.command.length > LONG_COMMAND ? { shape: fullShape } : {}
 
   const version = policyVersion(call.policy)
   const keys = uncleared.map(segment => segmentKey(segment, call.context, version))
@@ -166,10 +179,10 @@ export async function decideCall(call: ShellCall, options: ShellOptions & { judg
   const reply = await host
     .complete({ system: judgeSystemPrompt(call.policy), prompt: buildJudgePrompt(request, call.context.home), maxTokens: JUDGE_MAX_TOKENS, timeoutMs: JUDGE_TIMEOUT_MS })
     .catch((error: unknown): ModelReply => ({ isAnswered: false, reason: error instanceof Error ? error.message : String(error) }))
-  if (!reply.isAnswered) return { kind: 'refuse', via: 'fail-closed', reason: `the policy judge gave no answer (${reply.reason})` }
+  if (!reply.isAnswered) return { kind: 'refuse', via: 'fail-closed', reason: `the policy judge gave no answer (${reply.reason})`, ...shape }
   if (reply.usage) event.usage = { input: reply.usage.input_tokens ?? 0, output: reply.usage.output_tokens ?? 0, cacheRead: reply.usage.cache_read_input_tokens ?? 0 }
   const answer = parseJudgeAnswer(reply.text, reply.usage?.output_tokens)
-  if (answer.kind === 'malformed') return { kind: 'refuse', via: 'fail-closed', reason: `the policy judge gave no usable answer (${answer.why})` }
+  if (answer.kind === 'malformed') return { kind: 'refuse', via: 'fail-closed', reason: `the policy judge gave no usable answer (${answer.why})`, ...shape }
   if (answer.kind === 'block') return { kind: 'refuse', via: 'judge', reason: answer.reason }
   // A verdict that read the process snapshot holds only for that moment.
   if (!usesSnapshot) {
@@ -185,32 +198,77 @@ export async function decideCall(call: ShellCall, options: ShellOptions & { judg
 
 const STOP_AND_REPORT = 'If the task needs it, stop and report that instead of working around it.'
 
+type PolicyRefusal = Extract<ShellDecision, { kind: 'refuse'; via: 'complexity' | 'judge' | 'fail-closed' | 'budget' }>
+
+// A reason as the end of a sentence (a cut-off reason already ends in "…").
+const ended = (reason: string) => (/[.…!?]$/.test(reason) ? reason : `${reason}.`)
+
+const SHOWN_PARTS = 3
+const SHOWN_PART_LENGTH = 80
+
+// What a shape says: "long and compound (14 parts, 512 characters)".
+function sizeOf(shape: CommandShape): string {
+  const kind = shape.parts > 1 && shape.length > LONG_COMMAND ? 'long and compound' : shape.parts > 1 ? 'compound' : 'long'
+  return `${kind} (${shape.parts} ${shape.parts === 1 ? 'part' : 'parts'}, ${shape.length} characters)`
+}
+
+// The parts code couldn't clear: the first few, each cut short.
+function partsList(uncleared: readonly string[]): string {
+  const shown = uncleared.slice(0, SHOWN_PARTS).map(part => `\`${part.length > SHOWN_PART_LENGTH ? `${part.slice(0, SHOWN_PART_LENGTH).trimEnd()}…` : part}\``)
+  const more = uncleared.length - shown.length
+  return `${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}`
+}
+
+// One voice for both refusals that a command should be split: too many
+// uncleared parts, and a judge that gave no answer on a compound command.
+const SPLIT_IT =
+  "Don't retry this command as it is: split it into separate simple commands, one step each. Read-only commands (git status or log, ls, cat, grep) clear in code without the judge, so only the remaining parts need judging, one at a time."
+
+const splitIt = (shape: CommandShape) => `The parts it couldn't clear in code: ${partsList(shape.uncleared)}. ${SPLIT_IT}`
+
 // The denial Claude reads for a refusal other than inline code and scope
 // (those have their own messages).
-export function policyDenial(decision: Extract<ShellDecision, { kind: 'refuse'; via: 'complexity' | 'judge' | 'fail-closed' | 'budget' }>, isAgent: boolean): string {
+export function policyDenial(decision: PolicyRefusal, isAgent: boolean): string {
   const owner = 'Ask the owner: they can run it themselves, or turn the judge off for this session with /scope judge off.'
   switch (decision.via) {
     case 'judge':
-      return `Blocked by the sidekick policy judge: ${decision.reason}. ${isAgent ? STOP_AND_REPORT : owner}`
+      return `Blocked by the sidekick policy judge: ${ended(decision.reason)} ${isAgent ? STOP_AND_REPORT : owner}`
     case 'complexity':
+      if (decision.shape !== undefined) return `Blocked by the sidekick guard: ${decision.reason}, so the judge was not asked. ${splitIt(decision.shape)}`
       return `Blocked by the sidekick guard: ${decision.reason}. Split it into smaller commands, one step each, so each can be checked.`
     case 'budget':
       return `Blocked by the sidekick guard: ${decision.reason}, and it fails closed. ${isAgent ? 'Stop and report; the owner can raise the ceiling (judgeBudgetAgent).' : owner}`
     case 'fail-closed':
+      if (decision.shape !== undefined) {
+        return [
+          `Blocked by the sidekick guard: ${decision.reason}, and it fails closed.`,
+          `The guard couldn't judge this command as one: it is ${sizeOf(decision.shape)}.`,
+          splitIt(decision.shape),
+          `If a part is still blocked on its own, ${isAgent ? 'stop and report.' : 'tell the owner.'}`,
+        ].join(' ')
+      }
       return `Blocked by the sidekick guard: ${decision.reason}, and it fails closed. Retry once; if it is blocked again, ${isAgent ? 'stop and report.' : 'tell the owner.'}`
   }
 }
 
 // The question the owner is asked instead, in their own session.
-export function policyQuestion(decision: Extract<ShellDecision, { kind: 'refuse'; via: 'complexity' | 'judge' | 'fail-closed' | 'budget' }>): string {
+export function policyQuestion(decision: PolicyRefusal): string {
+  const splitNote = 'If you refuse, Claude is told to run the parts as separate simple commands.'
   switch (decision.via) {
     case 'judge':
-      return `Sidekick policy judge: BLOCK: ${decision.reason}. Allow it anyway?`
+      return `Sidekick policy judge: BLOCK: ${ended(decision.reason)} Allow it anyway?`
     case 'complexity':
-      return `Sidekick guard: ${decision.reason}, so the judge was not asked. Allow it anyway?`
+      return `Sidekick guard: ${decision.reason}, so the judge was not asked. Allow it anyway?${decision.shape === undefined ? '' : ` ${splitNote}`}`
     case 'budget':
       return `Sidekick guard: ${decision.reason}. Allow it without the judge?`
     case 'fail-closed':
+      if (decision.shape !== undefined) return `Sidekick guard: ${decision.reason}. The command is ${sizeOf(decision.shape)}, too much to judge as one. Allow it anyway? ${splitNote}`
       return `Sidekick guard: ${decision.reason}. Allow it anyway?`
   }
+}
+
+// The owner's toast when an agent is refused.
+export function policyToast(tool: ShellTool, decision: PolicyRefusal): string {
+  const split = decision.shape === undefined ? '' : `; the command is ${sizeOf(decision.shape)}, and the agent is told to split it`
+  return ended(`Policy guard refused ${tool}: ${decision.reason.replace(/\.$/, '')}${split}`)
 }
