@@ -15,7 +15,7 @@
 
 import type { AdvisorStatus, Council, DocketEntry, DocketFilter, DocketKind, DocketTally, DocketVote, OrderRole } from '../types'
 import { parseCheck } from './advisors'
-import { seatsOf } from './council'
+import { beyondOf, seatsOf } from './council'
 import { conditionAtOf, parseLevels } from './court'
 import { isPathInside } from './paths'
 import { redactSecrets } from './redact'
@@ -34,6 +34,9 @@ export const DOCKET_LIMITS = {
   // A condition, note, reason, option, leave sentence or check.
   line: 1000,
   findings: 1500,
+  // The person's words a sitting carried: each prompt, and Claude's answer's end.
+  words: 2000,
+  answer: 800,
   // Entries the view lists at a time.
   page: 20,
 } as const
@@ -165,11 +168,16 @@ export function consultOutcome(council: Council): string {
 }
 
 // What every sitting records of its council: the votes, abstentions, tally,
-// and the strictness and threshold in effect.
-export function sittingFields(council: Council, replies?: Replies, dispatchCount = 0): Pick<DocketEntry, 'votes' | 'abstentions' | 'tally' | 'strictness' | 'threshold' | 'isDeep' | 'options'> {
+// and the strictness and threshold in effect; and, for a sitting that
+// carried the person's own words, those words and what members said the
+// request adds beyond them.
+export function sittingFields(council: Council, replies?: Replies, dispatchCount = 0): Pick<DocketEntry, 'votes' | 'abstentions' | 'tally' | 'strictness' | 'threshold' | 'isDeep' | 'options' | 'beyond' | 'words'> {
   const votes = votesOf(council, replies, dispatchCount)
   const abstentions = votes.filter(vote => vote.status === 'abstained').map(vote => ({ id: vote.id, title: vote.title, reason: vote.verdict }))
+  const beyond = beyondOf(council)
   return {
+    ...(beyond.length > 0 ? { beyond } : {}),
+    ...(council.words ? { words: { prompts: [...council.words.prompts], ...(council.words.answered ? { answered: council.words.answered } : {}) } } : {}),
     votes,
     ...(abstentions.length > 0 ? { abstentions } : {}),
     tally: tallyOf(council),
@@ -222,6 +230,14 @@ export function sealEntry(entry: DocketEntry): DocketEntry {
     conditions: lines(entry.conditions),
     notes: lines(entry.notes),
     findings: entry.findings === undefined ? undefined : capText(entry.findings, DOCKET_LIMITS.findings),
+    beyond: entry.beyond?.map(item => ({ text: line(item.text), by: lines(item.by)! })),
+    words:
+      entry.words === undefined
+        ? undefined
+        : {
+            prompts: entry.words.prompts.map(prompt => capText(prompt, DOCKET_LIMITS.words)),
+            ...(entry.words.answered !== undefined ? { answered: capText(entry.words.answered, DOCKET_LIMITS.answer) } : {}),
+          },
   }
 }
 
@@ -282,7 +298,18 @@ export function parseDocketLine(line: string): DocketEntry | undefined {
     notes: texts(raw.notes),
     reason: isText(raw.reason) ? raw.reason : undefined,
     findings: isText(raw.findings) ? raw.findings : undefined,
+    beyond: records(raw.beyond)?.flatMap(item => (isText(item.text) ? [{ text: item.text, by: texts(item.by) ?? [] }] : [])),
+    words: wordsOf(raw.words),
   }
+}
+
+// A docket line's words, checked: undefined unless it holds a list of prompts.
+function wordsOf(value: unknown): DocketEntry['words'] {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const prompts = texts(raw.prompts)
+  if (prompts === undefined || prompts.length === 0) return undefined
+  return { prompts, ...(isText(raw.answered) ? { answered: raw.answered } : {}) }
 }
 
 // A file's entries; corrupt lines and lines of another version are skipped.

@@ -11,7 +11,7 @@
 import type { ElementTable, RenderSurface } from 'claude-code'
 
 import type { AdvisorId, AdvisorReport, Council, Roster, Seat } from '../../types'
-import { briefHeadline, concernMeter, seatsOf, type Advisor } from '../council'
+import { beyondOf, beyondText, briefHeadline, concernMeter, seatsOf, type Advisor } from '../council'
 import { RASTER_COLUMNS, RASTER_ROWS, animatedSvg, moodFor, rasterCells, spriteFrame } from '../sprites'
 
 // An advisor's portrait: half-block cells the terminal repaints by key, or an
@@ -261,7 +261,7 @@ export function compactDetailLines(council: Council, bodyColumns: number, bodyRo
   const herald = 2 + council.context.length
   const notice = council.notice ? rowsOf(council.notice, width) : 0
   const footerWidth = FOOTER_LABELS.reduce((sum, label) => sum + label.length + 6, 0)
-  const footer = council.phase === 'done' ? 2 + Math.ceil(footerWidth / width) : 0
+  const footer = council.phase === 'done' ? 2 + Math.ceil(footerWidth / width) + beyondOf(council).length : 0
   const fixed = 1 + topic + options + herald + notice + 1 + footer
   let rows = 0
   let withDetail = 0
@@ -382,6 +382,11 @@ export function councilView(el: ElementTable, props: CouncilViewProps) {
             )}
             {props.onDocket && <Button key="docket" label="docket" plain dimColor onPress={props.onDocket} />}
           </Box>
+          {beyondOf(council).map((entry, index) => (
+            <Text key={`beyond-${index}`} color="warning" wrap={isCompact ? 'truncate-end' : 'wrap'}>
+              {beyondText(entry)}
+            </Text>
+          ))}
           <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
             <Button key="reconsider" label="reconsider with more context" variant="secondary" onPress={props.onReconsider} />
             {props.onReconsiderDeep && <Button key="reconsider-deep" label="reconsider as a brain trust" variant="secondary" onPress={props.onReconsiderDeep} />}

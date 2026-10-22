@@ -60,8 +60,8 @@ describe("a dispatch's leave: the schema", () => {
 describe('leave is ruled on with the plan', () => {
   test('the brief shows it on its dispatch, and the members are asked to weigh it', () => {
     const proposal = read([SYSTEMCTL]) as Proposal
-    expect(proposalBrief(proposal, null)).toContain(`LEAVE ASKED (exceptions to the policy judge's default rules on the machine, for this knight only; rule on them with the plan): "${SYSTEMCTL}"`)
-    expect(proposalBrief(read() as Proposal, null)).not.toContain('LEAVE')
+    expect(proposalBrief(proposal)).toContain(`LEAVE ASKED (exceptions to the policy judge's default rules on the machine, for this knight only; rule on them with the plan): "${SYSTEMCTL}"`)
+    expect(proposalBrief(read() as Proposal)).not.toContain('LEAVE')
     expect(orderAsk(1, false, true)).toContain('Weigh each leave as a widening of what that agent may do on the machine')
     expect(orderAsk(1, false)).not.toContain('LEAVE')
   })

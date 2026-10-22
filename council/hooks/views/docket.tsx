@@ -7,7 +7,7 @@ import type { ElementTable } from 'claude-code'
 
 import type { DocketEntry, DocketFilter, DocketView, DocketVote } from '../../types'
 import { DOCKET_FILTERS, DOCKET_LIMITS, KIND_GLYPH, KIND_LABEL, entryTime, entryTitle, gravestVote, outcomeColor } from '../docket'
-import { concernMeter } from '../council'
+import { beyondText, concernMeter } from '../council'
 
 export type DocketViewProps = {
   view: DocketView
@@ -87,6 +87,15 @@ function entryDetail(el: ElementTable, entry: DocketEntry) {
   return (
     <Box key={`docket-detail-${entry.id}`} flexDirection="column" borderStyle="quote" borderColor={outcomeColor(entry.outcome) ?? 'inactive'} paddingLeft={1} rowGap={0}>
       {line('outcome', outcomeLine, { bold: true, color: outcomeColor(entry.outcome) })}
+      {entry.words !== undefined && (
+        <Box key={`docket-words-${entry.id}`} flexDirection="column">
+          <Text bold dimColor>
+            Your words
+          </Text>
+          {entry.words.prompts.map((prompt, index) => line(`word-${index}`, `“${prompt}”`, { italic: true }))}
+          {entry.words.answered !== undefined && line('answered', `answering Claude: …${entry.words.answered.replace(/^…/, '').replace(/\s+/g, ' ').slice(-200)}`)}
+        </Box>
+      )}
       {entry.question !== undefined && line('question', entry.question, {})}
       {entry.plan !== undefined && line('plan', entry.plan, {})}
       {(entry.options ?? []).map((option, index) => line(`option-${index}`, `${index + 1}. ${option}${entry.tally?.picks ? ` (${entry.tally.picks[index] ?? 0})` : ''}`))}
@@ -99,6 +108,7 @@ function entryDetail(el: ElementTable, entry: DocketEntry) {
           {entry.votes!.map(vote => voteLines(el, entry, vote))}
         </Box>
       )}
+      {(entry.beyond ?? []).map((item, index) => line(`beyond-${index}`, beyondText(item), { color: 'warning' }))}
       {entry.reason !== undefined && entry.reason !== '' && line('reason', `why: ${entry.reason}`, { color: 'error', dimColor: false })}
       {(entry.conditions ?? []).length > 0 && (
         <Box key={`docket-conditions-${entry.id}`} flexDirection="column" marginTop={1}>

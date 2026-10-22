@@ -420,6 +420,7 @@ test('turn.step: each request summed into main, its order (with the level), the 
   expect(of('advisor')).toMatchObject({ model: 'claude-opus-5-5', requests: 2, input: 1300, output: 130 })
   expect(of('other')).toMatchObject({ model: 'claude-sonnet-5', requests: 1, input: 1, output: 1 })
   // The order carries its totals, and the court shows them on its row.
+  await settle()
   const pane = await $.ui.mount({ plugin: 'council', surface: 'desktop', component: 'Pane', requestId: 'council-chamber', props: { title: 'The Council', isFocused: false, bodyColumns: 100, bodyRows: 40 } })
   expect(await pane.find({ text: /660 tok/ })).toBeDefined()
   await pane.unmount()

@@ -63,6 +63,9 @@ export type AdvisorReport = {
   // A consult with options: the option it favors (1-based), 0 for none of
   // them; absent when there were no options.
   choice?: number
+  // What it says the request or plan adds beyond the person's own words (its
+  // BEYOND line), when it gave one. Absent: none.
+  beyond?: string
 }
 
 // One advisor's verdict in a finished round.
@@ -128,7 +131,29 @@ export type Council = {
   // The docket entry that records this sitting (DocketEntry id). Absent until
   // it is recorded, and in councils from before the docket.
   docketId?: string
+  // The person's own words this sitting carries (words.ts): only a sitting
+  // Claude started, and only when some were recorded. Absent otherwise.
+  words?: WordsWindow
 }
+
+// ── The person's own words (words.ts) ─────────────────────────────────────
+
+// What the plugin keeps of the main session, in session state only: the
+// person's last prompts as typed (redacted, at most 2,000 characters each),
+// oldest first, a short one with the end of Claude's answer it followed; and
+// the end of Claude's latest answer.
+export type PersonWords = {
+  prompts: Array<{ text: string; answered?: string }>
+  answer: string | null
+}
+
+// The window a sitting carries: the person's prompts, oldest first, and when
+// the latest is short, the end of Claude's answer it followed.
+export type WordsWindow = { prompts: string[]; answered?: string }
+
+// Something the plan or request adds beyond the person's words, as members
+// said it (identical ones merged), and the members who said it.
+export type Beyond = { text: string; by: string[] }
 
 export type RosterEntry = {
   id: AdvisorId
@@ -349,8 +374,8 @@ export type CourtSummons = {
   orderIds: string[]
   proposal: SummonsProposal
   root: string
-  // The person's petition the plan answered (court mode), for the arbiter.
-  petition: string | null
+  // The first round, with the person's words it carried (Council.words),
+  // which the second round and the arbiter read again.
   council: Council
   replies: Record<AdvisorId, string>
   questions: AdvisorQuestion[]
@@ -380,6 +405,8 @@ export type Ruling = {
   notes?: string[]
   // The advisor the council summoned before ruling, if any.
   summons?: RulingSummons
+  // What members said it adds beyond the person's words, at most 3. Absent: none.
+  beyond?: Beyond[]
   // The docket entry that records it. Absent before the docket.
   docketId?: string
 }
@@ -520,6 +547,10 @@ export type DocketEntry = {
   follows?: string
   // Who recalled the order, or ruled on its leave.
   by?: 'claude' | 'person'
+  // What members said the request adds beyond the person's words, merged.
+  beyond?: Beyond[]
+  // The person's own words the sitting carried, redacted: to review drift later.
+  words?: WordsWindow
 }
 
 // The docket view's kind filter: consults (consult, council, court), orders
@@ -564,6 +595,8 @@ declare module 'claude-code' {
       // The pane shows the docket (/council docket).
       isDocketOpen: boolean
       docket: DocketView | null
+      // The person's last prompts and Claude's last answer in this session.
+      words: PersonWords
     }
   }
 }

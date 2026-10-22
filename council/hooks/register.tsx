@@ -11,7 +11,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelCompleteRequest, ModelCompleteResult, ModelForkRequest, ModelForkResult, ModelUsage, Register, RenderInput, Timer, TurnUsage } from 'claude-code'
 
-import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, CourtSummons, DocketEntry, DocketFilter, DocketView, LearningView, Order, Roster, RulingSummons, Seat } from '../types'
+import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, CourtSummons, DocketEntry, DocketFilter, DocketView, LearningView, Order, PersonWords, Roster, RulingSummons, Seat, WordsWindow } from '../types'
 import {
   ADVISOR_TYPE,
   SUMMONS_TIMEOUT_MS,
@@ -231,6 +231,7 @@ import { councilView, portraitFor, rosterView } from './views/council'
 import { MAX_SEATS, memberId, mergeMembers, parseMemberFile, resolveReference, seatOf, seatedMembers, trimReferences, tuningFiles, tuningSummary, BUILT_IN_MEMBERS, type MemberDefinition } from './members'
 import { conditionAt, mergeProfiles, parseProfile, profileContext, profileReport, type Profile, type ProfileFields, type ProfileSource } from './profile'
 import { removeInside, type RemoveHost } from './remove'
+import { BEYOND_TOKENS, emptyWords, withAnswerRecorded, withPromptRecorded, wordsWindow } from './words'
 import {
   SIDEKICK_LEDGERS,
   STEP_FLUSH_EVERY,
@@ -273,6 +274,9 @@ const isFinishedShownAtom = atom({ plugin: 'council', key: 'isFinishedShown' } a
 const openOrderAtom = atom({ plugin: 'council', key: 'openOrderId' } as const, null as string | null)
 const isDocketOpenAtom = atom({ plugin: 'council', key: 'isDocketOpen' } as const, false)
 const docketAtom = atom({ plugin: 'council', key: 'docket' } as const, null as DocketView | null)
+// The person's last prompts and Claude's last answer in the main session
+// (words.ts), in session state only: a reload keeps them; nothing writes them to disk.
+const wordsAtom = atom({ plugin: 'council', key: 'words' } as const, emptyWords() as PersonWords)
 
 // Module state: rebuilt on every load (the council itself is in $.state).
 let settings: CouncilSettings = readSettings({})
@@ -467,6 +471,7 @@ async function holdCouncil($: EngineInterface, generation: number, topic: string
   const convened = await read($, councilAtom)
   const options = convened?.options
   const standing = convened?.standing
+  const words = convened?.words
   if ('failure' in outcome) {
     await updateCouncil($, council => ({ ...council, phase: 'failed', notice: `Could not convene: ${outcome.failure}.` }))
     $.ui.toast(`The council could not convene: ${outcome.failure}.`)
@@ -476,7 +481,9 @@ async function holdCouncil($: EngineInterface, generation: number, topic: string
   await updateCouncil($, council => ({ ...withAdvisorsDeliberating(council, brief), notice: outcome.notice ?? null }))
   await Promise.all(
     seats.map(async advisor => {
-      const verdict = await askAdvisorModel($, asking.use ?? { purpose: `member:${advisor.id}` }, isDeep, advisorSystemPrompt(advisor, standing), advisorPrompt(topic, brief, options, asking.extra), asking.extra ? 450 : 300).catch(() => undefined)
+      // The person's words ask for a BEYOND line: a little more room, no more.
+      const maxTokens = (asking.extra ? 450 : 300) + (words ? BEYOND_TOKENS : 0)
+      const verdict = await askAdvisorModel($, asking.use ?? { purpose: `member:${advisor.id}` }, isDeep, advisorSystemPrompt(advisor, standing), advisorPrompt(topic, brief, options, asking.extra, words), maxTokens).catch(() => undefined)
       if (verdict?.isAnswered) asking.onReply?.(advisor.id, verdict.text)
       if (isCurrent()) await updateCouncil($, council => withVerdict(council, advisor.id, verdict?.isAnswered ? verdict.text : undefined))
     }),
@@ -565,7 +572,7 @@ async function reconsider($: EngineInterface, context: string, isDeep = false): 
       const report = reconsidering.advisors[advisor.id]
       if (report === undefined) return
       const prompt = reconsiderPrompt(reconsidering, report)
-      const verdict = await askAdvisorModel($, { purpose: `member:${advisor.id}` }, reconsidering.isDeep, advisorSystemPrompt(advisor, reconsidering.standing), prompt, 300).catch(() => undefined)
+      const verdict = await askAdvisorModel($, { purpose: `member:${advisor.id}` }, reconsidering.isDeep, advisorSystemPrompt(advisor, reconsidering.standing), prompt, 300 + (reconsidering.words ? BEYOND_TOKENS : 0)).catch(() => undefined)
       if (isCurrent()) await updateCouncil($, current => withVerdict(current, advisor.id, verdict?.isAnswered ? verdict.text : undefined))
     }),
   )
@@ -595,7 +602,7 @@ async function askAdvisor($: EngineInterface, query: string, question: string): 
   await openCouncilPane($)
   const generation = councilGeneration
   // In the background: the command returns now, the answer fills in under the card.
-  void askAdvisorModel($, { purpose: `member:${advisor.id}` }, council.isDeep, advisorSystemPrompt(advisor, council.standing), followUpPrompt(council.topic, council.brief, report, question), 400)
+  void askAdvisorModel($, { purpose: `member:${advisor.id}` }, council.isDeep, advisorSystemPrompt(advisor, council.standing), followUpPrompt(council.topic, council.brief, report, question, council.words), 400)
     .catch(() => undefined)
     .then(reply =>
       generation !== councilGeneration
@@ -952,9 +959,32 @@ const AGENT_LOOK: Record<Order['role'], Appearance> = {
   knight: { color: '#d4a017', accessory: 'shield' },
 }
 
-// The latest petition put to the council in court mode: the context for the
-// orders Claude then proposes.
-let lastPetition: string | null = null
+// ── The person's own words (words.ts) ─────────────────────────────────────
+
+// A prompt the person typed in the main session, recorded (redacted, the
+// last WORDS_LIMITS.kept kept).
+async function recordPrompt($: EngineInterface, text: string): Promise<void> {
+  await update($, wordsAtom, current => withPromptRecorded(current ?? emptyWords(), text))
+}
+
+// Claude's answer in the main session: its end, for a short prompt that follows.
+async function recordAnswer($: EngineInterface, answer: string): Promise<void> {
+  await update($, wordsAtom, current => withAnswerRecorded(current ?? emptyWords(), answer))
+}
+
+// The window a sitting Claude starts carries; undefined when nothing was recorded.
+async function wordsNow($: EngineInterface): Promise<WordsWindow | undefined> {
+  return wordsWindow(await read($, wordsAtom).catch(() => undefined))
+}
+
+// `/council forget-words`: the person clears what this session recorded.
+async function forgetWords($: EngineInterface): Promise<string> {
+  const words = await read($, wordsAtom)
+  const count = words?.prompts.length ?? 0
+  await update($, wordsAtom, () => emptyWords())
+  if (count === 0 && !words?.answer) return 'The council had recorded none of your words in this session.'
+  return `The council forgot ${count} prompt${count === 1 ? '' : 's'} of yours${words?.answer ? " and the end of Claude's last answer" : ''} from this session. Docket entries already written keep the words their sittings carried.`
+}
 
 const updateOrder = ($: EngineInterface, matches: (order: Order) => boolean, change: (order: Order) => Order) =>
   update($, courtAtom, court => ({ ...court, orders: court.orders.map(order => (matches(order) ? change(order) : order)) }))
@@ -965,7 +995,7 @@ async function conveneAndWait(
   $: EngineInterface,
   topic: string,
   produceBrief: () => Promise<BriefOutcome>,
-  sitting: { onlySeat?: string; options?: string[]; isChamber?: boolean; source?: 'person' | 'claude'; isDeep?: boolean } & Asking = {},
+  sitting: { onlySeat?: string; options?: string[]; isChamber?: boolean; source?: 'person' | 'claude'; isDeep?: boolean; words?: WordsWindow } & Asking = {},
 ): Promise<Council | undefined> {
   const { seats: seated } = await seatsForProject($)
   // Asked of one member: only it sits.
@@ -973,7 +1003,7 @@ async function conveneAndWait(
   if (seats.length === 0) return undefined
   const generation = ++councilGeneration
   const { standing, strictness } = await councilContext($)
-  const council: Council = { ...newCouncil(topic, seats, sitting.isDeep === true), standing, ...(strictness !== 0 ? { strictness } : {}), source: sitting.source ?? 'person' }
+  const council: Council = { ...newCouncil(topic, seats, sitting.isDeep === true), standing, ...(strictness !== 0 ? { strictness } : {}), source: sitting.source ?? 'person', ...(sitting.words ? { words: sitting.words } : {}) }
   await update($, councilAtom, () => (sitting.options && sitting.options.length > 0 ? { ...council, options: sitting.options } : council))
   // The court's sittings show the court; a consult shows its chamber.
   await update($, isChamberShownAtom, () => sitting.isChamber === true)
@@ -991,7 +1021,7 @@ async function conveneAndWait(
 async function consultCouncil($: EngineInterface, input: Record<string, unknown>): Promise<string> {
   const consult = readConsult(input)
   if ('error' in consult) return consult.error
-  const council = await conveneAndWait($, consult.question, async () => ({ brief: consult.context }), { options: consult.options, isChamber: true, source: 'claude', isDeep: consult.isDeep })
+  const council = await conveneAndWait($, consult.question, async () => ({ brief: consult.context }), { options: consult.options, isChamber: true, source: 'claude', isDeep: consult.isDeep, words: await wordsNow($) })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person instead.'
   const docketEntryId = await recordSitting($, { kind: 'consult', question: consult.question, ...sittingFields(council), outcome: consultOutcome(council) })
   await markCouncilDocket($, council.topic, docketEntryId)
@@ -1022,15 +1052,16 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
   // The person's strictness sets which concerns may ask a CHECK.
   const threshold = conditionAt((await loadProfile($).catch(() => undefined))?.profile.strictness)
-  const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal, lastPetition) }), {
+  const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal) }), {
     source: 'claude',
+    words: await wordsNow($),
     extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn, hasLeave(proposal), threshold),
     onReply,
   })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
   const questions = settings.isSummonsOn ? summonsChecks(council, proposal, replies) : undefined
   if (questions !== undefined) return holdForAdvisor($, council, proposal, root, replies, questions)
-  const { result, levels } = await finalRuling($, council, proposal, lastPetition, replies)
+  const { result, levels } = await finalRuling($, council, proposal, replies)
   const now = await $.clock.now()
   const base = await docketBase($)
   // Numbered inside the update, from the court as it is then, so an id is never
@@ -1078,14 +1109,16 @@ const rulingRecord = (result: RulingResult, docketEntryId?: string) => ({
   reason: result.reason,
   ...(result.notes ? { notes: result.notes } : {}),
   ...(result.summons ? { summons: result.summons } : {}),
+  ...(result.beyond ? { beyond: result.beyond } : {}),
   ...(docketEntryId !== undefined ? { docketId: docketEntryId } : {}),
 })
 
-// The ruling on a council's verdicts, its conditions reviewed by the arbiter,
-// and each dispatch's level from every member's answers.
-async function finalRuling($: EngineInterface, council: Council, proposal: Proposal, petition: string | null, replies: ReadonlyMap<AdvisorId, string>, summons?: RulingSummons) {
+// The ruling on a council's verdicts, its conditions reviewed by the arbiter
+// (with the person's words the council carried), and each dispatch's level
+// from every member's answers.
+async function finalRuling($: EngineInterface, council: Council, proposal: Proposal, replies: ReadonlyMap<AdvisorId, string>, summons?: RulingSummons) {
   const ruled = { ...ruling(council, proposal.plan), ...(summons ? { summons } : {}) }
-  const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled, petition) : ruled
+  const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled) : ruled
   const levels = orderLevels(
     seatsOf(council).flatMap(seat => replies.get(seat.id) ?? []),
     proposal.dispatches.map(dispatch => dispatch.role),
@@ -1294,7 +1327,6 @@ async function holdForAdvisor($: EngineInterface, council: Council, proposal: Pr
       orderIds: orders.map(order => order.id),
       proposal,
       root,
-      petition: lastPetition,
       council,
       replies: Object.fromEntries(replies),
       questions,
@@ -1415,7 +1447,7 @@ async function ruleSummons($: EngineInterface, runId: string, isTold = true): Pr
     const isShown = !isCouncilWorking && (await read($, councilAtom))?.topic === held.council.topic
     council = await secondRound($, held.council, findingsContext(held.questions, record.findings), orderAsk(proposal.dispatches.length, false, hasLeave(proposal)), onReply, isShown)
   }
-  const { result, levels } = await finalRuling($, council, proposal, held.petition, replies, record)
+  const { result, levels } = await finalRuling($, council, proposal, replies, record)
   // Held knights claimed no place: one whose place a knight now holds must wait.
   const waits: string[] = []
   if (result.isApproved && stillHeld.some(order => order.role === 'knight')) {
@@ -1484,7 +1516,7 @@ async function secondRound($: EngineInterface, council: Council, context: string
       seatsOf(current).map(async seat => {
         const report = current.advisors[seat.id]
         if (report === undefined) return
-        const reply = await askAdvisorModel($, { purpose: 'summons-round2' }, current.isDeep, advisorSystemPrompt(seat, current.standing), reconsiderPrompt(current, report, extra), 450).catch(() => undefined)
+        const reply = await askAdvisorModel($, { purpose: 'summons-round2' }, current.isDeep, advisorSystemPrompt(seat, current.standing), reconsiderPrompt(current, report, extra), 450 + (current.words ? BEYOND_TOKENS : 0)).catch(() => undefined)
         if (reply?.isAnswered) onReply(seat.id, reply.text)
         current = withVerdict(current, seat.id, reply?.isAnswered ? reply.text : undefined)
         await mirror()
@@ -1606,7 +1638,7 @@ async function withdrawOrdersTool($: EngineInterface, input: Record<string, unkn
 // on the advisor model, as the member itself (its own system prompt, with the
 // arbiter's request added). With no arbiter, or one not seated, the ruling
 // stands as it is; a failed call keeps every condition, with a note saying so.
-async function arbitrate($: EngineInterface, council: Council, proposal: Proposal, result: RulingResult, petition: string | null): Promise<RulingResult> {
+async function arbitrate($: EngineInterface, council: Council, proposal: Proposal, result: RulingResult): Promise<RulingResult> {
   if (settings.arbiter === null) return result
   const seat = arbiterSeat(council, settings.arbiter)
   if (seat === undefined) {
@@ -1619,7 +1651,7 @@ async function arbitrate($: EngineInterface, council: Council, proposal: Proposa
       model: settings.advisorModel,
       effort: 'low',
       system: advisorSystemPrompt(seat, council.standing, true),
-      prompt: arbiterPrompt(proposal, petition, result.proposed),
+      prompt: arbiterPrompt(proposal, council.words, result.proposed),
       maxTokens: 800,
       timeoutMs: 60000,
     })
@@ -1953,7 +1985,7 @@ async function amendOrderTool($: EngineInterface, input: Record<string, unknown>
   const changeOne = (change: (current: Order) => Order) => updateOrder($, candidate => candidate.id === asked.id, change)
   let council: Council | undefined
   try {
-    council = await conveneAndWait($, `Amendment to ${asked.id}: ${amendment.change}`, async () => ({ brief: amendmentBrief(asked, amendment, lastPetition) }), { source: 'claude', use: { purpose: 'amend', orderId: asked.id, level: levelOf(asked) } })
+    council = await conveneAndWait($, `Amendment to ${asked.id}: ${amendment.change}`, async () => ({ brief: amendmentBrief(asked, amendment) }), { source: 'claude', words: await wordsNow($), use: { purpose: 'amend', orderId: asked.id, level: levelOf(asked) } })
   } catch {
     council = undefined
   }
@@ -1984,7 +2016,7 @@ async function amendOrderTool($: EngineInterface, input: Record<string, unknown>
           })
         : candidate,
     ),
-    rulings: [...court.rulings.slice(-9), { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(base !== undefined ? { docketId: base.id } : {}) }],
+    rulings: [...court.rulings.slice(-9), { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(result.beyond ? { beyond: result.beyond } : {}), ...(base !== undefined ? { docketId: base.id } : {}) }],
   }))
   recordDocket($, base, {
     kind: 'amendment',
@@ -2085,7 +2117,6 @@ async function triage($: EngineInterface, petition: string): Promise<Route> {
 // Court mode: the council sits on the prompt (briefed from this conversation),
 // and its digest goes to Claude beside it, out of the transcript's sight.
 async function petitionDigest($: EngineInterface, petition: string, isAsked: boolean, onlySeat?: string): Promise<string> {
-  lastPetition = petition
   const council = await conveneAndWait($, petition, () => forkBrief($, petition), { onlySeat })
   if (council !== undefined) {
     const id = await recordSitting($, { kind: 'court', question: petition, ...sittingFields(council), outcome: council.phase === 'done' ? 'adjourned' : 'dissolved' })
@@ -2502,6 +2533,8 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
     const reason = trimmed.replace(/^recall\s+\S+\s*/, '').replace(/\s+/g, ' ').slice(0, 200) || 'recalled by the person'
     return recallOrderAction($, { id: target.toUpperCase(), reason }, 'person')
   }
+  // Only the person clears their words: Claude can't erase what it is held to.
+  if (action === 'forget-words' && isAlone) return isPersonOrigin(origin) ? forgetWords($) : 'Only the person can clear their recorded words: type /council forget-words at the prompt.'
   if (action === 'show' && isAlone) {
     if ((await read($, councilAtom)) === null) return 'The council has not convened. /council <topic> to summon it.'
     await update($, isDocketOpenAtom, () => false)
@@ -2776,7 +2809,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|usage [since YYYY-MM-DD]|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|usage [since YYYY-MM-DD]|forget-words|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)
@@ -2961,6 +2994,8 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     noteTurnEnd($, e)
+    // The main session's answer: its end, for the person's next short prompt.
+    if (e.agentId === undefined && 'answer' in e && typeof e.answer === 'string') await recordAnswer($, e.answer).catch(() => undefined)
     if (e.agentId !== undefined) {
       const answer = 'answer' in e ? e.answer : ''
       await finishOrder($, e.agentId, answer, e.reason).catch(() => undefined)
@@ -2975,6 +3010,11 @@ export const register: Register = (on, options) => {
   // council's digest beside it for Claude only. A report from the person's
   // own advisor goes beside their next prompt the same way, court mode or not.
   on('prompt.submit', async ($, e, next) => {
+    // The person's own words, as typed at the prompt (or through Remote
+    // Control) in the main session: never a command, a hidden row, or what a
+    // plugin, a notification or another session sent.
+    const isTyped = isPersonOrigin(e.origin) && e.isMeta !== true && e.command === undefined && (e as { agentId?: string }).agentId === undefined && !e.text.trim().startsWith('/')
+    if (isTyped) await recordPrompt($, e.text).catch(() => undefined)
     if (e.origin.kind !== 'composer') return next(e)
     // Your next message folds away the orders and advisors that have finished since.
     await expireOrders($).catch(() => undefined)

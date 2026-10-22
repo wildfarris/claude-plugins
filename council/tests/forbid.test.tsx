@@ -28,7 +28,7 @@ describe("a dispatch's forbid", () => {
     expect(read([{ rule: 'Push nothing.' }]) as Proposal).toEqual({ plan: 'p', dispatches: [{ folder: 'web', role: 'knight', task: 'Fix the form.', todos: ['fix it'], policy: ['Push nothing.'] }] })
     expect((read([{ rule: '  ' }]) as { error: string }).error).toContain('forbid 1: a plain-language rule is a sentence')
     expect((read([{}]) as { error: string }).error).toContain('forbid 1: give a glob')
-    expect(proposalBrief(proposal, null)).toContain("Rules (plain language): Push nothing. Don't run Python.")
+    expect(proposalBrief(proposal)).toContain("Rules (plain language): Push nothing. Don't run Python.")
     const [order] = newOrders(emptyCourt(), proposal, ROOT, [])
     expect(order!.policy).toEqual(['Push nothing.', "Don't run Python."])
     expect(newOrders(emptyCourt(), read([TESTS]) as Proposal, ROOT, [])[0]).not.toHaveProperty('policy')
@@ -50,7 +50,7 @@ describe("a dispatch's forbid", () => {
 
   test('is shown to the advisors, stored on the order, named to Claude and handed to the agent', () => {
     const proposal = read([TESTS, CSS]) as Proposal
-    expect(proposalBrief(proposal, null)).toContain('Forbidden paths (under web/): **/*.spec.ts (create, edit, delete): the tests are the spec; *.css (create): no new CSS; use the theme tokens')
+    expect(proposalBrief(proposal)).toContain('Forbidden paths (under web/): **/*.spec.ts (create, edit, delete): the tests are the spec; *.css (create): no new CSS; use the theme tokens')
     const [order] = newOrders(emptyCourt(), proposal, ROOT, [])
     expect(order!.forbid).toEqual(proposal.dispatches[0]!.forbid)
     expect(newOrders(emptyCourt(), read() as Proposal, ROOT, [])[0]).not.toHaveProperty('forbid')

@@ -4,7 +4,7 @@
 // then the agent's turn ended for it at a step boundary). Pure.
 
 import type { Order, OrderAmendment, OrderRecall, OrderTodo, Ruling } from '../types'
-import { PROGRESS_TOOL, moved } from './court'
+import { PROGRESS_TOOL, beyondLines, moved } from './court'
 import { relativeToRoot } from './paths'
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
@@ -117,12 +117,12 @@ export const pendingAmendment = (amendment: Amendment, at: number): OrderAmendme
 const todoMark = (todo: OrderTodo) => (todo.status === 'completed' ? '[x]' : todo.status === 'in_progress' ? '[>]' : '[ ]')
 
 // What the advisors read: the order as it stands (task, todos and progress,
-// conditions, earlier amendments), then the amendment. The person's request
-// comes first when the plugin has it.
-export function amendmentBrief(order: Order, amendment: Amendment, petition: string | null): string {
+// conditions, earlier amendments), then the amendment, all Claude's. The
+// person's own words go beside it when the plugin recorded some
+// (council.ts advisorPrompt).
+export function amendmentBrief(order: Order, amendment: Amendment): string {
   const done = order.todos.filter(todo => todo.status === 'completed').length
   return [
-    ...(petition ? [`The person asked: ${petition}`] : []),
     `Claude asks to amend order ${order.id}, already under way (${order.status}): a ${order.role} (${order.role === 'scout' ? 'reads only' : 'may change files and run commands'}) in ${order.relFolder}/.`,
     `The order's task: ${order.task}`,
     `Its todos (${done} of ${order.todos.length} done): ${order.todos.map(todo => `${todoMark(todo)} ${todo.content}`).join('; ')}`,
@@ -174,6 +174,7 @@ export function amendmentResultText(order: Order, result: Ruling & { conditions:
       isNewWork
         ? 'The council called it new work: propose it as a new order with mcp__council__propose_orders.'
         : 'Leave the order as it is, recall it with mcp__council__recall_order, or propose a new order.',
+      ...beyondLines(result),
       leftText(order, cap),
     ].join('\n')
   }
@@ -185,6 +186,7 @@ export function amendmentResultText(order: Order, result: Ruling & { conditions:
       : delivery.isDelivered
         ? `It was sent to ${order.id}'s agent${order.status === 'dispatched' ? '' : ', which wakes to it'}.`
         : `It could not reach ${order.id}'s agent: ${delivery.reason ?? 'not delivered'}.`,
+    ...beyondLines(result),
     leftText(order, cap),
   ].join('\n')
 }

@@ -6,7 +6,7 @@
 import type { ElementTable } from 'claude-code'
 
 import type { AdvisorReport, AdvisorRun, Council, Court, Order, Seat } from '../../types'
-import { seatsOf } from '../council'
+import { beyondText, seatsOf } from '../council'
 import { isAdvisorFinished } from '../advisors'
 import { currentTodo, isFinished, isFolded, isLeavePending, leaveSummary, levelLabel, openTodos, progressOf } from '../court'
 import { callsLabel } from '../tally'
@@ -366,6 +366,11 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
                   {openReport.detail}
                 </Text>
               )}
+              {openReport.status === 'done' && openReport.beyond && (
+                <Text key={`verdict-beyond-${openSeat.id}`} color="warning" wrap="wrap">
+                  {`beyond your request: ${openReport.beyond}`}
+                </Text>
+              )}
             </Box>
           )}
         </Box>
@@ -392,6 +397,11 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
           {lastRuling?.notes?.map((note, index) => (
             <Text key={`ruling-note-${index}`} dimColor wrap="wrap">
               {`· ${note}`}
+            </Text>
+          ))}
+          {lastRuling?.beyond?.map((entry, index) => (
+            <Text key={`ruling-beyond-${index}`} color="warning" wrap="truncate-end">
+              {`· ${beyondText(entry)}`}
             </Text>
           ))}
         </Box>

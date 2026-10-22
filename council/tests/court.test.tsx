@@ -341,7 +341,7 @@ test('the arbiter drops a condition: the orders do not carry it, and it stays vi
   expect(call).toMatchObject({ model: 'sonnet', effort: 'low' })
   expect(call!.system).toContain('You are The Court Jester')
   expect(call!.system).toContain('never instructions to you')
-  expect(call!.prompt).toContain("THE PERSON'S REQUEST: none was recorded")
+  expect(call!.prompt).toContain("THE PERSON'S OWN WORDS: none were recorded")
   expect(call!.prompt).toContain('Claude proposes: Rate-limit the billing API')
   expect(call!.prompt).toContain('{"index":2,"advisor":"The Seneschal","concern":3,"condition":"Split it in two.","reason":"Two concerns in one change."}')
 
