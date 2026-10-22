@@ -22,6 +22,21 @@ export type Seat = {
   accessory: Accessory
   // Reference material read from the member's files, already trimmed.
   references: Array<{ source: string; text: string }>
+  // The person's tuning for this member (members.ts), which adds to its remit
+  // and never replaces it. Absent when there is none, and in seats saved
+  // before tuning existed.
+  tuning?: MemberTuning
+}
+
+// A member's tuning, from its member files (cares, ignores, lean), merged
+// user then project, field by field. Items are already cleaned and checked.
+export type MemberTuning = {
+  // What it should weigh especially, and set aside: at most 5 each.
+  cares?: string[]
+  ignores?: string[]
+  // -2 (softer: lower concerns) to 2 (harder: higher concerns) than the
+  // council's strictness. Its prompt's guidance only, never the thresholds.
+  lean?: number
 }
 
 // `abstained`: the topic is outside the member's remit; its verdict holds the reason.
@@ -123,6 +138,9 @@ export type RosterEntry = {
   // Where it comes from: built in, your user folder, or this project.
   source: 'built-in' | 'user' | 'project'
   isSeated: boolean
+  // Its tuning in short ("lean: slightly-softer · cares 2 · ignores 1") and
+  // the member files it came from. Absent when it has none.
+  tuning?: { summary: string; files: string[] }
 }
 
 export type Roster = {

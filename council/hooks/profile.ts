@@ -191,7 +191,7 @@ export function profileReport(profile: Profile, paths: Record<ProfileSource, str
     `- notes: ${profile.notes === '' ? 'none' : `"${profile.notes.replace(/\s+/g, ' ').slice(0, 160)}${profile.notes.length > 160 ? '…' : ''}"`} ${from('notes')}`,
     `Files: ${paths.user} (${found.user ? 'read' : 'none'}); ${paths.project} (${found.project ? 'read' : 'none'}). The project's fields win.`,
     ...(profile.problems.length > 0 ? ['Problems (those fields are ignored):', ...profile.problems.map(problem => `- ${problem}`)] : []),
-    '/council:setup writes a profile; the council plugin README has the format.',
+    '/council:setup writes a profile, and /council:tune tunes single members (what each weighs especially or sets aside, and how hard it votes); the council plugin README has the formats.',
   ]
   return lines.join('\n')
 }

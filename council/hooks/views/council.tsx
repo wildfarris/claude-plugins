@@ -430,6 +430,7 @@ export function rosterView(el: ElementTable, props: RosterViewProps) {
                 {entry.title}
               </Text>
               <Text dimColor>{`${entry.concern} · ${SOURCE_LABEL[entry.source]}`}</Text>
+              {entry.tuning ? <Text key={`tuning-${entry.id}`} dimColor wrap="wrap">{`tuned: ${entry.tuning.summary} (${entry.tuning.files.join(', ')})`}</Text> : null}
             </Box>
           </Box>
         ))}
@@ -441,7 +442,7 @@ export function rosterView(el: ElementTable, props: RosterViewProps) {
       ))}
       <Box flexDirection="column" marginTop={1}>
         <Text dimColor wrap="wrap">
-          Seats apply to this project's next council. Add members as markdown files in ~/.claude/council/members/ or this project's .claude/council/members/.
+          Seats apply to this project's next council. Add members as markdown files in ~/.claude/council/members/ or this project's .claude/council/members/; /council:tune tunes one.
         </Text>
         <Button key="close-members" label="done" variant="secondary" onPress={props.onClose} />
       </Box>

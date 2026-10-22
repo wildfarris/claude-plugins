@@ -228,7 +228,7 @@ import {
   summaryPrompt,
 } from './learning'
 import { councilView, portraitFor, rosterView } from './views/council'
-import { MAX_SEATS, mergeMembers, parseMemberFile, resolveReference, seatedMembers, trimReferences, BUILT_IN_MEMBERS, type MemberDefinition } from './members'
+import { MAX_SEATS, memberId, mergeMembers, parseMemberFile, resolveReference, seatOf, seatedMembers, trimReferences, tuningFiles, tuningSummary, BUILT_IN_MEMBERS, type MemberDefinition } from './members'
 import { conditionAt, mergeProfiles, parseProfile, profileContext, profileReport, type Profile, type ProfileFields, type ProfileSource } from './profile'
 
 const COUNCIL_PANE_ID = 'council-chamber'
@@ -808,7 +808,9 @@ async function unseatedIds($: EngineInterface, root: string): Promise<string[]> 
 }
 
 // The member files in one folder, parsed, with their references resolved.
-async function readMemberFolder($: EngineInterface, folder: string, source: 'user' | 'project', homePath: string, spareStart: number) {
+// `bases`: the members a file of the same id takes the fields it leaves out
+// from (for a project's files, the person's own, then the built-ins).
+async function readMemberFolder($: EngineInterface, folder: string, source: 'user' | 'project', homePath: string, spareStart: number, bases: readonly MemberDefinition[] = BUILT_IN_MEMBERS) {
   const entries = await $.fs.list(folder).catch(() => [])
   const files = entries.filter(entry => entry.kind === 'file' && entry.name.toLowerCase().endsWith('.md')).sort((left, right) => left.name.localeCompare(right.name))
   const members: MemberDefinition[] = []
@@ -819,12 +821,15 @@ async function readMemberFolder($: EngineInterface, folder: string, source: 'use
       problems.push(`${entry.name}: could not be read`)
       continue
     }
-    const base = BUILT_IN_MEMBERS.find(member => member.id === entry.name.replace(/\.md$/i, '').toLowerCase())
+    const base = bases.find(member => member.id === memberId(entry.name))
     const parsed = parseMemberFile(entry.name, text, source, base, spareStart + index)
+    const label = `${source === 'user' ? '~/.claude' : '.claude'}/council/members/`
     if ('problem' in parsed) {
-      problems.push(`${source === 'user' ? '~/.claude' : '.claude'}/council/members/${parsed.problem}`)
+      problems.push(`${label}${parsed.problem}`)
       continue
     }
+    // Tuning that doesn't hold is left out and listed; the member still sits.
+    problems.push(...(parsed.problems ?? []).map(problem => `${label}${problem}`))
     const resolved = parsed.member.referencePaths.map(path => resolveReference(path, folder, homePath))
     resolved.forEach((path, position) => {
       if (path === undefined) problems.push(`${entry.name}: can't resolve reference ${parsed.member.referencePaths[position]}`)
@@ -838,7 +843,7 @@ async function readMemberFolder($: EngineInterface, folder: string, source: 'use
 async function loadMembers($: EngineInterface): Promise<{ members: MemberDefinition[]; problems: string[]; root: string }> {
   const [root, homePath] = await Promise.all([$.session.root(), home($)])
   const user = homePath === '' ? { members: [], problems: [`Your own member files were not read: ${NO_HOME}.`] } : await readMemberFolder($, `${homePath}/.claude/council/members`, 'user', homePath, 0)
-  const project = await readMemberFolder($, `${root}/.claude/council/members`, 'project', homePath, user.members.length)
+  const project = await readMemberFolder($, `${root}/.claude/council/members`, 'project', homePath, user.members.length, [...user.members, ...BUILT_IN_MEMBERS])
   return { members: mergeMembers(user.members, project.members), problems: [...user.problems, ...project.problems], root }
 }
 
@@ -847,15 +852,15 @@ async function seatsForProject($: EngineInterface): Promise<{ seats: Seat[]; pro
   const { members, problems, root } = await loadMembers($)
   const seated = seatedMembers(members, await unseatedIds($, root)).slice(0, MAX_SEATS)
   const seats = await Promise.all(
-    seated.map(async ({ source: _source, referencePaths, ...member }) => {
+    seated.map(async member => {
       const read = await Promise.all(
-        referencePaths.map(async path => {
+        member.referencePaths.map(async path => {
           const text = await $.fs.read(path).catch(() => undefined)
           if (typeof text !== 'string') problems.push(`${member.title}: could not read reference ${path}`)
           return typeof text === 'string' ? { source: path.split(/[\\/]/).pop() ?? path, text } : undefined
         }),
       )
-      return { ...member, references: trimReferences(read.filter((entry): entry is { source: string; text: string } => entry !== undefined)) }
+      return seatOf(member, trimReferences(read.filter((entry): entry is { source: string; text: string } => entry !== undefined)))
     }),
   )
   return { seats, problems }
@@ -866,7 +871,10 @@ async function refreshRoster($: EngineInterface): Promise<Roster> {
   const off = await unseatedIds($, root)
   const seated = seatedMembers(members, off).slice(0, MAX_SEATS).map(member => member.id)
   const roster: Roster = {
-    entries: members.map(member => ({ id: member.id, title: member.title, concern: member.concern, color: member.color, source: member.source, isSeated: seated.includes(member.id) })),
+    entries: members.map(member => {
+      const summary = tuningSummary(member.tuning)
+      return { id: member.id, title: member.title, concern: member.concern, color: member.color, source: member.source, isSeated: seated.includes(member.id), ...(summary !== undefined ? { tuning: { summary, files: tuningFiles(member) } } : {}) }
+    }),
     // The profile's problems beside the member files' (/council profile has the rest of it).
     problems: [...problems, ...(loaded?.profile.problems ?? []), ...(members.length - off.length > MAX_SEATS ? [`At most ${MAX_SEATS} sit at once; the rest wait until a seat is free.`] : [])],
   }

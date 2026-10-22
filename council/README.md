@@ -57,7 +57,7 @@ The council learns your preferences from the context you add when you reconsider
 Five members are built in (the Castellan, the Lord Treasurer, the Seneschal, the High Justiciar and the Court Jester). Add your own, or change a built-in, with a markdown file:
 
 - `~/.claude/council/members/<id>.md`: yours, in every project;
-- `<project>/.claude/council/members/<id>.md`: one project's (it wins over yours, which wins over the built-in).
+- `<project>/.claude/council/members/<id>.md`: one project's (it changes only the fields it sets over yours, as yours does over the built-in).
 
 ```markdown
 ---
@@ -76,6 +76,27 @@ compliance with our internal data-retention and SOC 2 controls: what is logged, 
 - The text under the header is the remit: what the member weighs.
 - `accessory` is one of `shield`, `crown`, `none`, `standard`, `antenna`; `color` is `#rgb` or `#rrggbb` (a spare color is picked if left out).
 - `references` are files read into the member's prompt as reference data (absolute, `~/…`, or relative to the member file), at most 4,000 characters each and 8,000 per member.
+- A project's file for one of your own members (not a built-in) takes the fields it leaves out from your file, so it can hold just tuning.
+
+**Tuning a member.** Three optional fields tell one member what to weigh especially, what to set aside, and how hard to vote, without rewriting its remit. **`/council:tune`** walks you through it: pick members, choose everywhere or this project, then for each member, one at a time, see its concern, remit and up to five of its recent votes here with a concern of 3 or more (from the docket), say what it got right or wrong, and accept, edit or skip a suggested draft. It changes only these three fields in the one file you chose.
+
+```markdown
+---
+cares:
+  - tokens in CI logs
+ignores:
+  - internal admin tools on the lab VLAN
+lean: slightly-softer
+---
+```
+
+- `cares` and `ignores`: lists, at most 5 items each, each 3 to 160 characters. Line breaks, tabs and other control characters become spaces; invisible format characters and `<`, `>` are removed. An item out of bounds is left out, never cut short; more than 5 items, or a one-line `[a, b]` list, leaves the whole field out.
+- `lean`: `-2` softer, `-1` slightly-softer, `0` as-is, `1` slightly-harder, `2` harder (the number or the label). Softer means lower concerns, harder higher ones. Each level gives the member one sentence of guidance: slightly-softer "when torn between two concern levels, give the lower one", softer "give one concern level lower than you otherwise would", and the harder ones the same upward. Lean changes only that member's own rating: the concern at which a verdict becomes a condition, and the 5 that refuses, stay as your profile sets them.
+- **They add to the remit, never replace it**, unlike `remit` (the body) or a built-in override. They work in a built-in's file (`castellan.md` holding only tuning) and in your own members'.
+- **Merging:** your file, then the project's, field by field: a project file's `cares`, `ignores` or `lean` replaces yours, and what it leaves out is kept. An empty `cares:` or `lean: as-is` in a project file clears yours.
+- **In the prompt:** a tuned member reads a section after the profile, `THE PERSON'S TUNING FOR YOU`, framed as your context, not instructions: the items are fenced as data (`<<<CARES … CARES>>>`, `<<<IGNORES … IGNORES>>>`) under "Weigh especially" and "Set aside", with the lean's guidance, and the frame says that nothing set aside and no softer lean ever lowers a concern about exposed credentials, data loss, anything irreversible, or acting outside what you asked. A member with no tuning (or only `lean: as-is` and empty lists) gets exactly the prompt it had before.
+- **Shown:** the members list puts a line under each tuned member, e.g. `tuned: lean: slightly-softer · cares 2 · ignores 1 (~/.claude/council/members/castellan.md)`, naming the files it came from; a field or item that doesn't hold is listed there as a problem, and the rest of the file still counts. Tuning is fixed when a council convenes.
+- A project's member files sit in its repository, where anyone who can commit can tune its members: read one you didn't write before trusting its council.
 
 **Who sits, per project:** `/council members` (or **members** in the chamber) lists everyone with a switch; `/council members off treasurer` and `on` do the same by name. Choices are kept per project and apply from the next sitting. At most 8 sit at once. A member file that can't be read or parsed is listed there with why.
 
@@ -85,7 +106,7 @@ The built-in remits also carry a few widely held engineering judgements, so each
 
 ## Your profile
 
-A profile tells every member how hard to vote and at what scale to judge, for example "vote as if this only ever runs at a low-traffic cafe, even if it looks like an enterprise app". **`/council:setup`** interviews you briefly (where it applies, strictness, scale, priorities, and optionally who sits) and writes the file; every question can be skipped. **`/council profile`** shows the profile in effect, which file each field comes from, and any problems. With no profile the council votes balanced at no particular scale: nothing needs setting up.
+A profile tells every member how hard to vote and at what scale to judge, for example "vote as if this only ever runs at a low-traffic cafe, even if it looks like an enterprise app". **`/council:setup`** interviews you briefly (where it applies, strictness, scale, priorities, and optionally who sits) and writes the file; every question can be skipped. **`/council profile`** shows the profile in effect, which file each field comes from, and any problems. To tune one member rather than the whole council, see Tuning a member under Members (`/council:tune`). With no profile the council votes balanced at no particular scale: nothing needs setting up.
 
 Two files, both optional:
 
@@ -243,7 +264,7 @@ Set them with `/plugin configure council@personal-mods`: `briefModel` (review mo
 
 ## Developing
 
-`hooks/register.tsx` holds every hook and every function that touches `$` (the engine follows `$` only into the hooks module's top-level functions). The rest is pure: `members.ts` (built-in members, member files, references, who sits), `profile.ts` (the person's profile: parsing, merging, the members' text and the condition threshold), `council.ts` (prompts, verdict parsing, state changes), `court.ts` (proposals, rulings, the arbiter's review, orders, withdrawal and expiry, dispatch instructions, progress, levels, knight overlap, the order lifecycle: settling, releasing, lost agents and wakes), `control.ts` (steering orders under way: the message block, /council message, amendments, recalls and the recall ceiling), `advisors.ts` (the advisor agent: CHECK questions, its task, its runs), `docket.ts` and `views/docket.tsx` (the docket: entries, the project key and paths, appending, retention, the lock's text, the view), `redact.ts` (token-like strings, copied from sidekick), `agents/` (the scout, knight and advisor types), `views/court.tsx`, `review.ts` (review mode's git commands and prompts), `sprites.ts` and `views/council.tsx` (the chamber: cards, or compact rows in a narrow terminal). `skills/setup/SKILL.md` is `/council:setup`.
+`hooks/register.tsx` holds every hook and every function that touches `$` (the engine follows `$` only into the hooks module's top-level functions). The rest is pure: `members.ts` (built-in members, member files, references, who sits), `profile.ts` (the person's profile: parsing, merging, the members' text and the condition threshold), `council.ts` (prompts, verdict parsing, state changes), `court.ts` (proposals, rulings, the arbiter's review, orders, withdrawal and expiry, dispatch instructions, progress, levels, knight overlap, the order lifecycle: settling, releasing, lost agents and wakes), `control.ts` (steering orders under way: the message block, /council message, amendments, recalls and the recall ceiling), `advisors.ts` (the advisor agent: CHECK questions, its task, its runs), `docket.ts` and `views/docket.tsx` (the docket: entries, the project key and paths, appending, retention, the lock's text, the view), `redact.ts` (token-like strings, copied from sidekick), `agents/` (the scout, knight and advisor types), `views/court.tsx`, `review.ts` (review mode's git commands and prompts), `sprites.ts` and `views/council.tsx` (the chamber: cards, or compact rows in a narrow terminal). `skills/setup/SKILL.md` is `/council:setup`, and `skills/tune/SKILL.md` is `/council:tune` (member tuning lives in `members.ts`).
 
 ```bash
 claude plugin validate ~/.claude/mod-sources/personal-mods/council
