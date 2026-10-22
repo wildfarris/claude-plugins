@@ -195,6 +195,10 @@ test('a second /council while one is working is refused; reset frees it', async 
   await chamber.unmount()
 })
 
+// The docket makes its folder and files owner-only on POSIX (mkdir, chmod);
+// every other command review mode runs is git, in the repo.
+const withoutDocket = <T extends { argv: string[] }>(ran: T[]) => ran.filter(entry => entry.argv[0] !== 'mkdir' && entry.argv[0] !== 'chmod')
+
 // A stand-in git repo for review mode: what each git command prints.
 const REPO = `${ROOT}/project`
 const COMMON_DIR = `${REPO}/.git`
@@ -257,7 +261,7 @@ test('review mode briefs from the repo alone: commits, diff, map, and the files 
   expect((await $.command.run(composer('council', 'review abc123 is the billing API safe?'))).text).toContain('Review since abc123')
   await settle()
 
-  expect(ran.every(entry => entry.argv[0] === 'git' && entry.cwd === REPO)).toBe(true)
+  expect(withoutDocket(ran).every(entry => entry.argv[0] === 'git' && entry.cwd === REPO)).toBe(true)
   const pick = harness.completions[0]!
   expect(pick.model).toBe('opus')
   expect(pick.prompt).toContain('def456 2026-10-07 Add the billing endpoint')
@@ -314,7 +318,7 @@ test('in a session over several repos, review names the repo by its folder', asy
   expect((await $.command.run(composer('council', 'review project abc123 ready?'))).text).toContain('Review since abc123: ready?')
   await settle()
   expect(ran.length).toBeGreaterThan(0)
-  expect(ran.every(entry => entry.cwd === REPO)).toBe(true)
+  expect(withoutDocket(ran).every(entry => entry.cwd === REPO)).toBe(true)
   expect(harness.completions.some(call => call.prompt.includes('Adds a billing endpoint.'))).toBe(true)
 })
 

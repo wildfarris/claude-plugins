@@ -36,6 +36,8 @@ export type CourtViewProps = {
   // and /council deny-leave). Left out: no buttons, the command only.
   onGrantLeave?: (id: string) => unknown
   onDenyLeave?: (id: string) => unknown
+  // Opens a ruling's docket entry. Left out: no button.
+  onOpenDocket?: (id: string) => unknown
 }
 
 const ROLE_TITLE = { scout: 'Scout', knight: 'Knight' } as const
@@ -375,9 +377,16 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
             </Text>
           )}
           {lastRuling && (
-            <Text color={lastRuling.isApproved ? 'success' : 'error'} wrap="wrap">
-              {lastRuling.isApproved ? `Approved: ${lastRuling.plan}` : `Refused: ${lastRuling.plan}`}
-            </Text>
+            <Box flexDirection="row" gap={1}>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text color={lastRuling.isApproved ? 'success' : 'error'} wrap="wrap">
+                  {lastRuling.isApproved ? `Approved: ${lastRuling.plan}` : `Refused: ${lastRuling.plan}`}
+                </Text>
+              </Box>
+              {lastRuling.docketId !== undefined && props.onOpenDocket && (
+                <Button key="ruling-docket" label="docket" plain dimColor onPress={() => props.onOpenDocket!(lastRuling.docketId!)} />
+              )}
+            </Box>
           )}
           {lastRuling?.notes?.map((note, index) => (
             <Text key={`ruling-note-${index}`} dimColor wrap="wrap">

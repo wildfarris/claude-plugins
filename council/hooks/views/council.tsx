@@ -54,6 +54,8 @@ export type CouncilViewProps = {
   onLessons?: () => unknown
   // Back to the court (when it has orders).
   onCourt?: () => unknown
+  // Opens this sitting's docket entry (when it has one).
+  onDocket?: () => unknown
   // Keyboard shortcuts (1–5, b): the terminal only. On the desktop a press on
   // a hotkeyed button went unhandled the first time.
   hasHotkeys: boolean
@@ -370,13 +372,16 @@ export function councilView(el: ElementTable, props: CouncilViewProps) {
       </Box>
       {council.phase === 'done' && (
         <Box flexDirection="column" marginTop={1}>
-          {gravest ? (
-            <Text bold color={concernTheme(gravest.report)}>
-              {`Gravest: ${shortTitle(gravest.advisor)} ${gravest.report.concern}/5`}
-            </Text>
-          ) : (
-            <Text dimColor>Every advisor abstained.</Text>
-          )}
+          <Box flexDirection="row" gap={2}>
+            {gravest ? (
+              <Text bold color={concernTheme(gravest.report)}>
+                {`Gravest: ${shortTitle(gravest.advisor)} ${gravest.report.concern}/5`}
+              </Text>
+            ) : (
+              <Text dimColor>Every advisor abstained.</Text>
+            )}
+            {props.onDocket && <Button key="docket" label="docket" plain dimColor onPress={props.onDocket} />}
+          </Box>
           <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
             <Button key="reconsider" label="reconsider with more context" variant="secondary" onPress={props.onReconsider} />
             {props.onReconsiderDeep && <Button key="reconsider-deep" label="reconsider as a brain trust" variant="secondary" onPress={props.onReconsiderDeep} />}

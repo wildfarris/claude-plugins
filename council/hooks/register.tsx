@@ -11,7 +11,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderInput, Timer } from 'claude-code'
 
-import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, CourtSummons, LearningView, Order, Roster, RulingSummons, Seat } from '../types'
+import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, CourtSummons, DocketEntry, DocketFilter, DocketView, LearningView, Order, Roster, RulingSummons, Seat } from '../types'
 import {
   ADVISOR_TYPE,
   SUMMONS_TIMEOUT_MS,
@@ -182,7 +182,32 @@ import {
   withoutAmendment,
   type RecallRequest,
 } from './control'
-import { NO_HOME, homeFromEnvironment, joinUnder } from './paths'
+import { NO_HOME, homeFromEnvironment, joinUnder, pathStyleOf } from './paths'
+import {
+  DOCKET_LIMITS,
+  DOCKET_LOCK,
+  consultOutcome,
+  dayFileName,
+  docketDispatches,
+  docketEntries,
+  docketFile,
+  docketId,
+  docketPage,
+  docketPaths,
+  findingsSummary,
+  formatLock,
+  isDayFileName,
+  isLockHeld,
+  offsetOf,
+  parseLock,
+  projectKey,
+  prunedFiles,
+  sealEntry,
+  sittingFields,
+  withEntryAppended,
+  type DocketPaths,
+} from './docket'
+import { docketView } from './views/docket'
 import { carryCalls, creditCall, sitesOf } from './tally'
 import { courtView } from './views/court'
 import { lessonsView } from './views/lessons'
@@ -219,6 +244,8 @@ const learningAtom = atom({ plugin: 'council', key: 'learning' } as const, null 
 const openVerdictAtom = atom({ plugin: 'council', key: 'openVerdictId' } as const, null as string | null)
 const isFinishedShownAtom = atom({ plugin: 'council', key: 'isFinishedShown' } as const, false)
 const openOrderAtom = atom({ plugin: 'council', key: 'openOrderId' } as const, null as string | null)
+const isDocketOpenAtom = atom({ plugin: 'council', key: 'isDocketOpen' } as const, false)
+const docketAtom = atom({ plugin: 'council', key: 'docket' } as const, null as DocketView | null)
 
 // Module state: rebuilt on every load (the council itself is in $.state).
 let settings: CouncilSettings = readSettings({})
@@ -443,11 +470,19 @@ async function startCouncil($: EngineInterface, topic: string, isDeep: boolean, 
   if (profileProblems.length > 0) $.ui.toast(`Council: ${profileProblems.length} profile problem${profileProblems.length === 1 ? '' : 's'}; /council profile shows them.`)
   await update($, councilAtom, () => ({ ...newCouncil(topic, seats, isDeep), standing, ...(strictness !== 0 ? { strictness } : {}), source: 'person' as const }))
   await update($, isRosterOpenAtom, () => false)
+  await update($, isDocketOpenAtom, () => false)
   // A council you convened opens to its chamber, even when the court has orders.
   await update($, isChamberShownAtom, () => true)
   await openCouncilPane($)
   isCouncilWorking = true
   void holdCouncil($, generation, topic, seats, isDeep, produceBrief)
+    .then(async () => {
+      // The sitting, recorded in the docket once it adjourns (or dissolves).
+      const council = generation === councilGeneration ? await read($, councilAtom) : null
+      if (council === null) return
+      const id = await recordSitting($, { kind: 'council', question: topic, ...sittingFields(council), outcome: council.phase === 'done' ? 'adjourned' : 'dissolved' })
+      await markCouncilDocket($, council.topic, id)
+    })
     .catch(() => undefined)
     .finally(() => {
       if (generation === councilGeneration) isCouncilWorking = false
@@ -622,13 +657,29 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
   const table = $.ui.resolve(e)
   // Whatever this draw shows, the portraits drawn before are gone from the pane.
   if (e.surface === 'terminal') shownSprites.clear()
-  const [council, isRosterOpen, roster, isLessonsOpen, learning] = await Promise.all([
+  const [council, isRosterOpen, roster, isLessonsOpen, learning, isDocketOpen, docket] = await Promise.all([
     read($, councilAtom),
     read($, isRosterOpenAtom),
     read($, rosterAtom),
     read($, isLessonsOpenAtom),
     read($, learningAtom),
+    read($, isDocketOpenAtom),
+    read($, docketAtom),
   ])
+  if (isDocketOpen) {
+    if (docket === null) {
+      void refreshDocket($).catch(() => undefined)
+      return <table.Text dimColor>Reading the docket…</table.Text>
+    }
+    return docketView(table, {
+      view: docket,
+      onFilter: filter => refreshDocket($, { filter, offset: 0, openId: null }),
+      onToggle: id => update($, docketAtom, current => (current === null ? current : { ...current, openId: current.openId === id ? null : id })),
+      onMore: () => refreshDocket($, { offset: docket.offset + DOCKET_LIMITS.page }),
+      onLess: () => refreshDocket($, { offset: Math.max(0, docket.offset - DOCKET_LIMITS.page) }),
+      onClose: () => update($, isDocketOpenAtom, () => false),
+    })
+  }
   if (isLessonsOpen) {
     if (learning === null) {
       void refreshLearning($).catch(() => undefined)
@@ -691,6 +742,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onToggleFinished: () => update($, isFinishedShownAtom, current => !current),
       onToggleSession: () => setCourtSession($, !court.isInSession),
       onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)), advisors: (current.advisors ?? []).filter(run => !isClearable(run, current)) })),
+      onOpenDocket: id => openDocket($, id),
     })
   }
   if (council === null) return <table.Text dimColor>The council has not convened. /council &lt;question&gt; to summon it; /council members to choose who sits.</table.Text>
@@ -724,6 +776,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
     onReport: async () => $.ui.toast(await reportCouncil($)),
     onMembers: () => openRoster($),
     onLessons: () => openLessons($),
+    ...(council.docketId !== undefined ? { onDocket: () => openDocket($, council.docketId ?? null) } : {}),
     ...(hasCourt ? { onCourt: () => update($, isChamberShownAtom, () => false) } : {}),
   })
   if (isTerminal) {
@@ -837,6 +890,7 @@ async function toggleSeat($: EngineInterface, id: string): Promise<void> {
 
 async function openRoster($: EngineInterface): Promise<void> {
   await refreshRoster($)
+  await update($, isDocketOpenAtom, () => false)
   await update($, isRosterOpenAtom, () => true)
   await $.ui.open({ id: COUNCIL_PANE_ID, title: 'The Council', rows: 30 })
 }
@@ -905,6 +959,8 @@ async function consultCouncil($: EngineInterface, input: Record<string, unknown>
   if ('error' in consult) return consult.error
   const council = await conveneAndWait($, consult.question, async () => ({ brief: consult.context }), { options: consult.options, isChamber: true, source: 'claude', isDeep: consult.isDeep })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person instead.'
+  const docketEntryId = await recordSitting($, { kind: 'consult', question: consult.question, ...sittingFields(council), outcome: consultOutcome(council) })
+  await markCouncilDocket($, council.topic, docketEntryId)
   if (council.phase !== 'done') return `The council could not answer: ${council.notice ?? 'it dissolved'}. Ask the person instead.`
   return consultText(council)
 }
@@ -942,16 +998,35 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   if (questions !== undefined) return holdForAdvisor($, council, proposal, root, replies, questions)
   const { result, levels } = await finalRuling($, council, proposal, lastPetition, replies)
   const now = await $.clock.now()
+  const base = await docketBase($)
   // Numbered inside the update, from the court as it is then, so an id is never
   // handed out twice; the court's counter moves past it and clearing never frees it.
   let orders: Order[] = []
   await update($, courtAtom, current => {
     orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now, levels, 'approved', settings.leaveApproval) : []
-    return { ...withOrdersAdded(current, orders), rulings: [...current.rulings.slice(-9), rulingRecord(result)] }
+    return { ...withOrdersAdded(current, orders), rulings: [...current.rulings.slice(-9), rulingRecord(result, base?.id)] }
   })
+  recordDocket($, base, {
+    kind: 'orders',
+    plan: proposal.plan,
+    dispatches: docketDispatches(proposal.dispatches),
+    ...sittingFields(council, replies, proposal.dispatches.length),
+    outcome: result.isApproved ? 'approved' : 'refused',
+    ...rulingFields(result),
+    orderIds: orders.map(order => order.id),
+  })
+  await markCouncilDocket($, council.topic, base?.id)
   toastPendingLeave($, orders)
   return rulingText(result, orders)
 }
+
+// What a ruling adds to its docket entry: why it was refused, the conditions
+// and the arbiter's notes.
+const rulingFields = (result: RulingResult): Pick<DocketEntry, 'reason' | 'conditions' | 'notes'> => ({
+  ...(!result.isApproved && result.reason !== '' ? { reason: result.reason } : {}),
+  ...(result.conditions.length > 0 ? { conditions: [...result.conditions] } : {}),
+  ...(result.notes && result.notes.length > 0 ? { notes: [...result.notes] } : {}),
+})
 
 const hasLeave = (proposal: Proposal) => proposal.dispatches.some(dispatch => (dispatch.leave ?? []).length > 0)
 
@@ -961,14 +1036,15 @@ function toastPendingLeave($: EngineInterface, orders: readonly Order[]): void {
   if (pending.length > 0) $.ui.toast(`Council: ${pending.join(', ')} ${pending.length === 1 ? 'asks' : 'ask'} for leave. /council grant <id> or /council deny-leave <id>; the court shows it.`)
 }
 
-// A ruling as the court records it.
-const rulingRecord = (result: RulingResult) => ({
+// A ruling as the court records it, with its docket entry's id.
+const rulingRecord = (result: RulingResult, docketEntryId?: string) => ({
   plan: result.plan,
   isApproved: result.isApproved,
   gravest: result.gravest,
   reason: result.reason,
   ...(result.notes ? { notes: result.notes } : {}),
   ...(result.summons ? { summons: result.summons } : {}),
+  ...(docketEntryId !== undefined ? { docketId: docketEntryId } : {}),
 })
 
 // The ruling on a council's verdicts, its conditions reviewed by the arbiter,
@@ -1065,6 +1141,17 @@ async function finishAdvisor($: EngineInterface, runId: string, outcome: Advisor
         ? `${runId}: the advisor is back from ${before.relFolders.join(', ')}/; its report goes to Claude with your next message.`
         : `${runId}: the advisor ${outcome.status === 'timed-out' ? 'timed out' : 'failed'} in ${before.relFolders.join(', ')}/.`,
     )
+    // The person's own advisor goes in the docket: where, what, and what it found.
+    await recordSitting($, {
+      kind: 'advise',
+      question: before.questions.map(entry => entry.question).join('\n'),
+      folders: [...before.relFolders],
+      ...(before.isDeep ? { isDeep: true } : {}),
+      outcome: outcome.status,
+      findings: findingsSummary(outcome.report),
+      runId,
+      by: 'person',
+    })
   }
 }
 
@@ -1162,9 +1249,11 @@ async function holdForAdvisor($: EngineInterface, council: Council, proposal: Pr
     proposal.dispatches.map(dispatch => dispatch.role),
   )
   let orders: Order[] = []
+  const base = await docketBase($)
   await update($, courtAtom, current => {
     orders = newOrders(current, proposal, root, [], now, levels, 'held', settings.leaveApproval)
     const summons: CourtSummons = {
+      ...(base !== undefined ? { docketId: base.id } : {}),
       runId: run.id,
       phase: 'checking',
       orderIds: orders.map(order => order.id),
@@ -1179,6 +1268,17 @@ async function holdForAdvisor($: EngineInterface, council: Council, proposal: Pr
     }
     return { ...withOrdersAdded(current, orders), summonses: [...(current.summonses ?? []), summons] }
   })
+  // The first round, held: its second round's entry follows it (by the run id too).
+  recordDocket($, base, {
+    kind: 'orders',
+    plan: proposal.plan,
+    dispatches: docketDispatches(proposal.dispatches),
+    ...sittingFields(council, replies, proposal.dispatches.length),
+    outcome: 'held',
+    orderIds: orders.map(order => order.id),
+    runId: run.id,
+  })
+  await markCouncilDocket($, council.topic, base?.id)
   const failure = await startAdvisorAgent($, run.id, folders, advisorTask(folders, questions, proposal.plan), level)
   if (failure !== undefined) {
     await finishAdvisor($, run.id, { status: 'failed', report: `It could not start: ${failure}` })
@@ -1294,6 +1394,7 @@ async function ruleSummons($: EngineInterface, runId: string, isTold = true): Pr
   }
   const ruledAt = await $.clock.now()
   const refusal = `refused after the advisor's check (gravest concern ${result.gravest}/5)`
+  const base = await docketBase($)
   let settled: Order[] = []
   await update($, courtAtom, current => {
     settled = []
@@ -1308,8 +1409,22 @@ async function ruleSummons($: EngineInterface, runId: string, isTold = true): Pr
       settled.push(next)
       return next
     })
-    return { ...current, orders, summonses: (current.summonses ?? []).filter(candidate => candidate.runId !== runId), rulings: [...current.rulings.slice(-9), rulingRecord(result)] }
+    return { ...current, orders, summonses: (current.summonses ?? []).filter(candidate => candidate.runId !== runId), rulings: [...current.rulings.slice(-9), rulingRecord(result, base?.id)] }
   })
+  // The second round, linked to the first by its entry and the run id.
+  recordDocket($, base, {
+    kind: 'summons',
+    plan: proposal.plan,
+    dispatches: docketDispatches(proposal.dispatches),
+    ...sittingFields(council, replies, proposal.dispatches.length),
+    outcome: result.isApproved ? 'approved' : 'refused',
+    ...rulingFields(result),
+    orderIds: settled.length > 0 ? settled.map(order => order.id) : stillHeld.map(order => order.id),
+    runId,
+    ...(held.docketId !== undefined ? { follows: held.docketId } : {}),
+    findings: status === 'done' ? findingsSummary(findings) : `The advisor ${status === 'timed-out' ? 'timed out' : 'failed'}; the council ruled on its first round.`,
+  })
+  await markCouncilDocket($, held.council.topic, base?.id)
   if (settled.length === 0) return undefined
   const line = summonsRuledLine(result, settled, waits)
   $.ui.toast(`Council: ${settled.map(order => order.id).join(', ')} ${result.isApproved ? 'released' : 'refused'} after its advisor (${runId}).`)
@@ -1716,12 +1831,22 @@ async function settleOrderTool($: EngineInterface, input: Record<string, unknown
 async function leaveAction($: EngineInterface, id: string, verdict: 'grant' | 'deny'): Promise<string> {
   await expireOrders($)
   let outcome = { error: `No order ${id}.` } as ReturnType<typeof ruleOnLeave>
+  let asked = undefined as Order | undefined
   await update($, courtAtom, current => {
     outcome = ruleOnLeave(current.orders, id, verdict)
+    asked = current.orders.find(candidate => candidate.id === id.trim().toUpperCase())
     return 'error' in outcome ? current : { ...current, orders: outcome.orders }
   })
   if ('error' in outcome) return outcome.error
   const { order } = outcome
+  // The leave as it was asked (a denial drops it from the order).
+  await recordSitting($, {
+    kind: 'leave',
+    dispatches: [{ folder: order.relFolder, role: order.role, ...(asked?.leave ? { leave: [...asked.leave] } : {}) }],
+    outcome: verdict === 'grant' ? 'granted' : 'denied',
+    orderIds: [order.id],
+    by: 'person',
+  })
   await tellMain($, verdict === 'grant' ? `Council: the person granted ${order.id}'s leave; it can be dispatched.` : `Council: the person denied ${order.id}'s leave; it can be dispatched without it.`)
   return outcome.message
 }
@@ -1803,6 +1928,7 @@ async function amendOrderTool($: EngineInterface, input: Record<string, unknown>
   }
   const result = ruling(council, `Amend ${asked.id}: ${amendment.change}`)
   const now = await $.clock.now()
+  const base = await docketBase($)
   const current = (await read($, courtAtom)).orders.find(candidate => candidate.id === asked.id) ?? asked
   // Sent only while the order is still under way and not recalled meanwhile.
   const canSend = result.isApproved && current.agentId !== null && isUnderWay(current) && current.recall === undefined
@@ -1823,8 +1949,17 @@ async function amendOrderTool($: EngineInterface, input: Record<string, unknown>
           })
         : candidate,
     ),
-    rulings: [...court.rulings.slice(-9), { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason }],
+    rulings: [...court.rulings.slice(-9), { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(base !== undefined ? { docketId: base.id } : {}) }],
   }))
+  recordDocket($, base, {
+    kind: 'amendment',
+    plan: `Amend ${asked.id}: ${amendment.change}\nWhy: ${amendment.reason}`,
+    ...sittingFields(council),
+    outcome: result.isApproved ? 'approved' : 'refused',
+    ...rulingFields(result),
+    orderIds: [asked.id],
+  })
+  await markCouncilDocket($, council.topic, base?.id)
   const ruled = (await read($, courtAtom)).orders.find(candidate => candidate.id === asked.id) ?? current
   return amendmentResultText(ruled, result, delivery, settings.amendmentsPerOrder)
 }
@@ -1842,6 +1977,14 @@ async function recallOrderAction($: EngineInterface, request: RecallRequest, by:
   })
   if ('error' in outcome) return outcome.error
   const { order } = outcome
+  await recordSitting($, {
+    kind: 'recall',
+    dispatches: [{ folder: order.relFolder, role: order.role }],
+    outcome: order.status === 'recalled' ? 'recalled' : 'recalling',
+    reason: request.reason,
+    orderIds: [order.id],
+    by,
+  })
   if (order.status === 'recalled') {
     $.ui.toast(`${order.id}: recalled from ${order.relFolder}/.`)
     // Claude hears of a recall the person made; its own tool's answer says it.
@@ -1910,6 +2053,10 @@ async function triage($: EngineInterface, petition: string): Promise<Route> {
 async function petitionDigest($: EngineInterface, petition: string, isAsked: boolean, onlySeat?: string): Promise<string> {
   lastPetition = petition
   const council = await conveneAndWait($, petition, () => forkBrief($, petition), { onlySeat })
+  if (council !== undefined) {
+    const id = await recordSitting($, { kind: 'court', question: petition, ...sittingFields(council), outcome: council.phase === 'done' ? 'adjourned' : 'dissolved' })
+    await markCouncilDocket($, council.topic, id)
+  }
   return council !== undefined && council.phase === 'done'
     ? councilDigest(council, isAsked)
     : "[Court mode: the person's council could not sit on this prompt; go ahead with care.]"
@@ -1926,6 +2073,7 @@ async function courtCommand($: EngineInterface, action: string): Promise<string>
     return 'Finished orders cleared.'
   }
   await update($, isChamberShownAtom, () => false)
+  await update($, isDocketOpenAtom, () => false)
   await $.ui.open({ id: COUNCIL_PANE_ID, title: 'The Council', rows: 30 })
   return 'The court is open.'
 }
@@ -2023,6 +2171,7 @@ async function refreshLearning($: EngineInterface): Promise<void> {
 
 async function openLessons($: EngineInterface): Promise<void> {
   await refreshLearning($)
+  await update($, isDocketOpenAtom, () => false)
   await update($, isLessonsOpenAtom, () => true)
   await $.ui.open({ id: COUNCIL_PANE_ID, title: 'The Council', rows: 30 })
 }
@@ -2089,6 +2238,212 @@ async function forgetLesson($: EngineInterface, id: string): Promise<void> {
   await refreshLearning($)
 }
 
+// ── The docket: every sitting, recorded (docket.ts) ───────────────────────
+
+type DocketBase = Pick<DocketEntry, 'id' | 'time' | 'session' | 'project'>
+type DocketFields = Omit<DocketEntry, 'v' | 'id' | 'time' | 'session' | 'project'>
+
+// One session's writes, one after another (sessions take turns through the lock).
+let docketQueue: Promise<unknown> = Promise.resolve()
+// Entries recorded and not yet written, which the view shows meanwhile.
+let docketPending: DocketEntry[] = []
+// The project's entries as last read, until a new one is written.
+let docketCache: { folder: string; entries: DocketEntry[] } | null = null
+// Once per session: the folder made owner-only, the docket pruned, a failure toasted.
+const securedDockets = new Set<string>()
+const prunedDockets = new Set<string>()
+let isDocketFailureToasted = false
+
+// An entry's id, time, session and project; undefined when they can't be
+// read (the sitting goes on unrecorded). Fast: no file is touched.
+async function docketBase($: EngineInterface): Promise<DocketBase | undefined> {
+  try {
+    const [now, session, project] = await Promise.all([$.clock.now(), $.session.id(), $.session.root()])
+    return { id: docketId(now, Math.random()), time: new Date(now).toISOString(), session, project }
+  } catch {
+    return undefined
+  }
+}
+
+// Queues a sitting's entry (redacted and capped) for writing and returns its
+// id at once. Nothing waits on the write: a failure is toasted once, and the
+// sitting never sees it.
+function recordDocket($: EngineInterface, base: DocketBase | undefined, fields: DocketFields): string | undefined {
+  if (base === undefined) return undefined
+  try {
+    const entry = sealEntry({ v: 1, ...base, ...fields })
+    docketPending = [...docketPending, entry]
+    docketQueue = docketQueue
+      .then(() => writeDocketEntry($, entry))
+      .catch(error => docketFailed($, error))
+      .finally(() => {
+        docketPending = docketPending.filter(pending => pending.id !== entry.id)
+      })
+    return entry.id
+  } catch (error) {
+    docketFailed($, error)
+    return undefined
+  }
+}
+
+const recordSitting = async ($: EngineInterface, fields: DocketFields) => recordDocket($, await docketBase($), fields)
+
+function docketFailed($: EngineInterface, error: unknown): void {
+  if (isDocketFailureToasted) return
+  isDocketFailureToasted = true
+  try {
+    $.ui.toast(`Council: the docket could not be written (${error instanceof Error ? error.message : String(error)}); sittings go on unrecorded.`)
+  } catch {
+    // Nothing more to do: the sitting goes on.
+  }
+}
+
+// The sitting's entry, linked from its council (the chamber's docket button).
+async function markCouncilDocket($: EngineInterface, topic: string, id: string | undefined): Promise<void> {
+  if (id === undefined) return
+  await updateCouncil($, current => (current.topic === topic ? { ...current, docketId: id } : current)).catch(() => undefined)
+}
+
+async function docketPathsFor($: EngineInterface, project: string): Promise<DocketPaths> {
+  const homePath = await home($)
+  if (homePath === '') throw new Error(NO_HOME)
+  const paths = docketPaths(homePath, projectKey(project))
+  if (paths === undefined) throw new Error('its folder could not be placed under the home folder')
+  return paths
+}
+
+// POSIX: the docket's folders owner-only (0700), once per session. $.fs
+// creates folders and files with the default mode, so this runs chmod; on
+// Windows the folder keeps the home folder's own access list.
+async function secureDocketFolder($: EngineInterface, paths: DocketPaths): Promise<void> {
+  if (securedDockets.has(paths.folder)) return
+  securedDockets.add(paths.folder)
+  if (pathStyleOf(paths.root) === 'windows') return
+  await $.process.run(['mkdir', '-p', '-m', '700', paths.folder], { timeoutMs: 5000 }).catch(() => undefined)
+  await $.process.run(['chmod', '700', paths.root, paths.folder], { timeoutMs: 5000 }).catch(() => undefined)
+}
+
+// POSIX: a new day file owner-only (0600).
+async function secureDocketFile($: EngineInterface, path: string): Promise<void> {
+  if (pathStyleOf(path) === 'windows') return
+  await $.process.run(['chmod', '600', path], { timeoutMs: 5000 }).catch(() => undefined)
+}
+
+// Runs `work` holding the project's lock file: written with this call's
+// token, held if the token is still there after DOCKET_LOCK.settleMs (a
+// session writing at the same moment overwrote it otherwise, and waits). A
+// lock older than DOCKET_LOCK.staleMs is taken over; after waitMs it gives up.
+async function withDocketLock<T>($: EngineInterface, paths: DocketPaths, work: () => Promise<T>): Promise<T> {
+  const token = newToken()
+  const started = await $.clock.now()
+  for (;;) {
+    const now = await $.clock.now()
+    if (now - started > DOCKET_LOCK.waitMs) throw new Error('another session held its lock too long')
+    if (isLockHeld(parseLock(await readFileText($, paths.lock)), token, now)) {
+      await $.clock.sleep(DOCKET_LOCK.retryMs)
+      continue
+    }
+    await $.fs.write(paths.lock, formatLock({ token, at: now }))
+    await $.clock.sleep(DOCKET_LOCK.settleMs)
+    if (parseLock(await readFileText($, paths.lock))?.token === token) break
+  }
+  try {
+    return await work()
+  } finally {
+    if (parseLock(await readFileText($, paths.lock))?.token === token) await $.fs.write(paths.lock, '').catch(() => undefined)
+  }
+}
+
+// The project's day files, read (only those: never another file in the folder).
+async function readDocketFiles($: EngineInterface, paths: DocketPaths): Promise<Array<{ name: string; text: string }>> {
+  const listed = await $.fs.list(paths.folder).catch(() => [])
+  const names = listed.filter(entry => entry.kind === 'file' && !entry.isLink && entry.size > 0 && isDayFileName(entry.name)).map(entry => entry.name)
+  const files = await Promise.all(
+    names.map(async name => {
+      const path = docketFile(paths, name)
+      const text = path === undefined ? undefined : await readFileText($, path)
+      return text === undefined ? undefined : { name, text }
+    }),
+  )
+  return files.filter((file): file is { name: string; text: string } => file !== undefined)
+}
+
+// Retention, under the lock: lines past 180 days or the newest 2,000 dropped.
+async function pruneDocket($: EngineInterface, paths: DocketPaths): Promise<void> {
+  const [files, now] = await Promise.all([readDocketFiles($, paths), $.clock.now()])
+  for (const file of prunedFiles(files, now)) {
+    const path = docketFile(paths, file.name)
+    if (path !== undefined) await $.fs.write(path, file.text)
+  }
+}
+
+// One entry onto its day's file, under the lock; the first write of the
+// session prunes the docket first.
+async function writeDocketEntry($: EngineInterface, entry: DocketEntry): Promise<void> {
+  const paths = await docketPathsFor($, entry.project)
+  await secureDocketFolder($, paths)
+  await withDocketLock($, paths, async () => {
+    if (!prunedDockets.has(paths.folder)) {
+      prunedDockets.add(paths.folder)
+      await pruneDocket($, paths).catch(() => undefined)
+    }
+    const path = docketFile(paths, dayFileName(entry.time))
+    if (path === undefined) throw new Error('its day file could not be named')
+    const isThere = await $.fs.exists(path)
+    const existing = isThere ? await readFileText($, path) : ''
+    // A file that is there but can't be read is never overwritten.
+    if (existing === undefined) throw new Error(`${path} could not be read`)
+    await $.fs.write(path, withEntryAppended(existing, entry))
+    if (!isThere) await secureDocketFile($, path)
+  })
+  if (docketCache?.folder === paths.folder) docketCache = null
+  if (await read($, isDocketOpenAtom)) await refreshDocket($).catch(() => undefined)
+}
+
+// This project's entries, newest first: read when the view needs them and
+// kept until a new entry is written, with this session's unwritten ones.
+async function loadDocket($: EngineInterface): Promise<{ project: string; entries: DocketEntry[] }> {
+  const project = await $.session.root()
+  const paths = await docketPathsFor($, project)
+  let cache = docketCache
+  if (cache === null || cache.folder !== paths.folder) {
+    const [files, now] = await Promise.all([readDocketFiles($, paths), $.clock.now()])
+    cache = { folder: paths.folder, entries: docketEntries(files.map(file => file.text), now) }
+    docketCache = cache
+  }
+  const written = new Set(cache.entries.map(entry => entry.id))
+  const pending = docketPending.filter(entry => entry.project === project && !written.has(entry.id)).reverse()
+  return { project, entries: [...pending, ...cache.entries] }
+}
+
+// The docket view, redrawn: a new filter, page or open entry (an open entry
+// moves to the page that holds it).
+async function refreshDocket($: EngineInterface, change: { filter?: DocketFilter; offset?: number; openId?: string | null } = {}): Promise<void> {
+  const current = await read($, docketAtom)
+  const filter = change.filter ?? current?.filter ?? 'all'
+  const openId = change.openId !== undefined ? change.openId : (current?.openId ?? null)
+  let view: DocketView
+  try {
+    const { project, entries } = await loadDocket($)
+    const offset = change.offset ?? (change.openId ? offsetOf(entries, filter, change.openId) : (current?.offset ?? 0))
+    const page = docketPage(entries, filter, offset)
+    view = { project, filter, offset: page.offset, total: page.total, entries: page.entries, openId, error: null }
+  } catch (error) {
+    const project = await $.session.root().catch(() => '')
+    view = { project, filter, offset: 0, total: 0, entries: [], openId: null, error: `Could not read the docket: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  await update($, docketAtom, () => view)
+}
+
+// `/council docket`, or a ruling's or the chamber's docket button (`openId`: that entry, open).
+async function openDocket($: EngineInterface, openId: string | null = null): Promise<void> {
+  await refreshDocket($, openId === null ? { filter: 'all', offset: 0, openId: null } : { filter: 'all', openId })
+  await update($, isLessonsOpenAtom, () => false)
+  await update($, isRosterOpenAtom, () => false)
+  await update($, isDocketOpenAtom, () => true)
+  await openCouncilPane($)
+}
+
 // Who typed the command: the person at the prompt (or through Remote Control),
 // or anything else (a model, a plugin, a schedule).
 const isPersonOrigin = (origin: { kind: string } | undefined) => origin?.kind === 'composer' || origin?.kind === 'bridge'
@@ -2116,6 +2471,7 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   }
   if (action === 'show' && isAlone) {
     if ((await read($, councilAtom)) === null) return 'The council has not convened. /council <topic> to summon it.'
+    await update($, isDocketOpenAtom, () => false)
     await openCouncilPane($)
     return 'The council chamber is open.'
   }
@@ -2129,6 +2485,10 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   if (action === 'lessons' && isAlone) {
     await openLessons($)
     return 'The lessons are open in the chamber.'
+  }
+  if (action === 'docket' && isAlone) {
+    await openDocket($)
+    return 'The docket is open in the chamber.'
   }
   if (action === 'deep' && target === 'reconsider') return reconsider($, trimmed.replace(/^deep\s+reconsider\b/, '').trim(), true)
   if (action === 'deep') return conveneFromText($, trimmed.replace(/^deep\b/, '').trim() || DEFAULT_COUNCIL_TOPIC, true)
@@ -2149,7 +2509,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)

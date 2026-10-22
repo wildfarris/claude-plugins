@@ -110,6 +110,9 @@ export type Council = {
   rounds?: CouncilRound[]
   // Every answered follow-up, oldest first. Absent in older councils.
   followUps?: FollowUpRecord[]
+  // The docket entry that records this sitting (DocketEntry id). Absent until
+  // it is recorded, and in councils from before the docket.
+  docketId?: string
 }
 
 export type RosterEntry = {
@@ -333,6 +336,9 @@ export type CourtSummons = {
   // How the advisor ended, saved as the second round starts, so a round a
   // reload dropped starts again without the run. Absent while checking.
   outcome?: { status: AdvisorRunStatus; findings: string }
+  // The docket entry of the first round (outcome 'held'), which the second
+  // round's entry follows. Absent when it was not recorded.
+  docketId?: string
 }
 
 // What a ruling's summons asked and found.
@@ -350,6 +356,8 @@ export type Ruling = {
   notes?: string[]
   // The advisor the council summoned before ruling, if any.
   summons?: RulingSummons
+  // The docket entry that records it. Absent before the docket.
+  docketId?: string
 }
 
 export type Court = {
@@ -404,6 +412,110 @@ export type LearningView = {
   error: string | null
 }
 
+// ── The docket (docket.ts): a record of every sitting ───────────────────
+
+// What a docket entry records: a consult (Claude's question, a brain trust
+// when `isDeep`), a ruling on orders (outcome approved, refused or held), the
+// second round of a held ruling (summons), a ruling on an amendment, a
+// court-mode council on the person's prompt (court), a council the person
+// convened with /council (council), and the lighter events: the person's
+// leave ruling, an advisor the person sent (advise), and a recall.
+export type DocketKind = 'consult' | 'orders' | 'summons' | 'amendment' | 'court' | 'council' | 'leave' | 'advise' | 'recall'
+
+// One member's vote in a sitting.
+export type DocketVote = {
+  id: AdvisorId
+  title: string
+  status: AdvisorStatus
+  // 1 to 5; 0 when it gave none.
+  concern: number
+  verdict: string
+  // At most 600 characters.
+  detail: string
+  // A consult's option it picked (1-based, 0 for none).
+  choice?: number
+  // A ruling on orders: its LEVEL rating of each dispatch, in order (null
+  // where it gave none), and its CHECK question.
+  levels?: Array<number | null>
+  check?: string
+}
+
+// The concerns counted: how many members gave each concern (index 0 is
+// concern 1), how many abstained or fell silent, and a consult's picks per
+// option (index 0 is option 1).
+export type DocketTally = { gravest: number; concerns: number[]; abstained: number; silent: number; picks?: number[] }
+
+// One sitting, one line of a project's docket. `v` is the schema version: a
+// line of another version is skipped when read. Text is redacted and capped
+// before it is written (question and plan 4,000 characters, each detail 600).
+export type DocketEntry = {
+  v: 1
+  // `20261022T101500-ab12`: when it was recorded, and a random part.
+  id: string
+  // ISO time.
+  time: string
+  kind: DocketKind
+  // The session it happened in ($.session.id).
+  session: string
+  // The session root (the project), as the session gives it.
+  project: string
+  // The question: a consult's, a council's topic, the person's petition, an advisor's.
+  question?: string
+  // A plan of orders, or the amendment asked.
+  plan?: string
+  options?: string[]
+  // The dispatches proposed: folder (relative to the root), role, and leave asked.
+  dispatches?: Array<{ folder: string; role: OrderRole; leave?: string[] }>
+  // The folders an advisor read (advise).
+  folders?: string[]
+  isDeep?: boolean
+  votes?: DocketVote[]
+  abstentions?: Array<{ id: AdvisorId; title: string; reason: string }>
+  tally?: DocketTally
+  // approved, refused or held (a ruling); adjourned or dissolved (a council);
+  // a consult's result (`option 2`, `tie 1, 3`, `no pick`, `advice`);
+  // granted or denied (leave); done, failed or timed-out (advise); recalled
+  // or recalling (recall).
+  outcome: string
+  // Why it was refused, or why it was recalled.
+  reason?: string
+  conditions?: string[]
+  orderIds?: string[]
+  // The arbiter's notes beside the conditions.
+  notes?: string[]
+  // The advisor's findings, cut short.
+  findings?: string
+  // The person's strictness (-2 to 2) and the concern at which a verdict
+  // became a condition, in effect for the sitting.
+  strictness?: number
+  threshold?: number
+  // The advisor run (A3) a summons or an advise names: a held ruling and its
+  // second round share it.
+  runId?: string
+  // The entry this one follows: a summons's held first round.
+  follows?: string
+  // Who recalled the order, or ruled on its leave.
+  by?: 'claude' | 'person'
+}
+
+// The docket view's kind filter: consults (consult, council, court), orders
+// (orders, summons), amendments, and other (leave, advise, recall).
+export type DocketFilter = 'all' | 'consults' | 'orders' | 'amendments' | 'other'
+
+// What the docket view shows: one page of this project's entries, newest
+// first, under the filter; the entry open in full, if any.
+export type DocketView = {
+  project: string
+  filter: DocketFilter
+  // The first entry shown, counted in the filtered list.
+  offset: number
+  // Entries in the filtered list.
+  total: number
+  entries: DocketEntry[]
+  openId: string | null
+  error: string | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     council: {
@@ -425,6 +537,9 @@ declare module 'claude-code' {
       // The pane shows the lessons and guidance.
       isLessonsOpen: boolean
       learning: LearningView | null
+      // The pane shows the docket (/council docket).
+      isDocketOpen: boolean
+      docket: DocketView | null
     }
   }
 }
