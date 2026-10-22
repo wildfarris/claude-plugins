@@ -945,7 +945,8 @@ async function reviewAgentRun($: EngineInterface, agentId: string): Promise<stri
   if (paused !== undefined) return reviewNote(order.id, { kind: 'skipped', why: paused })
   judgeState.calls.set(agentId, spent + 1)
   const context = await scopeContext($)
-  const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), { id: order.id, sentences: order.policy })
+  // With its granted leave, so the review doesn't warn of what was granted.
+  const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), { id: order.id, sentences: order.policy, leave: order.leave })
   const reply = await $.model
     .complete({
       model: settings.model,
@@ -1017,7 +1018,9 @@ async function judgeShellCall(
   context: ScopeContext,
   who: { agentId: string | undefined; order: CarriedOrder | undefined },
 ): Promise<ShellDecision> {
-  const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), who.order === undefined ? undefined : { id: who.order.id, sentences: who.order.policy })
+  // An order's agent answers to its order's rules and granted leave; the
+  // deterministic checks before the judge hold either way (decideCall).
+  const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), who.order === undefined ? undefined : { id: who.order.id, sentences: who.order.policy, leave: who.order.leave })
   const budgetKey = who.agentId ?? 'owner'
   const call: ShellCall = {
     tool,

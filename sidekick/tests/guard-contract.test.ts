@@ -63,7 +63,7 @@ const callOf = (fixture: GuardFixture & { tool: 'Bash' | 'PowerShell' }): ShellC
   isAgent: fixture.agent === 'order',
   agentLabel: fixture.agent === 'order' ? "a council order's agent (order O9)" : "the owner's own session",
   budgetKey: fixture.agent === 'order' ? 'agent-1' : 'owner',
-  policy: assemblePolicy([], fixture.policy ? { id: 'O9', sentences: fixture.policy } : undefined),
+  policy: assemblePolicy([], fixture.policy || fixture.leave ? { id: 'O9', sentences: fixture.policy ?? [], leave: fixture.leave } : undefined),
   recent: fixture.recent ?? [],
 })
 
@@ -87,6 +87,8 @@ describe('stage 2: the fast path, the complexity rule and the judge', () => {
         expect(host.calls.length).toBe(1)
         expect(outcome).toBe(fixture.outcome!)
         for (const text of fixture.promptHas ?? []) expect(host.calls[0]!.prompt).toContain(text)
+        for (const text of fixture.systemHas ?? []) expect(host.calls[0]!.system).toContain(text)
+        for (const text of fixture.systemLacks ?? []) expect(host.calls[0]!.system).not.toContain(text)
         expect(host.calls[0]!.maxTokens).toBe(100)
         expect(host.calls[0]!.effort).toBe('low')
       }

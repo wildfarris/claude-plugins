@@ -56,6 +56,8 @@ export type GuardFixture = {
   cwd?: string
   // The order's plain-language rules.
   policy?: string[]
+  // The order's granted leave (exceptions to the default rules).
+  leave?: string[]
   recent?: string[]
   // The process snapshot is on offer to the judge.
   hasSnapshot?: boolean
@@ -67,9 +69,14 @@ export type GuardFixture = {
   // Text the refusal (or the judge's prompt) must contain.
   says?: string
   promptHas?: string[]
+  // Text the judge's system prompt must (or must not) contain.
+  systemHas?: string[]
+  systemLacks?: string[]
 }
 
 const ORDER_POLICY = ['Commit on local main and push nothing.']
+const LEAVE = ['May run systemctl status and systemctl restart on units this order installs']
+const LEAVE_SECTION = "Granted to this order by the person's council (O9):"
 
 export const FIXTURES: GuardFixture[] = [
   // ── Plain read-only commands: the fast path ──
@@ -192,6 +199,32 @@ export const FIXTURES: GuardFixture[] = [
     outcome: 'deny',
     promptHas: ['3000', 'outside'],
   },
+  // ── Leave: a council order's granted exceptions reach its judge only; code still decides first ──
+  {
+    name: 'systemctl restart under granted leave',
+    tool: 'Bash',
+    text: 'systemctl restart agent-host-kiosk.service',
+    agent: 'order',
+    leave: LEAVE,
+    expect: 'judge',
+    expectStage1: 'allow',
+    judgeAnswer: 'ALLOW',
+    outcome: 'allow',
+    systemHas: [LEAVE_SECTION, `- ${LEAVE[0]}`, "within the leave's own words and no further"],
+  },
+  {
+    name: 'systemctl restart with no leave',
+    tool: 'Bash',
+    text: 'systemctl restart agent-host-kiosk.service',
+    agent: 'order',
+    expect: 'judge',
+    expectStage1: 'allow',
+    judgeAnswer: 'BLOCK: restarts a system service',
+    outcome: 'deny',
+    systemLacks: [LEAVE_SECTION, LEAVE[0]!],
+  },
+  { name: 'inline code under granted leave is still refused', tool: 'Bash', text: 'node -e "require(\'child_process\').execSync(\'systemctl restart x\')"', agent: 'order', leave: LEAVE, expect: 'block', says: 'node -e' },
+  { name: 'a write outside the folder under granted leave is still refused', tool: 'Bash', text: "cat <<'EOF' > ../agmen/kiosk.service\n[Unit]\nEOF", agent: 'order', leave: LEAVE, expect: 'block' },
   {
     name: 'recent commands reach the judge',
     tool: 'Bash',

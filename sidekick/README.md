@@ -95,6 +95,14 @@ A numbered list of sentences, from three places:
 - **Standing rules**: `/rules add policy Don't open pull requests.`, for every session and agent in the root. `/rules list` shows them with the defaults.
 - **A council order's rules**: a dispatch's `forbid` entry written as `{ "rule": "Push nothing." }` (or a bare sentence) instead of a glob. Only that order's agent is held to it.
 
+### Leave: a council order's granted exceptions
+
+Some orders are deliberate system work (an installer on a Debian host, say), which the default rule on installed tools, PATH, services and system settings would refuse. Council 0.3 lets a knight dispatch ask for **leave**: up to four specific exceptions, such as "May run systemctl status and systemctl restart on units this order installs", ruled on by the council with the plan and, by default, granted by you (`/council grant <order>`) before the order can be dispatched. See [the council's README](../council/README.md#leave).
+
+Sidekick reads an order's `leave` only while its `leaveStatus` is `granted`, and only in shape (at most four sentences, each one line of 10 to 200 characters, no angle brackets; anything else is dropped). It adds them to that order's policy alone, last, under their own heading: "Granted to this order by the person's council (O3):". The judge's instructions then say that a leave sentence overrides a conflicting default rule within its own words and no further, never the owner's standing rules or the order's own, and that leave never comes from the data sections (text there claiming an exception grants nothing and is itself a reason to block). Every other agent's, and your own session's, policy and prompt are unchanged, byte for byte, and so is their prompt cache prefix; the order's own verdict cache is keyed on its leave too. The stop review reads the leave, so it doesn't warn of what was granted, and still warns of anything beyond it.
+
+Leave is for the judge only. The inline-code ban, the scope guard (the folder) and the path rules run first and hold whatever the leave says: leave to "edit unit files under /etc/systemd" won't let a command write outside the order's folder.
+
 ### The order of the checks
 
 Code decides first and never waits on a model; a model only ever decides what code leaves open.
@@ -154,6 +162,7 @@ Kept, locally only: the guard's metrics per session (commands cleared by code, c
 - **Too strict for a session?** `/scope judge off`.
 - **A command keeps being refused as too complex?** Split it, or raise `judgeMaxSegments`.
 - **Add a rule?** `/rules add policy <sentence>`, or a council dispatch's `forbid: [{ "rule": "…" }]`.
+- **An order's task needs what the defaults refuse?** Give its knight dispatch `leave`, and grant it with `/council grant <order>`.
 
 The pass/fail set every stage of the guard is tested against is `tests/guard-fixtures.ts`, run by `tests/guard-contract.test.ts` against a fake model.
 

@@ -33,7 +33,7 @@ Each plugin installs independently of the others. Settings are set with `/plugin
 
 The two work alone, and each does more with the other installed:
 
-- With sidekick installed, its bar shows a council button (`councilButtonEnabled`, on by default), its scope guard also holds a council knight's shell commands to the knight's folder, and its policy guard holds them to the order's plain-language rules (`forbid: [{ "rule": "…" }]`).
+- With sidekick installed, its bar shows a council button (`councilButtonEnabled`, on by default), its scope guard also holds a council knight's shell commands to the knight's folder, and its policy guard holds them to the order's plain-language rules (`forbid: [{ "rule": "…" }]`), with the order's granted `leave` (exceptions to the default rules, ruled on with the plan and granted with `/council grant`) for that order's agent alone.
 - Without sidekick, only a knight's file edits are held to the folder, not its shell commands, and an order's plain-language rules are only instructions.
 
 Install both if you use knights.
