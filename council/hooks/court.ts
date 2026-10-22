@@ -7,6 +7,7 @@
 import type { AdvisorId, Council, Court, ForbidOp, ForbidRule, LeaveStatus, Order, OrderLevel, OrderRole, OrderTodo, Ruling, Seat } from '../types'
 import { seatsOf } from './council'
 import { canonicalPath, isPathInside, joinUnder, nativePath, parseAbsolute, pathStyleOf, relativeToRoot, segmentsBelow } from './paths'
+import { conditionAt } from './profile'
 
 export const AGENT_TYPES: Record<OrderRole, string> = { scout: 'council:scout', knight: 'council:knight' }
 
@@ -16,10 +17,14 @@ export const PROGRESS_TOOL = 'mcp__council__progress'
 
 export const emptyCourt = (): Court => ({ orders: [], rulings: [], isInSession: false, heldPrompt: null })
 
-// A ruling refuses the plan when any advisor's concern reaches this.
+// A ruling refuses the plan when any advisor's concern reaches this, whatever
+// the person's strictness.
 export const REFUSE_AT = 5
-// Concerns at or above this become conditions on every order.
+// Concerns at or above this become conditions on every order, for a balanced
+// profile; the person's strictness moves it (profile.ts conditionAt: 4 when
+// lenient, 2 when strict), as a council's own `conditionAtOf` says.
 export const CONDITION_AT = 3
+export const conditionAtOf = (council: Pick<Council, 'strictness'>) => conditionAt(council.strictness)
 export const MAX_DISPATCHES = 6
 export const MAX_TODOS = 12
 
@@ -227,7 +232,8 @@ export function proposalBrief(proposal: Proposal, petition: string | null): stri
   return [...(petition ? [`The person asked: ${petition}`] : []), ...planLines(proposal)].join('\n')
 }
 
-// One advisor's condition on the orders: its concern of 3–4, and the text
+// One advisor's condition on the orders: its concern from the condition
+// threshold (3 when balanced) to 4, and the text
 // every order carries (`text`).
 export type ProposedCondition = { seatId: AdvisorId; title: string; concern: number; verdict: string; detail: string; text: string }
 
@@ -243,8 +249,9 @@ export function ruling(council: Council, plan: string): RulingResult {
   })
   const gravest = Math.max(0, ...reports.map(entry => entry.report.concern))
   const refusing = reports.filter(entry => entry.report.concern >= REFUSE_AT)
+  const threshold = conditionAtOf(council)
   const proposed = reports
-    .filter(entry => entry.report.concern >= CONDITION_AT && entry.report.concern < REFUSE_AT)
+    .filter(entry => entry.report.concern >= threshold && entry.report.concern < REFUSE_AT)
     .map(({ seat, report }) => ({
       seatId: seat.id,
       title: seat.title,
@@ -557,7 +564,7 @@ export function councilDigest(council: Council, isAsked = false): string {
   }
   const concerns = seatsOf(council).flatMap(seat => {
     const report = council.advisors[seat.id]
-    return report?.status === 'done' && report.concern >= CONDITION_AT ? [line(seat.title, report)] : []
+    return report?.status === 'done' && report.concern >= conditionAtOf(council) ? [line(seat.title, report)] : []
   })
   return [
     concerns.length === 0 ? "[The person's council reviewed this prompt and raised no concerns.]" : "[The person's council reviewed this prompt. Weigh these concerns before acting:]",
@@ -796,7 +803,10 @@ export const levelOf = (order: Pick<Order, 'role' | 'level'>): OrderLevel => ord
 // LEVEL line per dispatch, and (when summons are on) an optional CHECK. No
 // extra model call: it rides on the ruling's own.
 // `hasLeave`: some dispatch asks for leave, which the members weigh with the plan.
-export function orderAsk(count: number, isSummonsOn: boolean, hasLeave = false): string {
+// `threshold`: the concern at which a verdict becomes a condition (the
+// person's strictness moves it); a CHECK is asked only between it and 4.
+export function orderAsk(count: number, isSummonsOn: boolean, hasLeave = false, threshold = CONDITION_AT): string {
+  const checkRange = threshold >= 4 ? '4' : threshold === 3 ? '3 or 4' : `${threshold} to 4`
   return [
     ...(hasLeave
       ? [
@@ -806,7 +816,7 @@ export function orderAsk(count: number, isSummonsOn: boolean, hasLeave = false):
     `Also rate how demanding each numbered dispatch is, one line per dispatch: LEVEL <dispatch number>: <1 to 3>, where 1 = a simple lookup or mechanical edit, 2 = ordinary work, 3 = needs deep reasoning or is risky. (${count} dispatch${count === 1 ? '' : 'es'}: LEVEL 1${count > 1 ? ` to LEVEL ${count}` : ''}.)`,
     ...(isSummonsOn
       ? [
-          'Only if your concern is 3 or 4 and hinges on a fact you cannot see in the brief (what a file in those folders says, whether something exists there), add one line: CHECK: <one question a read-only agent could answer by reading the dispatch folders>. Otherwise leave CHECK out.',
+          `Only if your concern is ${checkRange} and hinges on a fact you cannot see in the brief (what a file in those folders says, whether something exists there), add one line: CHECK: <one question a read-only agent could answer by reading the dispatch folders>. Otherwise leave CHECK out.`,
         ]
       : []),
   ].join('\n')

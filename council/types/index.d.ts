@@ -92,6 +92,10 @@ export type Council = {
   // The person's standing context (guidance and recent lessons) given to
   // every advisor of this council, fixed when it convened.
   standing?: string | null
+  // The person's strictness from their profile (-2 lenient to 2 strict),
+  // fixed when it convened: it moves the concern at which a verdict becomes a
+  // condition (profile.ts conditionAt). Absent: balanced.
+  strictness?: number
   // Who put the question: the person, or Claude (a consult, the court's
   // orders). Only the person's questions go into lessons.
   source?: 'person' | 'claude'

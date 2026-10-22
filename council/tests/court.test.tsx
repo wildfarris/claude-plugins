@@ -238,7 +238,7 @@ test('orders: on the road newest first, then back home, then the archive', async
   await pane.unmount()
 })
 
-test('the terminal animation never runs for a desktop chamber, and does for a terminal one', async ($, on) => {
+test('the terminal animation never runs for a desktop chamber or compact rows, and does for an opened card or wide cards', async ($, on) => {
   const harness = courtStandIn(on)
   const blits: string[] = []
   on('ui.blit', ($, e) => {
@@ -252,7 +252,21 @@ test('the terminal animation never runs for a desktop chamber, and does for a te
   await pane.unmount()
   await harness.clock.advance(2000)
   expect(blits).toEqual([])
+  // 100 columns hold no five cards side by side: compact rows, no portraits, no timer work.
   pane = await mountPane($, 'terminal')
+  expect(await pane.find({ type: 'Raster' })).toBeUndefined()
+  await harness.clock.advance(2000)
+  expect(blits).toEqual([])
+  // Opening a row shows its portrait, and only that one is repainted.
+  await pane.press({ key: 'row-castellan' })
+  expect(await pane.find({ type: 'Raster' })).toBeDefined()
+  await harness.clock.advance(2000)
+  expect(blits.length).toBeGreaterThan(0)
+  await pane.unmount()
+  // A wide pane draws every card with its portrait.
+  blits.length = 0
+  pane = await $.ui.mount({ plugin: 'council', surface: 'terminal', component: 'Pane', requestId: 'council-chamber', props: { ...PANE, bodyColumns: 140 } })
+  expect((await pane.findAll({ type: 'Raster' })).length).toBe(5)
   await harness.clock.advance(2000)
   expect(blits.length).toBeGreaterThan(0)
   await pane.unmount()

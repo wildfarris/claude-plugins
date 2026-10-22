@@ -113,7 +113,7 @@ import {
   needsArbiter,
   parseArbiterReply,
   withArbiterReview,
-  CONDITION_AT,
+  conditionAtOf,
   REFUSE_AT,
   SETTLE_ORDER_DESCRIPTION,
   SETTLE_ORDER_SCHEMA,
@@ -204,6 +204,7 @@ import {
 } from './learning'
 import { councilView, portraitFor, rosterView } from './views/council'
 import { MAX_SEATS, mergeMembers, parseMemberFile, resolveReference, seatedMembers, trimReferences, BUILT_IN_MEMBERS, type MemberDefinition } from './members'
+import { conditionAt, mergeProfiles, parseProfile, profileContext, profileReport, type Profile, type ProfileFields, type ProfileSource } from './profile'
 
 const COUNCIL_PANE_ID = 'council-chamber'
 const DEFAULT_COUNCIL_TOPIC = 'The work in progress in this session: is the current approach sound?'
@@ -232,6 +233,9 @@ let isBlitting = false
 // Set while startAnimation awaits, so two overlapping starts make one timer.
 let isStartingAnimation = false
 const lastBlitCells = new Map<AdvisorId, string>()
+// The seats whose portrait the terminal's chamber drew last: the only ones
+// the timer repaints (a compact row has none).
+const shownSprites = new Set<AdvisorId>()
 // The effort each council agent's requests run at, by agent id (turn.step);
 // rebuilt from the court's orders and runs after a reload.
 const stepEfforts = new Map<string, string>()
@@ -269,10 +273,10 @@ async function blitSprites($: EngineInterface): Promise<void> {
   isBlitting = true
   try {
     const council = await read($, councilAtom)
-    if (council === null) return stopAnimation()
+    if (council === null || shownSprites.size === 0) return stopAnimation()
     const changed = seatsOf(council).flatMap(advisor => {
       const report = council.advisors[advisor.id]
-      if (report === undefined) return []
+      if (report === undefined || !shownSprites.has(advisor.id)) return []
       const cells = rasterCells(spriteFrame(advisor, moodFor(report, council.phase), animationTick))
       return lastBlitCells.get(advisor.id) === cells ? [] : [{ id: advisor.id, cells }]
     })
@@ -435,8 +439,9 @@ async function startCouncil($: EngineInterface, topic: string, isDeep: boolean, 
   if (seats.length === 0) return 'No one is seated on this project\'s council. /council members to seat someone.'
   if (problems.length > 0) $.ui.toast(`Council: ${problems.length} member file problem${problems.length === 1 ? '' : 's'}; /council members shows them.`)
   const generation = ++councilGeneration
-  const standing = await standingFor($).catch(() => null)
-  await update($, councilAtom, () => ({ ...newCouncil(topic, seats, isDeep), standing, source: 'person' as const }))
+  const { standing, strictness, problems: profileProblems } = await councilContext($)
+  if (profileProblems.length > 0) $.ui.toast(`Council: ${profileProblems.length} profile problem${profileProblems.length === 1 ? '' : 's'}; /council profile shows them.`)
+  await update($, councilAtom, () => ({ ...newCouncil(topic, seats, isDeep), standing, ...(strictness !== 0 ? { strictness } : {}), source: 'person' as const }))
   await update($, isRosterOpenAtom, () => false)
   // A council you convened opens to its chamber, even when the court has orders.
   await update($, isChamberShownAtom, () => true)
@@ -615,6 +620,8 @@ async function settleInterruptedWork($: EngineInterface): Promise<void> {
 
 async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
   const table = $.ui.resolve(e)
+  // Whatever this draw shows, the portraits drawn before are gone from the pane.
+  if (e.surface === 'terminal') shownSprites.clear()
   const [council, isRosterOpen, roster, isLessonsOpen, learning] = await Promise.all([
     read($, councilAtom),
     read($, isRosterOpenAtom),
@@ -686,15 +693,29 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)), advisors: (current.advisors ?? []).filter(run => !isClearable(run, current)) })),
     })
   }
-  if (e.surface === 'terminal' && council !== null) startAnimation($)
   if (council === null) return <table.Text dimColor>The council has not convened. /council &lt;question&gt; to summon it; /council members to choose who sits.</table.Text>
-  return councilView(table, {
+  const isTerminal = e.surface === 'terminal'
+  // The portraits this draw holds: compact rows have none, so the timer
+  // repaints only these, and doesn't run when there are none.
+  const portraits = new Set<AdvisorId>()
+  const tree = councilView(table, {
     council,
     bodyColumns: e.props.bodyColumns,
-    hasHotkeys: e.surface === 'terminal',
-    portrait: (seat, report) => portraitFor(table, e.surface, seat, report, council, animationTick),
+    bodyRows: (e.props as { scroll?: { bodyRows?: number } }).scroll?.bodyRows,
+    isTerminal,
+    hasHotkeys: isTerminal,
+    portrait: (seat, report) => {
+      portraits.add(seat.id)
+      return portraitFor(table, e.surface, seat, report, council, animationTick)
+    },
     onToggleBrief: () => updateCouncil($, current => ({ ...current, isBriefExpanded: !current.isBriefExpanded })),
     onToggleAdvisor: id => updateAdvisor($, id, report => ({ ...report, isExpanded: !report.isExpanded })),
+    // One card open at a time among the compact rows.
+    onOpenAdvisor: id =>
+      updateCouncil($, current => ({
+        ...current,
+        advisors: Object.fromEntries(Object.entries(current.advisors).map(([seatId, report]) => [seatId, { ...report, isExpanded: seatId === id ? !report.isExpanded : false }])),
+      })),
     // Fills the prompt box in front of the draft: the question is finished there and sent with Enter.
     onAsk: id => fillCommand($, `/council ask ${id} `),
     onReconsider: () => fillCommand($, '/council reconsider '),
@@ -705,6 +726,12 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
     onLessons: () => openLessons($),
     ...(hasCourt ? { onCourt: () => update($, isChamberShownAtom, () => false) } : {}),
   })
+  if (isTerminal) {
+    for (const id of portraits) shownSprites.add(id)
+    if (shownSprites.size > 0) startAnimation($)
+    else stopAnimation()
+  }
+  return tree
 }
 
 // ── Members ───────────────────────────────────────────────────────────────
@@ -782,12 +809,13 @@ async function seatsForProject($: EngineInterface): Promise<{ seats: Seat[]; pro
 }
 
 async function refreshRoster($: EngineInterface): Promise<Roster> {
-  const { members, problems, root } = await loadMembers($)
+  const [{ members, problems, root }, loaded] = await Promise.all([loadMembers($), loadProfile($).catch(() => undefined)])
   const off = await unseatedIds($, root)
   const seated = seatedMembers(members, off).slice(0, MAX_SEATS).map(member => member.id)
   const roster: Roster = {
     entries: members.map(member => ({ id: member.id, title: member.title, concern: member.concern, color: member.color, source: member.source, isSeated: seated.includes(member.id) })),
-    problems: [...problems, ...(members.length - off.length > MAX_SEATS ? [`At most ${MAX_SEATS} sit at once; the rest wait until a seat is free.`] : [])],
+    // The profile's problems beside the member files' (/council profile has the rest of it).
+    problems: [...problems, ...(loaded?.profile.problems ?? []), ...(members.length - off.length > MAX_SEATS ? [`At most ${MAX_SEATS} sit at once; the rest wait until a seat is free.`] : [])],
   }
   await update($, rosterAtom, () => roster)
   return roster
@@ -856,8 +884,8 @@ async function conveneAndWait(
   const seats = sitting.onlySeat === undefined ? seated : seated.filter(seat => seat.id === sitting.onlySeat)
   if (seats.length === 0) return undefined
   const generation = ++councilGeneration
-  const standing = await standingFor($).catch(() => null)
-  const council: Council = { ...newCouncil(topic, seats, sitting.isDeep === true), standing, source: sitting.source ?? 'person' }
+  const { standing, strictness } = await councilContext($)
+  const council: Council = { ...newCouncil(topic, seats, sitting.isDeep === true), standing, ...(strictness !== 0 ? { strictness } : {}), source: sitting.source ?? 'person' }
   await update($, councilAtom, () => (sitting.options && sitting.options.length > 0 ? { ...council, options: sitting.options } : council))
   // The court's sittings show the court; a consult shows its chamber.
   await update($, isChamberShownAtom, () => sitting.isChamber === true)
@@ -902,9 +930,11 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   // Each member's raw answers, newest round first, for the LEVEL lines.
   const replies = new Map<AdvisorId, string>()
   const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
+  // The person's strictness sets which concerns may ask a CHECK.
+  const threshold = conditionAt((await loadProfile($).catch(() => undefined))?.profile.strictness)
   const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal, lastPetition) }), {
     source: 'claude',
-    extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn, hasLeave(proposal)),
+    extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn, hasLeave(proposal), threshold),
     onReply,
   })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
@@ -1110,7 +1140,7 @@ function summonsChecks(council: Council, proposal: Proposal, replies: ReadonlyMa
   const checks = seatsOf(council).flatMap(seat => {
     const report = council.advisors[seat.id]
     const reply = replies.get(seat.id)
-    if (report?.status !== 'done' || report.concern < CONDITION_AT || report.concern >= REFUSE_AT || reply === undefined) return []
+    if (report?.status !== 'done' || report.concern < conditionAtOf(council) || report.concern >= REFUSE_AT || reply === undefined) return []
     const question = parseCheck(reply)
     return question === undefined ? [] : [{ title: seat.title, question }]
   })
@@ -1927,6 +1957,48 @@ async function standingFor($: EngineInterface): Promise<string | null> {
   return standingContext(learning.guidance, learning.lessons, project)
 }
 
+// ── The person's profile ──────────────────────────────────────────────────
+
+async function profilePaths($: EngineInterface): Promise<Record<ProfileSource, string> & { home: string }> {
+  const [root, homePath] = await Promise.all([$.session.root(), home($)])
+  return { home: homePath, user: homePath === '' ? '' : `${homePath}/.claude/council/profile.md`, project: `${root}/.claude/council/profile.md` }
+}
+
+// The profile in effect here: the project's file over the person's own, field
+// by field; no file is the default (balanced, no scale). Problems name the
+// fields left out.
+async function loadProfile($: EngineInterface): Promise<{ profile: Profile; paths: Record<ProfileSource, string>; found: Record<ProfileSource, boolean> }> {
+  const paths = await profilePaths($)
+  const readOne = async (path: string, label: string) => {
+    const text = path === '' ? undefined : await readFileText($, path)
+    return text === undefined ? undefined : parseProfile(text, label)
+  }
+  const [user, project] = await Promise.all([readOne(paths.user, '~/.claude/council/profile.md'), readOne(paths.project, '.claude/council/profile.md')])
+  const problems = [...(user?.problems ?? []), ...(project?.problems ?? [])]
+  const fields = (parsed: { fields: ProfileFields } | undefined) => parsed?.fields
+  return {
+    profile: mergeProfiles(fields(user), fields(project), problems),
+    paths: { user: paths.user || '~/.claude/council/profile.md (no home folder)', project: paths.project },
+    found: { user: user !== undefined, project: project !== undefined },
+  }
+}
+
+// A new council's context, fixed when it convenes: the profile and the
+// standing context as every member reads them, and the strictness that sets
+// its condition threshold. A failure reads as no profile, no standing.
+async function councilContext($: EngineInterface): Promise<{ standing: string | null; strictness: number; problems: string[] }> {
+  const [loaded, standing] = await Promise.all([loadProfile($).catch(() => undefined), standingFor($).catch(() => null)])
+  const profile = loaded === undefined ? null : profileContext(loaded.profile)
+  const parts = [profile, standing].filter((part): part is string => part !== null && part !== '')
+  return { standing: parts.length > 0 ? parts.join('\n\n') : null, strictness: loaded?.profile.strictness ?? 0, problems: loaded?.profile.problems ?? [] }
+}
+
+// `/council profile`: the profile in effect, each field's file, and any problems.
+async function profileCommand($: EngineInterface): Promise<string> {
+  const { profile, paths, found } = await loadProfile($)
+  return profileReport(profile, paths, found)
+}
+
 const rejectedKey = (project: string) => `learning-rejected:${project}`
 
 async function refreshLearning($: EngineInterface): Promise<void> {
@@ -2052,6 +2124,7 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
     return 'The council is dismissed.'
   }
   if (action === 'members') return membersCommand($, target, words.join(' '))
+  if (action === 'profile' && isAlone) return profileCommand($)
   if (action === 'court') return courtCommand($, target)
   if (action === 'lessons' && isAlone) {
     await openLessons($)
@@ -2076,7 +2149,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|lessons|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)

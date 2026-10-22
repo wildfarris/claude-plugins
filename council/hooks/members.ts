@@ -36,7 +36,7 @@ export const BUILT_IN_MEMBERS: readonly MemberDefinition[] = [
     id: 'castellan',
     title: 'The Castellan',
     concern: 'Security',
-    remit: 'security: secrets, tokens or keys leaking into code, logs, prompts or commits; injection of any kind (shell, SQL, prompt, path traversal); where untrusted input crosses a trust boundary and how it is checked; authentication, authorization, least privilege, and tokens or scopes broader than the job needs; sensitive or personal data exposed at rest, in transit or in URLs; supply-chain risk (unvetted, abandoned or look-alike packages, unpinned versions, install scripts); and destructive or irreversible operations without a backup or confirmation',
+    remit: 'security: secrets, tokens or keys leaking into code, logs, prompts or commits; injection of any kind (shell, SQL, prompt, path traversal); where untrusted input crosses a trust boundary and how it is checked; authentication, authorization, least privilege, and tokens or scopes broader than the job needs; sensitive or personal data exposed at rest, in transit or in URLs; supply-chain risk (unvetted, abandoned or look-alike packages, unpinned versions, install scripts); and destructive or irreversible operations without a backup or confirmation. A control counts only where it is a real boundary: extra layers that resolve to the same identity and operator add no security, so their absence is no cause for concern',
     color: '#4f86c6',
     accessory: 'shield',
   },
@@ -44,7 +44,7 @@ export const BUILT_IN_MEMBERS: readonly MemberDefinition[] = [
     id: 'treasurer',
     title: 'The Lord Treasurer',
     concern: 'Money',
-    remit: 'money: metered spend (API and model tokens, per-request, storage and egress charges) and whether it has a ceiling; subscriptions, plan tiers and usage limits, and what breaks when a free tier ends or a quota runs out; infrastructure and hosting cost now and as use grows; lock-in that makes leaving expensive; and the time cost of the approach, in build effort and ongoing upkeep, against cheaper paths to the same result',
+    remit: "money: metered spend (API and model tokens, per-request, storage and egress charges) and whether it has a ceiling; subscriptions, plan tiers and usage limits, and what breaks when a free tier ends or a quota runs out; infrastructure and hosting cost now and as use grows; lock-in that makes leaving expensive; and the time cost of the approach, in build effort and ongoing upkeep, against cheaper paths to the same result. Widely held judgements: an unbounded or metered cost with no ceiling is not acceptable; don't rent capacity that is already owned; don't depend on a paid-only tier; and back up only what is cheap to keep and painful to lose",
     color: '#2f9e5b',
     accessory: 'crown',
   },
@@ -52,7 +52,7 @@ export const BUILT_IN_MEMBERS: readonly MemberDefinition[] = [
     id: 'seneschal',
     title: 'The Seneschal',
     concern: 'Reasonableness',
-    remit: "reasonableness: whether the plan is proportionate to the goal and solves the problem actually asked; simpler or existing alternatives, including tools already in use; scope creep and unrequested extras; maintainability (how hard it will be to read, change and debug later, and whether it brings a dependency or pattern the codebase doesn't already have); hidden assumptions and failure modes; and whether it will actually work as described, with a way to verify that it does",
+    remit: "reasonableness: whether the plan is proportionate to the goal and solves the problem actually asked; simpler or existing alternatives, including tools already in use; scope creep and unrequested extras; maintainability (how hard it will be to read, change and debug later, and whether it brings a dependency or pattern the codebase doesn't already have); hidden assumptions and failure modes; and whether it will actually work as described, with a way to verify that it does. Widely held judgements: take the platform's native path first; prefer one tool of each kind, used everywhere, over several that overlap; adopt a mature tool that fits most of the need and live with a small gap, building only when the gap matters; don't stack heavy frameworks; code a reviewer can't follow counts against a tool; test the contract or abstraction rather than every function; what nothing depends on can be rewritten freely, while change to what is in use is contained behind switches; known, rare nuisances can be lived with; and small third-party libraries likely to be abandoned are a liability",
     color: '#e0913a',
     accessory: 'none',
   },
@@ -60,7 +60,7 @@ export const BUILT_IN_MEMBERS: readonly MemberDefinition[] = [
     id: 'justiciar',
     title: 'The High Justiciar',
     concern: 'Legal',
-    remit: "legal: licenses for code, models, data and assets (copyleft obligations, compatibility, attribution and notices); the terms of service and acceptable-use rules of every service touched, including limits on scraping and automation; privacy and personal data (what is collected, kept, shared or sent across borders, consent and retention, under laws such as GDPR and CCPA); intellectual property, including copied or generated content; contracts and liability; and regulated areas such as payments, health or children's data",
+    remit: "legal: licenses for code, models, data and assets (copyleft obligations, compatibility, attribution and notices); the terms of service and acceptable-use rules of every service touched, including limits on scraping and automation; privacy and personal data (what is collected, kept, shared or sent across borders, consent and retention, under laws such as GDPR and CCPA); intellectual property, including copied or generated content; contracts and liability; and regulated areas such as payments, health or children's data. Relying on a grey area of a service's terms is a risk in itself",
     color: '#c0392b',
     accessory: 'standard',
   },
@@ -94,7 +94,8 @@ const expandColor = (color: string) => (color.length === 4 ? `#${color.slice(1).
 const unquote = (value: string) => value.trim().replace(/^(["'])(.*)\1$/, '$2')
 
 // The header's fields: `key: value` lines and `- item` lists under a key.
-function parseHeader(lines: readonly string[]): Record<string, string | string[]> {
+// (The profile file's header is read the same way: profile.ts.)
+export function parseHeader(lines: readonly string[]): Record<string, string | string[]> {
   const fields: Record<string, string | string[]> = {}
   let listKey: string | undefined
   for (const line of lines) {
