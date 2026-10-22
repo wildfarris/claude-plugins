@@ -27,7 +27,6 @@ export const DEFAULT_POLICY: readonly string[] = [
   FOLDER_RULE,
   'Stop only processes this session started, by their ID.',
   "Don't change installed tools, PATH, services or system settings.",
-  "Don't run Python.",
 ]
 
 export const MAX_POLICY_SENTENCE = 300

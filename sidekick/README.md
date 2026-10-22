@@ -91,7 +91,7 @@ The scope guard asks one question: does this change files outside the folder? Th
 
 A numbered list of sentences, from three places:
 
-- **The default policy**, shipped with sidekick: "Change files only inside the target folders." "Stop only processes this session started, by their ID." "Don't change installed tools, PATH, services or system settings." "Don't run Python."
+- **The default policy**, shipped with sidekick: "Change files only inside the target folders." "Stop only processes this session started, by their ID." "Don't change installed tools, PATH, services or system settings."
 - **Standing rules**: `/rules add policy Don't open pull requests.`, for every session and agent in the root. `/rules list` shows them with the defaults.
 - **A council order's rules**: a dispatch's `forbid` entry written as `{ "rule": "Push nothing." }` (or a bare sentence) instead of a glob. Only that order's agent is held to it.
 

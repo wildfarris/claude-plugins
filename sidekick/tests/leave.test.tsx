@@ -49,7 +49,7 @@ describe("the policy's leave section", () => {
     expect(policyLines(plain)).not.toContain(leaveHeading('O3'))
     expect(policyLines(granted)).toEqual([
       ...DEFAULT_POLICY.map((rule, index) => `${index + 1}. ${rule} (default)`),
-      '5. Push nothing. (order O3)',
+      '4. Push nothing. (order O3)',
       '',
       "Granted to this order by the person's council (O3):",
       `- ${SYSTEMCTL}`,
@@ -58,7 +58,7 @@ describe("the policy's leave section", () => {
     expect(policyVersion(granted)).not.toBe(policyVersion(plain))
     // A rule worded like a leave sentence is still a rule, and the leave still shows.
     const both = assemblePolicy([SYSTEMCTL], { id: 'O3', sentences: [], leave: [SYSTEMCTL] })
-    expect(both.map(rule => rule.source.kind)).toEqual(['default', 'default', 'default', 'default', 'standing', 'leave'])
+    expect(both.map(rule => rule.source.kind)).toEqual(['default', 'default', 'default', 'standing', 'leave'])
   })
 
   test("the judge's prompt explains leave only when the policy has it; the ban on exceptions from data stays", () => {
