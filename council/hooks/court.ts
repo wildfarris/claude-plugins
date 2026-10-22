@@ -144,7 +144,7 @@ export function ruleOnLeave(orders: readonly Order[], id: string, verdict: 'gran
   const order = orders.find(candidate => candidate.id === wanted)
   if (order === undefined) return { error: `No order ${wanted}.` }
   if (!order.leave || order.leave.length === 0) return { error: `${order.id} asks for no leave${order.leaveStatus === 'denied' ? ' (it was denied)' : ''}.` }
-  if (order.status !== 'approved' && order.status !== 'held') return { error: `${order.id} is ${order.status}: leave is ruled on only before the order is dispatched.` }
+  if (order.status !== 'approved') return { error: `${order.id} is ${order.status}: leave is ruled on only before the order is dispatched.` }
   if (verdict === 'grant' && order.leaveStatus === 'granted') return { error: `${order.id}'s leave is already granted.` }
   const { leave: _dropped, ...rest } = order
   const next: Order = verdict === 'grant' ? { ...order, leaveStatus: 'granted' } : { ...rest, leaveStatus: 'denied' }
@@ -396,10 +396,8 @@ export const withOrdersAdded = (court: Court, orders: readonly Order[]): Court =
 
 // `now` (ms) stamps when each order was approved, which starts its expiry
 // clock; `levels`, the council's rating of each dispatch (court.ts orderLevels).
-// `status`: 'held' while the council's summoned advisor checks a fact.
 // `leaveApproval`: who grants a knight's leave (settings): 'owner' leaves it
-// pending until the person grants it; 'council' grants it with the approval
-// (a held order's, at its release: leaveOnApproval).
+// pending until the person grants it; 'council' grants it with the approval.
 export function newOrders(
   court: Court,
   proposal: Proposal,
@@ -407,7 +405,6 @@ export function newOrders(
   conditions: string[],
   now?: number,
   levels?: readonly OrderLevel[],
-  status: 'approved' | 'held' = 'approved',
   leaveApproval: 'owner' | 'council' = 'owner',
 ): Order[] {
   const next = nextOrderNumber(court)
@@ -424,9 +421,9 @@ export function newOrders(
     ...(dispatch.forbid && dispatch.forbid.length > 0 ? { forbid: dispatch.forbid } : {}),
     ...(dispatch.policy && dispatch.policy.length > 0 ? { policy: dispatch.policy } : {}),
     ...(dispatch.role === 'knight' && dispatch.leave && dispatch.leave.length > 0
-      ? { leave: [...dispatch.leave], leaveStatus: (leaveApproval === 'council' && status === 'approved' ? 'granted' : 'pending') as LeaveStatus }
+      ? { leave: [...dispatch.leave], leaveStatus: (leaveApproval === 'council' ? 'granted' : 'pending') as LeaveStatus }
       : {}),
-    status,
+    status: 'approved',
     agentId: null,
     steps: 0,
     edits: 0,
@@ -436,11 +433,6 @@ export function newOrders(
     ...(now === undefined ? {} : { approvedAt: now }),
   }))
 }
-
-// A held order released by the council: with leaveApproval 'council', its
-// pending leave is granted with the release.
-export const leaveOnApproval = (order: Pick<Order, 'leave' | 'leaveStatus'>, leaveApproval: 'owner' | 'council'): { leaveStatus?: LeaveStatus } =>
-  leaveApproval === 'council' && (order.leave ?? []).length > 0 && order.leaveStatus === 'pending' ? { leaveStatus: 'granted' } : {}
 
 // An order's leave beside its line for Claude.
 const leaveNote = (order: Order) => (order.leave && order.leave.length > 0 ? `, leave (${order.leaveStatus ?? 'pending'}): ${leaveText(order.leave)}` : '')
@@ -462,12 +454,11 @@ export const beyondLines = (result: Pick<Ruling, 'beyond'>): string[] => (result
 // What the tool tells Claude after the ruling.
 export function rulingText(result: Ruling & { conditions: string[] }, orders: readonly Order[]): string {
   if (!result.isApproved) {
-    return [`The council refused the plan (gravest concern ${result.gravest}/5). ${result.reason}`, ...summonsLines(result.summons), ...beyondLines(result), 'Revise the plan and propose again, or ask the person.'].join('\n')
+    return [`The council refused the plan (gravest concern ${result.gravest}/5). ${result.reason}`, ...beyondLines(result), 'Revise the plan and propose again, or ask the person.'].join('\n')
   }
   const notes = result.notes ?? []
   return [
     `The council approved the plan (gravest concern ${result.gravest}/5).`,
-    ...summonsLines(result.summons),
     ...(result.conditions.length > 0 ? ['Conditions:', ...result.conditions.map(condition => `- ${condition}`)] : []),
     ...(notes.length > 0 ? ['Notes (not conditions; the orders do not carry them):', ...notes.map(note => `- ${note}`)] : []),
     ...beyondLines(result),
@@ -616,22 +607,7 @@ export function parseTriage(answer: string | undefined, seatIds: readonly string
 }
 
 // An open order is approved and waiting: the only kind a dispatch may carry.
-// A held one may also be withdrawn, and expires the same way.
 export const isOpen = (order: Pick<Order, 'status'>) => order.status === 'approved'
-
-export const isHeld = (order: Pick<Order, 'status'>) => order.status === 'held'
-
-// Why a dispatch is refused when it names a held order (or its role has only
-// held ones): the council still waits on its advisor. Undefined otherwise.
-export function heldRefusal(orders: readonly Order[], subagentType: string, description: string, prompt: string): string | undefined {
-  const role = (Object.keys(AGENT_TYPES) as OrderRole[]).find(key => AGENT_TYPES[key] === subagentType)
-  if (role === undefined) return undefined
-  const named = /\bO(\d+)\b/.exec(description) ?? /\bO(\d+)\b/.exec(prompt)
-  const held = orders.filter(order => isHeld(order) && order.role === role)
-  const blocked = named ? held.filter(order => order.id === `O${named[1]}`) : orders.some(order => isOpen(order) && order.role === role) ? [] : held
-  if (blocked.length === 0) return undefined
-  return `${blocked.map(order => order.id).join(', ')} ${blocked.length === 1 ? 'is' : 'are'} held while the council's advisor checks a fact. You will be told when the council rules; dispatch then.`
-}
 
 // Settled, lost and withdrawn orders count as finished: they show in the
 // finished section and fold away like the rest. Unsettled and waiting orders
@@ -698,7 +674,7 @@ export function withdrawOrders(orders: readonly Order[], ids: readonly string[],
 export function withdrawalText(result: { withdrawn: readonly string[]; refused: readonly WithdrawalRefusal[] }, reason: string): string {
   return [
     result.withdrawn.length > 0 ? `Withdrew ${result.withdrawn.join(', ')} (${reason}). ${result.withdrawn.length === 1 ? 'It' : 'They'} can no longer be dispatched.` : 'Withdrew nothing.',
-    ...result.refused.map(refusal => `Refused ${refusal.id}: ${refusal.why}. Only approved or held orders that have not been dispatched can be withdrawn.`),
+    ...result.refused.map(refusal => `Refused ${refusal.id}: ${refusal.why}. Only approved orders that have not been dispatched can be withdrawn.`),
   ].join('\n')
 }
 
@@ -709,7 +685,7 @@ export function withdrawalText(result: { withdrawn: readonly string[]; refused: 
 export function withExpired(orders: readonly Order[], now: number): readonly Order[] {
   let isChanged = false
   const next = orders.map((order): Order => {
-    if (!isOpen(order) && !isHeld(order)) return order
+    if (!isOpen(order)) return order
     if (order.approvedAt === undefined) {
       isChanged = true
       return { ...order, approvedAt: now }
@@ -724,7 +700,7 @@ export function withExpired(orders: readonly Order[], now: number): readonly Ord
 }
 
 export const WITHDRAW_ORDERS_DESCRIPTION =
-  "Retire approved orders you have decided not to dispatch (the person changed their mind, a launch was rejected, the plan changed), so they stop waiting in the court. Give their ids and a short reason. Only approved or held orders that no agent has been sent on can be withdrawn; dispatched, finished, withdrawn and unknown ids are refused, and the reply says which. A withdrawn order cannot be dispatched; propose it again if it is needed after all. Undispatched orders also expire by themselves after 24 hours."
+  "Retire approved orders you have decided not to dispatch (the person changed their mind, a launch was rejected, the plan changed), so they stop waiting in the court. Give their ids and a short reason. Only approved orders that no agent has been sent on can be withdrawn; dispatched, finished, withdrawn and unknown ids are refused, and the reply says which. A withdrawn order cannot be dispatched; propose it again if it is needed after all. Undispatched orders also expire by themselves after 24 hours."
 
 export const WITHDRAW_ORDERS_SCHEMA = {
   type: 'object',
@@ -809,13 +785,9 @@ export const LEVELS: readonly OrderLevel[] = [1, 2, 3]
 export const levelOf = (order: Pick<Order, 'role' | 'level'>): OrderLevel => order.level ?? (order.role === 'knight' ? 2 : 1)
 
 // What a ruling on orders asks of every member beyond its three lines: one
-// LEVEL line per dispatch, and (when summons are on) an optional CHECK. No
-// extra model call: it rides on the ruling's own.
+// LEVEL line per dispatch. No extra model call: it rides on the ruling's own.
 // `hasLeave`: some dispatch asks for leave, which the members weigh with the plan.
-// `threshold`: the concern at which a verdict becomes a condition (the
-// person's strictness moves it); a CHECK is asked only between it and 4.
-export function orderAsk(count: number, isSummonsOn: boolean, hasLeave = false, threshold = CONDITION_AT): string {
-  const checkRange = threshold >= 4 ? '4' : threshold === 3 ? '3 or 4' : `${threshold} to 4`
+export function orderAsk(count: number, hasLeave = false): string {
   return [
     ...(hasLeave
       ? [
@@ -823,11 +795,6 @@ export function orderAsk(count: number, isSummonsOn: boolean, hasLeave = false, 
         ]
       : []),
     `Also rate how demanding each numbered dispatch is, one line per dispatch: LEVEL <dispatch number>: <1 to 3>, where 1 = a simple lookup or mechanical edit, 2 = ordinary work, 3 = needs deep reasoning or is risky. (${count} dispatch${count === 1 ? '' : 'es'}: LEVEL 1${count > 1 ? ` to LEVEL ${count}` : ''}.)`,
-    ...(isSummonsOn
-      ? [
-          `Only if your concern is ${checkRange} and hinges on a fact you cannot see in the brief (what a file in those folders says, whether something exists there), add one line: CHECK: <one question a read-only agent could answer by reading the dispatch folders>. Otherwise leave CHECK out.`,
-        ]
-      : []),
   ].join('\n')
 }
 
@@ -939,10 +906,9 @@ export function clashReason(place: Place, other: Place): string {
 // way: `turn-failed`); its agent leaving the engine's agent list (`gone`);
 // the main session's settle_order (`settle-*`); a wake (its agent resumed by
 // a timer, a background task or a message); the person's /council release;
-// a recall (recall_order, /council recall): at once for an unsettled or
+// and a recall (recall_order, /council recall): at once for an unsettled or
 // waiting order, at its agent's turn end (or when its agent is gone) for a
-// dispatched one; and for a held order, its ruling's second round, which
-// releases it (`approve`) or refuses it (`refuse`).
+// dispatched one.
 export type OrderEvent =
   | 'spawn'
   | 'withdraw'
@@ -958,8 +924,6 @@ export type OrderEvent =
   | 'wake'
   | 'release'
   | 'recall'
-  | 'approve'
-  | 'refuse'
 
 const SETTLED_WAKE = { wake: 'dispatched' } as const
 
@@ -969,7 +933,6 @@ const SETTLED_WAKE = { wake: 'dispatched' } as const
 // (wakeVerdict); otherwise it is denied, which parks the agent. A recalled
 // order has no way out: its wakes are refused.
 export const ORDER_LIFECYCLE: { readonly [S in Order['status']]: { readonly [E in OrderEvent]?: Order['status'] } } = {
-  held: { approve: 'approved', refuse: 'withdrawn', withdraw: 'withdrawn', expire: 'withdrawn' },
   approved: { spawn: 'dispatched', withdraw: 'withdrawn', expire: 'withdrawn' },
   dispatched: { 'turn-done': 'done', 'turn-open': 'unsettled', 'turn-failed': 'failed', gone: 'lost', recall: 'recalled' },
   unsettled: { 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', 'settle-waiting': 'waiting', wake: 'dispatched', gone: 'lost', release: 'lost', recall: 'recalled' },
@@ -1102,50 +1065,35 @@ export function wakeVerdict(order: Order, clash: { order: Order; place: Place } 
   return { deny: `${order.id} is ${order.status} and ${clash.order.id} now holds ${reason ?? 'its place'}: the wake is refused.` }
 }
 
-// What the ruling tells Claude of its summons.
-function summonsLines(summons: Ruling['summons']): string[] {
-  if (summons === undefined) return []
-  const head = [`The council summoned an advisor (${summons.advisorId}) to check:`, ...summons.questions.map((entry, index) => `  ${index + 1}. ${entry.question} (asked by ${entry.askedBy.join(', ')})`)]
-  if (summons.status !== 'done') return [...head, `It ${summons.status === 'timed-out' ? 'did not report in time' : 'failed'}, so the council ruled on its first round.`]
-  const findings = summons.findings.replace(/\s+/g, ' ').trim()
-  return [...head, `Its findings, which the council ruled on: ${findings.length > 1200 ? `${findings.slice(0, 1197)}…` : findings}`]
-}
+// ── Courts saved before council 0.6.0 removed the advisor agent ────────────
 
-// ── Held orders: the council rules again once its advisor reports ─────────
+export const ADVISORS_REMOVED_REASON = 'advisors were removed'
 
-// What propose_orders answers when the council holds the plan for its advisor.
-export function heldText(orders: readonly Order[], advisorId: string, questions: ReadonlyArray<{ question: string; askedBy: string[] }>, timeoutMs: number): string {
-  const ids = orders.map(order => order.id).join(', ')
-  return [
-    `The council holds ${ids} while its advisor (${advisorId}, read-only) checks:`,
-    ...questions.map((entry, index) => `${index + 1}. ${entry.question} (asked by ${entry.askedBy.join(', ')})`),
-    `It rules again when the advisor reports (within ${Math.round(timeoutMs / 60000)} minutes), and you will be told. Held orders can't be dispatched yet: carry on with other work, or end your turn.`,
-  ].join('\n')
-}
+// What a court saved before 0.6.0 may still hold beyond today's: held
+// orders, advisor runs and their counter, summonses, and a ruling's summons.
+type SavedCourt = Court & { advisors?: unknown; nextAdvisorId?: unknown; summonses?: unknown }
 
-// The line the main session gets once the held orders are released or refused.
-// `waits`: a released knight whose place another knight now holds.
-export function summonsRuledLine(result: Ruling & { conditions: string[] }, orders: readonly Order[], waits: readonly string[] = []): string {
-  const summons = result.summons
-  const advisor = summons ? `the advisor (${summons.advisorId})` : 'the advisor'
-  const head =
-    summons?.status === 'done'
-      ? `Council: ${advisor} reported`
-      : `Council: ${advisor} ${summons?.status === 'timed-out' ? 'did not report in time' : 'failed'}, so the council ruled on its first round`
-  const ids = orders.map(order => order.id).join(', ') || 'no orders'
-  if (!result.isApproved) {
-    return [`${head}; it refused ${ids} (gravest concern ${result.gravest}/5). ${result.reason} Revise the plan and propose again, or ask the person.`.replace(/\s+/g, ' ').trim(), ...beyondLines(result)].join('\n')
+const wasHeld = (order: Pick<Order, 'status'>) => (order.status as string) === 'held'
+
+// The court as 0.6.0 reads it: a held order is withdrawn (ADVISORS_REMOVED_REASON),
+// and advisor runs, summonses and a ruling's summons are dropped; nothing
+// else changes. The same court when there is nothing to change.
+export function withoutAdvisors(court: Court, now: number): Court {
+  const saved = court as SavedCourt
+  const rulings = court.rulings ?? []
+  const isStale =
+    court.orders.some(wasHeld) || 'advisors' in saved || 'nextAdvisorId' in saved || 'summonses' in saved || rulings.some(ruling => 'summons' in ruling)
+  if (!isStale) return court
+  const { advisors: _advisors, nextAdvisorId: _nextAdvisorId, summonses: _summonses, ...rest } = saved
+  return {
+    ...rest,
+    orders: court.orders.map((order): Order => (wasHeld(order) ? { ...order, status: 'withdrawn', withdrawnReason: ADVISORS_REMOVED_REASON, endedAt: order.endedAt ?? now } : order)),
+    rulings: rulings.map(ruling => {
+      if (!('summons' in ruling)) return ruling
+      const { summons: _summons, ...kept } = ruling as Ruling & { summons?: unknown }
+      return kept
+    }),
   }
-  const findings = summons?.status === 'done' ? summons.findings.replace(/\s+/g, ' ').trim() : ''
-  return [
-    `${head}; ${ids} approved (gravest concern ${result.gravest}/5).`,
-    ...(result.conditions.length > 0 ? [`Conditions: ${result.conditions.join('; ')}`] : []),
-    ...(findings ? [`Findings: ${findings.length > 500 ? `${findings.slice(0, 499)}…` : findings}`] : []),
-    ...beyondLines(result),
-    `Dispatch them as before, the order id in each description: ${orders.map(order => `${order.id} (${AGENT_TYPES[order.role]}, ${order.relFolder}/)`).join(', ')}.`,
-    ...pendingLeaveLines(orders),
-    ...waits,
-  ].join('\n')
 }
 
 // ── Waking: an agent that ended its turn to wait comes back ────────────────

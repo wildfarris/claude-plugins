@@ -67,7 +67,7 @@ const briefParts = (topic: string, brief: string, words: WordsWindow | undefined
   words === undefined ? [`TOPIC:\n${topic}`, `THE HERALD'S BRIEF:\n${brief}`] : [`TOPIC (Claude's words):\n${topic}`, wordsBlock(words), `${CLAUDE_REQUEST}\n${brief}`, WORDS_INSTRUCTION]
 
 // `extra`: a sitting's own request after the usual one (a ruling on orders
-// asks for LEVEL and CHECK lines, court.ts orderAsk). `words`: the person's
+// asks for LEVEL lines, court.ts orderAsk). `words`: the person's
 // own words the sitting carries, which also asks for the BEYOND line.
 export function advisorPrompt(topic: string, brief: string, options?: readonly string[], extra?: string, words?: WordsWindow): string {
   const block = optionsBlock(options)
@@ -116,7 +116,7 @@ export type ParsedVerdict = Pick<AdvisorReport, 'concern' | 'verdict' | 'detail'
 const CHOICE = /^\W*CHOICE\b[^:\n]{0,12}:\W*(\d+)/im
 // A ruling on orders' extra lines (court.ts orderAsk) and the BEYOND line
 // (words.ts): they end the DETAIL too.
-const EXTRA_LINE = /^\W*(?:LEVEL|CHECK|BEYOND)\b/i
+const EXTRA_LINE = /^\W*(?:LEVEL|BEYOND)\b/i
 
 // An abstention: `ABSTAIN: <why>` with no concern given.
 const ABSTAIN = /^\W*ABSTAIN\b[^:\n]{0,12}:\W*(.*)$/im

@@ -7,7 +7,7 @@
 //   $.model.fork: a member's vote, the herald, the arbiter, ...), its purpose,
 //   model and token counts;
 // - a step total: the session's model requests (turn.step), summed per day,
-//   category (main, dispatch, advisor, other) and model, one line per order
+//   category (main, dispatch, other) and model, one line per order
 //   for dispatches, rewritten as the totals grow.
 // /council usage reads them back, with sidekick's own records from its ledgers.
 
@@ -45,7 +45,11 @@ export type UsageRecord = Tokens & {
   calls?: number
 }
 
-export type StepCategory = 'main' | 'dispatch' | 'advisor' | 'other'
+// Files written before council 0.6.0 may also hold 'advisor' (the removed
+// advisor agent): read, and counted under other subagents (isOtherSubagent).
+export type StepCategory = 'main' | 'dispatch' | 'other'
+
+export const isOtherSubagent = (total: Pick<StepTotal, 'category'>) => total.category === 'other' || (total.category as string) === 'advisor'
 
 export type StepTotal = Tokens & {
   v: 1
@@ -65,7 +69,7 @@ export type StepTotal = Tokens & {
 }
 
 // Who an agent is, for its model requests.
-export type AgentKind = { category: 'dispatch'; orderId: string; level: number; role: string; folder: string } | { category: 'advisor' }
+export type AgentKind = { category: 'dispatch'; orderId: string; level: number; role: string; folder: string }
 
 export const ZERO: Tokens = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
 
@@ -284,11 +288,12 @@ function grouped<T>(items: readonly T[], keyOf: (item: T) => string, tokensOfIte
   return sums
 }
 
-const COUNCIL_PURPOSES = ['member votes', 'herald', 'brief', 'triage', 'arbiter', 'summons-round2', 'amend', 'report', 'guidance']
+// An older file's purposes no longer made (summons-round2) sort after these.
+const COUNCIL_PURPOSES = ['member votes', 'herald', 'brief', 'triage', 'arbiter', 'amend', 'report', 'guidance']
 const purposeGroup = (purpose: string) => (purpose.startsWith('member:') ? 'member votes' : purpose)
 
 // The rows of the report: main sessions, dispatches (by level, then the top
-// five orders), advisors, other subagents, the council's own calls by
+// five orders), other subagents, the council's own calls by
 // purpose, and sidekick's by purpose (null: not recorded).
 export function usageRows(input: { steps: readonly StepTotal[]; calls: readonly UsageRecord[]; sidekick: readonly UsageRecord[] | null; sinceDay: string; since: number; now: number }): Row[] {
   const steps = input.steps.filter(total => total.day >= input.sinceDay)
@@ -308,8 +313,7 @@ export function usageRows(input: { steps: readonly StepTotal[]; calls: readonly 
     const sample = dispatches.find(total => `${total.session}|${total.orderId ?? '?'}` === key)!
     row(`${sample.orderId ?? '?'} ${sample.role ?? ''} ${sample.folder ?? ''}`.replace(/\s+/g, ' ').trim() + ` · ${sample.session.slice(0, 8)}`, value, 1)
   }
-  row('Advisors (council:advisor)', sum(steps.filter(total => total.category === 'advisor')))
-  row('Other subagents', sum(steps.filter(total => total.category === 'other')))
+  row('Other subagents', sum(steps.filter(isOtherSubagent)))
 
   const council = calls.filter(record => record.plugin === 'council')
   row("Council members' calls", council.reduce((total, record) => plus(total, record, record.model), NONE))

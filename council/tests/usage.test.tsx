@@ -1,6 +1,7 @@
 // Usage: every council model call recorded through one helper, the
 // session's model requests summed from turn.step by category (main, an
-// order's dispatch with its level, the advisor, other subagents), the
+// order's dispatch with its level, other subagents; an older file's advisor
+// steps read as other subagents), the
 // per-session file, its retention, a failed write that changes nothing, and
 // /council usage's table on fixture files.
 
@@ -129,13 +130,14 @@ describe('the usage record', () => {
 })
 
 // The fixture: 31.5 price units in all. Main 5, dispatches 16 (level 1: 1,
-// level 2: 15), advisors 0.5, other 5, the council's calls 4 (votes 3, triage
-// 1), sidekick 1 (the judge).
+// level 2: 15), other 5.5 (5, and 0.5 from an advisor step a file written
+// before 0.6.0 holds), the council's calls 4 (votes 3, triage 1), sidekick 1
+// (the judge).
 const FIXTURE_STEPS = [
   step({ category: 'main', model: 'claude-opus-5-5', input: M }),
   step({ category: 'dispatch', model: 'claude-sonnet-5', output: M, orderId: 'O1', level: 2, role: 'knight', folder: 'api' }),
   step({ category: 'dispatch', model: 'haiku', input: M, orderId: 'O2', level: 1, role: 'scout', folder: 'web', session: 'sess-bbbb-2' }),
-  step({ category: 'advisor', model: 'opus', cacheRead: M }),
+  step({ category: 'advisor' as StepTotal['category'], model: 'opus', cacheRead: M }),
   step({ category: 'other', model: 'haiku', output: M }),
   // Before the span: left out.
   step({ category: 'main', model: 'opus', input: 50 * M, day: '2026-10-01' }),
@@ -150,7 +152,7 @@ const FIXTURE_SIDEKICK = [{ ...call({ purpose: 'judge', model: 'haiku', input: M
 const SINCE = { sinceDay: '2026-10-15', since: Date.parse('2026-10-15T12:00:00Z'), now: NOW }
 
 describe('the report', () => {
-  test('rows: main, dispatches by level then the top orders, advisors, other subagents, the council by purpose, sidekick by purpose', () => {
+  test('rows: main, dispatches by level then the top orders, other subagents (with old advisor steps), the council by purpose, sidekick by purpose', () => {
     const rows = usageRows({ steps: FIXTURE_STEPS, calls: FIXTURE_CALLS, sidekick: FIXTURE_SIDEKICK, ...SINCE })
     expect(rows.map(row => [row.depth, row.label, Math.round(row.cost * 10) / 10])).toEqual([
       [0, 'Main sessions', 5],
@@ -159,8 +161,7 @@ describe('the report', () => {
       [1, 'level 2', 15],
       [1, 'O1 knight api · sess-aaa', 15],
       [1, 'O2 scout web · sess-bbb', 1],
-      [0, 'Advisors (council:advisor)', 0.5],
-      [0, 'Other subagents', 5],
+      [0, 'Other subagents', 5.5],
       [0, "Council members' calls", 4],
       [1, 'member votes', 3],
       [1, 'triage', 1],
@@ -179,8 +180,8 @@ describe('the report', () => {
     expect(line('Main sessions')).toBe('Main sessions 1.0M 0 16%')
     expect(line('Dispatches')).toBe('Dispatches 2.0M 1.0M 51%')
     expect(line('level 2')).toBe('level 2 1.0M 1.0M 48%')
-    expect(line('Advisors')).toBe('Advisors (council:advisor) 1.0M 0 2%')
-    expect(line('Other subagents')).toBe('Other subagents 1.0M 1.0M 16%')
+    expect(table.some(row => row.includes('Advisors'))).toBe(false)
+    expect(line('Other subagents')).toBe('Other subagents 2.0M 1.0M 17%')
     expect(line("Council members' calls")).toBe("Council members' calls 2.0M 0 13%")
     expect(line('Sidekick')).toBe('Sidekick 1.0M 0 3%')
   })
@@ -330,14 +331,7 @@ const until = async (harness: { clock: { advance: (ms: number) => Promise<void> 
 
 test('every model call the council makes is recorded through its helper, each with its purpose', { options: { arbiter: 'jester' } }, async ($, on) => {
   const harness = standIn(on, {
-    verdict: (system, prompt) =>
-      prompt.includes('ITS FINDINGS')
-        ? 'CONCERN: 1\nVERDICT: Checked and fine.\nLEVEL 1: 1'
-        : prompt.includes('held') || system.includes('You are The Castellan')
-          ? prompt.includes('Is a key committed') || prompt.includes('KEY CHECK')
-            ? 'CONCERN: 3\nVERDICT: Is a key committed?\nDETAIL: Unclear.\nCHECK: Is an API key committed in api/?'
-            : 'CONCERN: 3\nVERDICT: Mind the keys.\nDETAIL: Rotate them.'
-          : 'CONCERN: 1\nVERDICT: Fine.',
+    verdict: system => (system.includes('You are The Castellan') ? 'CONCERN: 3\nVERDICT: Mind the keys.\nDETAIL: Rotate them.' : 'CONCERN: 1\nVERDICT: Fine.'),
   })
   await start($, harness)
   const made = () => harness.completions.length + harness.forks.length
@@ -373,26 +367,12 @@ test('every model call the council makes is recorded through its helper, each wi
   expect(harness.files.get(MINE)).not.toContain('Mind the keys')
 })
 
-test('the brief, guidance-free summons second round: a held ruling records its round two', async ($, on) => {
-  const harness = standIn(on, {
-    verdict: (system, prompt) =>
-      prompt.includes('ITS FINDINGS') ? 'CONCERN: 1\nVERDICT: Checked and fine.\nLEVEL 1: 1' : system.includes('You are The Castellan') ? 'CONCERN: 3\nVERDICT: Is a key committed?\nDETAIL: Unclear.\nCHECK: Is an API key committed in api/?' : 'CONCERN: 1\nVERDICT: Fine.',
-  })
-  await start($, harness)
-  expect(text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))).toContain('The council holds O1')
-  await until(harness, () => harness.spawned.length === 1)
-  await finish($, 'agent-1', 'No key is committed.')
-  await until(harness, () => recorded(harness.files).calls.filter(record => record.purpose === 'summons-round2').length === 5)
-  expect(recorded(harness.files).calls.length).toBe(harness.completions.length)
-})
-
-test('turn.step: each request summed into main, its order (with the level), the advisor or other; the stream passes through unchanged', async ($, on) => {
+test('turn.step: each request summed into main, its order (with the level), or other; the stream passes through unchanged', async ($, on) => {
   const harness = standIn(on, { stepUsage: agentId => (agentId === undefined ? OPUS(100, 10) : agentId === 'agent-1' ? SONNET(200, 20) : agentId === 'agent-2' ? OPUS(300, 30) : SONNET(1, 1)) })
   await start($, harness)
   expect(text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))).toContain('The council approved the plan')
   expect(((await $.agent.spawn({ subagentType: 'council:knight', description: 'O1 api limits', prompt: 'Do it.' } as never)) as { agentId?: string }).agentId).toBe('agent-1')
-  expect(await run($, 'advise web where does the client retry?')).toContain('A1')
-  await until(harness, () => harness.spawned.length === 2)
+  // agent-2 and agent-9: subagents no order is behind.
 
   // The stream above is the stream beneath: the same chunks, the same result.
   const main = await stepThrough($, undefined, 'm1')
@@ -417,8 +397,10 @@ test('turn.step: each request summed into main, its order (with the level), the 
   const of = (category: string) => steps.find(total => total.category === category)!
   expect(of('main')).toMatchObject({ model: 'claude-opus-5-5', requests: 2, input: 200, output: 20, session: 'session-1', day: dayOf(NOW) })
   expect(of('dispatch')).toMatchObject({ model: 'claude-sonnet-5', requests: 3, input: 600, output: 60, orderId: 'O1', level: 2, role: 'knight', folder: 'api' })
-  expect(of('advisor')).toMatchObject({ model: 'claude-opus-5-5', requests: 2, input: 1300, output: 130 })
-  expect(of('other')).toMatchObject({ model: 'claude-sonnet-5', requests: 1, input: 1, output: 1 })
+  const others = steps.filter(total => total.category === 'other')
+  expect(others.find(total => total.model === 'claude-opus-5-5')).toMatchObject({ requests: 2, input: 1300, output: 130 })
+  expect(others.find(total => total.model === 'claude-sonnet-5')).toMatchObject({ requests: 1, input: 1, output: 1 })
+  expect(steps.some(total => (total.category as string) === 'advisor')).toBe(false)
   // The order carries its totals, and the court shows them on its row.
   await settle()
   const pane = await $.ui.mount({ plugin: 'council', surface: 'desktop', component: 'Pane', requestId: 'council-chamber', props: { title: 'The Council', isFocused: false, bodyColumns: 100, bodyRows: 40 } })

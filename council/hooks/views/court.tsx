@@ -5,9 +5,8 @@
 
 import type { ElementTable } from 'claude-code'
 
-import type { AdvisorReport, AdvisorRun, Council, Court, Order, Seat } from '../../types'
+import type { AdvisorReport, Council, Court, Order, Seat } from '../../types'
 import { beyondText, seatsOf } from '../council'
-import { isAdvisorFinished } from '../advisors'
 import { currentTodo, isFinished, isFolded, isLeavePending, leaveSummary, levelLabel, openTodos, progressOf } from '../court'
 import { callsLabel } from '../tally'
 import { tokensLabel } from '../usage'
@@ -93,7 +92,7 @@ function leaveLines(el: ElementTable, order: Order, buttons: LeaveButtons = {}) 
   const summary = leaveSummary(order)
   if (summary === undefined) return []
   const isPending = isLeavePending(order)
-  const canRule = isPending && (order.status === 'approved' || order.status === 'held')
+  const canRule = isPending && order.status === 'approved'
   return [
     <Text key={`order-leave-${order.id}`} color={isPending ? 'warning' : undefined} dimColor={!isPending} wrap="wrap">
       {summary}
@@ -115,23 +114,18 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
   const { Box, Text } = el
   const { done, total } = progressOf(order)
   const calls = [callsLabel(order.steps), tokensLabel(order.usage)].filter(Boolean).join(' · ')
-  // Held: approved on the first round, waiting for the advisor's check and the second.
-  const isHeld = order.status === 'held'
-  const isWaiting = order.status === 'approved' || isHeld
-  const now = isHeld
-    ? 'held: advisor checking'
-    : order.status === 'approved'
-      ? isLeavePending(order)
-        ? 'approved · its leave waits for you'
-        : 'approved · waiting to be dispatched'
-      : order.recall
-        ? 'recalled · winding down'
-        : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
+  const isWaiting = order.status === 'approved'
+  const now = isWaiting
+    ? isLeavePending(order)
+      ? 'approved · its leave waits for you'
+      : 'approved · waiting to be dispatched'
+    : order.recall
+      ? 'recalled · winding down'
+      : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
   return (
     <Box key={`order-${order.id}`} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Box flexDirection="row" gap={1} flexShrink={1}>
-          {isHeld && <Text key={`order-held-${order.id}`} color="warning">◌</Text>}
           <Text bold wrap="truncate-end">{`${ROLE_GLYPH[order.role]} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`}</Text>
           <Text dimColor>{order.id}</Text>
           <Text key={`order-level-${order.id}`} dimColor>{levelLabel(order)}</Text>
@@ -257,47 +251,6 @@ function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: 
   )
 }
 
-const ADVISOR_STATUS: Record<AdvisorRun['status'], string> = { running: 'reading…', done: 'reported', failed: 'failed', 'timed-out': 'timed out' }
-
-// An advisor agent: a bishop, where it reads, who sent it and what it was
-// asked; once back, pressed, its whole report.
-function advisorRow(el: ElementTable, run: AdvisorRun, isOpen: boolean, onToggle: (id: string) => unknown) {
-  const { Box, Text, Button } = el
-  const isBack = isAdvisorFinished(run)
-  const color = run.status === 'running' ? 'claude' : run.status === 'done' ? 'success' : 'error'
-  const where = `Advisor · ${run.relFolders.map(folder => `${folder}/`).join(', ')}`
-  const sentBy = run.origin === 'owner' ? `sent by you${run.isDeep ? ' · deep' : ''}` : `summoned by ${[...new Set(run.questions.flatMap(entry => entry.askedBy))].join(', ')}`
-  return (
-    <Box key={`advisor-${run.id}`} flexDirection="column">
-      <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Box flexDirection="row" gap={1} flexShrink={1}>
-          <Text color={color}>♝</Text>
-          {isBack ? (
-            <Button key={`advisor-toggle-${run.id}`} label={`${isOpen ? '▾' : '▸'} ${where}`} plain onPress={() => onToggle(run.id)} />
-          ) : (
-            <Text bold wrap="truncate-end">
-              {where}
-            </Text>
-          )}
-          <Text dimColor>{run.id}</Text>
-        </Box>
-        <Text color={color}>{ADVISOR_STATUS[run.status]}</Text>
-      </Box>
-      <Text dimColor italic wrap="truncate-end">{`${sentBy} · ${run.model}, ${run.effort} effort`}</Text>
-      {run.questions.map((entry, index) => (
-        <Text key={`advisor-question-${run.id}-${index}`} dimColor wrap="wrap">
-          {`${run.questions.length > 1 ? `${index + 1}. ` : '? '}${entry.question}`}
-        </Text>
-      ))}
-      {isOpen && isBack && (
-        <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={color}>
-          <Text wrap="wrap">{(run.report.trim() || (run.status === 'done' ? 'Back with no report.' : 'No report.')).replace(/\*\*|__|`/g, '').replace(/^#+\s*/gm, '')}</Text>
-        </Box>
-      )}
-    </Box>
-  )
-}
-
 function section(el: ElementTable, key: string, title: string, rows: unknown[]) {
   const { Box, Text } = el
   return (
@@ -321,9 +274,7 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
   const paused = court.orders.filter(isPaused).sort((left, right) => (left.status === right.status ? newestFirst(left, right) : left.status === 'unsettled' ? -1 : 1))
   const home = court.orders.filter(order => isFinished(order) && !isFolded(order)).sort(newestFirst)
   const archived = court.orders.filter(order => isFolded(order)).sort(newestFirst)
-  // Advisors not yet folded away, newest first.
-  const advisors = (court.advisors ?? []).filter(run => run.isFolded !== true).reverse()
-  const hasFinished = home.length + archived.length > 0 || advisors.some(isAdvisorFinished)
+  const hasFinished = home.length + archived.length > 0
   const seats = council ? seatsOf(council) : []
   const openSeat = seats.find(seat => seat.id === props.openVerdictId)
   const openReport = openSeat && council ? council.advisors[openSeat.id] : undefined
@@ -406,14 +357,13 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
           ))}
         </Box>
       )}
-      {court.orders.length === 0 && advisors.length === 0 && (
+      {court.orders.length === 0 && (
         <Box marginTop={1}>
           <Text dimColor wrap="wrap">
             No orders yet. Claude proposes dispatches with the council's propose_orders tool; approved ones appear here as roads.
           </Text>
         </Box>
       )}
-      {advisors.length > 0 && section(el, 'section-advisors', `Advisors · ${advisors.length}`, advisors.map(run => advisorRow(el, run, props.openOrderId === run.id, props.onToggleOrder)))}
       {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road, props)))}
       {paused.length > 0 && section(el, 'section-paused', `Paused · ${paused.length}`, paused.map(order => pausedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
       {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}

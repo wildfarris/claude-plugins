@@ -332,33 +332,45 @@ test('a ruling records levels, conditions and its orders, and the court links to
   expect(recalled).toMatchObject({ kind: 'recall', outcome: 'recalling', reason: 'The plan changed.', orderIds: ['O1'], by: 'person' })
 })
 
-test('a held ruling and its second round are both recorded, linked; the advisor the person sends is recorded', async ($, on) => {
-  const harness = standIn(on, {
-    verdict: (system, prompt) =>
-      prompt.includes('ITS FINDINGS')
-        ? 'CONCERN: 1\nVERDICT: Checked and fine.\nLEVEL 1: 1'
-        : system.includes('You are The Castellan')
-          ? 'CONCERN: 3\nVERDICT: Is a key committed?\nDETAIL: Unclear.\nCHECK: Is an API key committed in api/?'
-          : 'CONCERN: 1\nVERDICT: Fine.',
+test('entries from before 0.6.0 still show: a held ruling, its second round (summons) and an advisor the person sent (advise)', async ($, on) => {
+  const held = entry(3, 'orders', {
+    plan: 'Rate-limit the API.',
+    outcome: 'held',
+    runId: 'A1',
+    orderIds: ['O1'],
+    votes: [{ id: 'castellan', title: 'The Castellan', status: 'done', concern: 3, verdict: 'Is a key committed?', detail: 'Unclear.', check: 'Is an API key committed in api/?' }],
   })
+  const second = entry(2, 'summons', { plan: 'Rate-limit the API.', outcome: 'approved', runId: 'A1', follows: 'e03', orderIds: ['O1'], findings: 'No key is committed; api/.env is ignored.' })
+  const advised = entry(1, 'advise', { question: 'where does the client retry?', folders: ['web'], outcome: 'done', runId: 'A2', by: 'person', findings: 'Retries are in web/src/http.ts:40.' })
+  const files = new Map([[TODAY, `${[held, second, advised].map(formatEntry).join('\n')}\n`]])
+  const harness = standIn(on, { files })
   await start($, harness)
-  expect(text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))).toContain('The council holds O1')
-  await until(harness, () => written(harness.files).length === 1 && harness.spawned.length === 1)
-  const [held] = written(harness.files)
-  expect(held).toMatchObject({ kind: 'orders', outcome: 'held', orderIds: ['O1'], runId: 'A1' })
-  expect(held!.votes!.find(vote => vote.id === 'castellan')!.check).toBe('Is an API key committed in api/?')
+  expect(String((await run($, 'docket')).text)).toContain('The docket is open')
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /^1–3 of 3$/ })).toBeDefined()
+  expect(await pane.find({ text: /▸ where does the client retry\?/ })).toBeDefined()
 
-  await finish($, 'agent-1', 'No key is committed; api/.env is ignored.')
-  await until(harness, () => written(harness.files).length === 2)
-  const second = written(harness.files)[1]!
-  expect(second).toMatchObject({ kind: 'summons', outcome: 'approved', orderIds: ['O1'], runId: 'A1', follows: held!.id, findings: 'No key is committed; api/.env is ignored.' })
-  expect(second.votes!.every(vote => vote.concern === 1)).toBe(true)
+  await pane.press({ key: 'docket-entry-e03' })
+  expect(await pane.find({ text: /^orders · held/ })).toBeDefined()
+  expect(await pane.find({ text: /check: Is an API key committed in api\/\?/ })).toBeDefined()
+  await pane.press({ key: 'docket-entry-e02' })
+  expect(await pane.find({ text: /^second round · approved/ })).toBeDefined()
+  expect(await pane.find({ text: /^The advisor \(A1\)$/ })).toBeDefined()
+  expect(await pane.find({ text: /^No key is committed; api\/\.env is ignored\.$/ })).toBeDefined()
+  expect(await pane.find({ text: /^second round of e03$/ })).toBeDefined()
+  await pane.press({ key: 'docket-entry-e01' })
+  expect(await pane.find({ text: /^advisor · done/ })).toBeDefined()
+  expect(await pane.find({ text: /^read web\/$/ })).toBeDefined()
+  expect(await pane.find({ text: /^Retries are in web\/src\/http\.ts:40\.$/ })).toBeDefined()
 
-  expect(String((await run($, 'advise web where does the client retry?')).text)).toContain('A2')
-  await until(harness, () => harness.spawned.length === 2)
-  await finish($, 'agent-2', 'Retries are in web/src/http.ts:40.\n\nThree attempts, with backoff.')
-  await until(harness, () => written(harness.files).length === 3)
-  expect(written(harness.files)[2]).toMatchObject({ kind: 'advise', question: 'where does the client retry?', folders: ['web'], outcome: 'done', runId: 'A2', findings: 'Retries are in web/src/http.ts:40. Three attempts, with backoff.' })
+  // They keep their filters: a second round with the orders, an advisor with the rest.
+  await pane.press({ key: 'docket-filter-orders' })
+  expect(await pane.find({ text: /^1–2 of 2$/ })).toBeDefined()
+  await pane.press({ key: 'docket-filter-other' })
+  expect(await pane.find({ text: /^1–1 of 1$/ })).toBeDefined()
+  await pane.unmount()
+  // Reading them rewrites nothing.
+  expect(harness.files.get(TODAY)).toBe(`${[held, second, advised].map(formatEntry).join('\n')}\n`)
 })
 
 test('a failed write never breaks a consult: it answers as usual, and the failure is toasted once', async ($, on) => {

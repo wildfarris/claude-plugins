@@ -179,9 +179,6 @@ export type Roster = {
 export type OrderRole = 'scout' | 'knight'
 
 // The order lifecycle (court.ts ORDER_LIFECYCLE holds every transition):
-// 'held': approved on the first round while the council's summoned advisor
-// checks a fact (CourtSummons); not dispatchable, holding no place, until the
-// second round releases it ('approved') or refuses it ('withdrawn');
 // 'approved': waiting for Claude to dispatch it; 'dispatched': an agent is on
 // it; 'unsettled': its agent ended a turn with todos open, so the main session
 // judges how it ended (settle_order); 'waiting': settled as waiting for a wake
@@ -191,8 +188,9 @@ export type OrderRole = 'scout' | 'knight'
 // expired), with `withdrawnReason`; 'recalled': the main session or the person
 // recalled it (`recall`), and its agent's turn has ended (or it was not
 // running). A knight order holds its place (the folder claim) while
-// dispatched, unsettled or waiting.
-export type OrderStatus = 'held' | 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn' | 'recalled'
+// dispatched, unsettled or waiting. A 'held' order saved before council 0.6.0
+// (which removed the advisor agent) loads as withdrawn (court.ts withoutAdvisors).
+export type OrderStatus = 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn' | 'recalled'
 
 // A message the person sent an order's agent (/council message).
 export type OrderMessage = { text: string; at: number; isDelivered: boolean; reason?: string }
@@ -322,77 +320,6 @@ export type OrderLevel = 1 | 2 | 3
 
 export type LeaveStatus = 'pending' | 'granted' | 'denied'
 
-// ── Advisor agents (council:advisor): read-only investigators ─────────────
-
-// 'timed-out': the council stopped waiting for it (a summons only).
-export type AdvisorRunStatus = 'running' | 'done' | 'failed' | 'timed-out'
-
-// One question put to an advisor, and who asked it: member titles for a
-// summons, 'you' for the person's own.
-export type AdvisorQuestion = { question: string; askedBy: string[] }
-
-// One advisor agent's run: started by the person (/council advise) or
-// summoned by the council during a ruling on orders.
-export type AdvisorRun = {
-  // A1, A2…
-  id: string
-  origin: 'owner' | 'council'
-  // The folders it may read, relative to the session root.
-  relFolders: string[]
-  questions: AdvisorQuestion[]
-  // /council advise deep: the second advisor agent level.
-  isDeep: boolean
-  model: string
-  effort: string
-  status: AdvisorRunStatus
-  agentId: string | null
-  // Its findings, trimmed.
-  report: string
-  startedAt: number
-  endedAt: number | null
-  // The person's own: its report has gone to Claude with their next prompt.
-  isDelivered?: boolean
-  // Finished, and folded away at the person's next prompt.
-  isFolded?: boolean
-}
-
-// A plan the council held for its summoned advisor: the dispatches as
-// proposed (court.ts Proposal).
-export type SummonsProposal = {
-  plan: string
-  dispatches: Array<{ folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[]; leave?: string[] }>
-}
-
-// A summons in progress, kept in the court so a reload never loses it: the
-// held orders, the plan, the first round (its council and each member's raw
-// answer, for the LEVEL lines), the questions and the deadline. 'checking':
-// the advisor (run `runId`) is out; 'ruling': the second round is sitting.
-// Removed once the held orders are released or refused.
-export type CourtSummons = {
-  runId: string
-  phase: 'checking' | 'ruling'
-  orderIds: string[]
-  proposal: SummonsProposal
-  root: string
-  // The first round, with the person's words it carried (Council.words),
-  // which the second round and the arbiter read again.
-  council: Council
-  replies: Record<AdvisorId, string>
-  questions: AdvisorQuestion[]
-  startedAt: number
-  // When the council stops waiting and rules on its first round (ms).
-  deadline: number
-  // How the advisor ended, saved as the second round starts, so a round a
-  // reload dropped starts again without the run. Absent while checking.
-  outcome?: { status: AdvisorRunStatus; findings: string }
-  // The docket entry of the first round (outcome 'held'), which the second
-  // round's entry follows. Absent when it was not recorded.
-  docketId?: string
-}
-
-// What a ruling's summons asked and found.
-export type RulingSummons = { advisorId: string; questions: AdvisorQuestion[]; status: AdvisorRunStatus; findings: string }
-
 // One proposal the council ruled on.
 export type Ruling = {
   plan: string
@@ -403,8 +330,6 @@ export type Ruling = {
   // What the arbiter's review left beside the conditions: each one it
   // dropped and why, or that its review failed (court.ts). Absent before it.
   notes?: string[]
-  // The advisor the council summoned before ruling, if any.
-  summons?: RulingSummons
   // What members said it adds beyond the person's words, at most 3. Absent: none.
   beyond?: Beyond[]
   // The docket entry that records it. Absent before the docket.
@@ -418,16 +343,10 @@ export type Court = {
   // saved before it existed: ids then continue after the highest saved one.
   nextOrderId?: number
   rulings: Ruling[]
-  // Advisor agents, oldest first. Absent in courts saved before them.
-  advisors?: AdvisorRun[]
-  // The number the next advisor gets (A<n>).
-  nextAdvisorId?: number
   // Court mode: every prompt goes to the council before Claude.
   isInSession: boolean
   // A prompt held for the council, while it sits.
   heldPrompt: string | null
-  // Summonses whose held orders wait for the second round. Absent when none.
-  summonses?: CourtSummons[]
   // Lines for the main session (an order left unsettled) that could not be
   // appended to its conversation: they go beside the person's next prompt.
   // Absent when there are none.
@@ -466,11 +385,13 @@ export type LearningView = {
 // ── The docket (docket.ts): a record of every sitting ───────────────────
 
 // What a docket entry records: a consult (Claude's question, a brain trust
-// when `isDeep`), a ruling on orders (outcome approved, refused or held), the
-// second round of a held ruling (summons), a ruling on an amendment, a
-// court-mode council on the person's prompt (court), a council the person
-// convened with /council (council), and the lighter events: the person's
-// leave ruling, an advisor the person sent (advise), and a recall.
+// when `isDeep`), a ruling on orders (outcome approved or refused), a ruling
+// on an amendment, a court-mode council on the person's prompt (court), a
+// council the person convened with /council (council), and the lighter
+// events: the person's leave ruling and a recall. 'summons' (the second
+// round of a held ruling) and 'advise' (an advisor agent the person sent)
+// are only in entries written before council 0.6.0 removed the advisor agent:
+// they are still read and shown, never written.
 export type DocketKind = 'consult' | 'orders' | 'summons' | 'amendment' | 'court' | 'council' | 'leave' | 'advise' | 'recall'
 
 // One member's vote in a sitting.
@@ -486,8 +407,9 @@ export type DocketVote = {
   // A consult's option it picked (1-based, 0 for none).
   choice?: number
   // A ruling on orders: its LEVEL rating of each dispatch, in order (null
-  // where it gave none), and its CHECK question.
+  // where it gave none).
   levels?: Array<number | null>
+  // Its CHECK question: only in entries written before council 0.6.0.
   check?: string
 }
 
@@ -510,23 +432,23 @@ export type DocketEntry = {
   session: string
   // The session root (the project), as the session gives it.
   project: string
-  // The question: a consult's, a council's topic, the person's petition, an advisor's.
+  // The question: a consult's, a council's topic, the person's petition (or, in an older advise entry, the advisor's).
   question?: string
   // A plan of orders, or the amendment asked.
   plan?: string
   options?: string[]
   // The dispatches proposed: folder (relative to the root), role, and leave asked.
   dispatches?: Array<{ folder: string; role: OrderRole; leave?: string[] }>
-  // The folders an advisor read (advise).
+  // The folders an advisor read (advise, an older entry).
   folders?: string[]
   isDeep?: boolean
   votes?: DocketVote[]
   abstentions?: Array<{ id: AdvisorId; title: string; reason: string }>
   tally?: DocketTally
-  // approved, refused or held (a ruling); adjourned or dissolved (a council);
-  // a consult's result (`option 2`, `tie 1, 3`, `no pick`, `advice`);
-  // granted or denied (leave); done, failed or timed-out (advise); recalled
-  // or recalling (recall).
+  // approved or refused (a ruling; held in older entries); adjourned or
+  // dissolved (a council); a consult's result (`option 2`, `tie 1, 3`, `no
+  // pick`, `advice`); granted or denied (leave); recalled or recalling
+  // (recall); done, failed or timed-out (advise, an older entry).
   outcome: string
   // Why it was refused, or why it was recalled.
   reason?: string
@@ -534,16 +456,16 @@ export type DocketEntry = {
   orderIds?: string[]
   // The arbiter's notes beside the conditions.
   notes?: string[]
-  // The advisor's findings, cut short.
+  // The advisor's findings, cut short (older summons and advise entries).
   findings?: string
   // The person's strictness (-2 to 2) and the concern at which a verdict
   // became a condition, in effect for the sitting.
   strictness?: number
   threshold?: number
-  // The advisor run (A3) a summons or an advise names: a held ruling and its
-  // second round share it.
+  // The advisor run (A3) a summons or an advise named: a held ruling and its
+  // second round share it (older entries only).
   runId?: string
-  // The entry this one follows: a summons's held first round.
+  // The entry this one follows: a summons's held first round (older entries only).
   follows?: string
   // Who recalled the order, or ruled on its leave.
   by?: 'claude' | 'person'
@@ -554,7 +476,7 @@ export type DocketEntry = {
 }
 
 // The docket view's kind filter: consults (consult, council, court), orders
-// (orders, summons), amendments, and other (leave, advise, recall).
+// (orders, and older summons), amendments, and other (leave, recall, and older advise).
 export type DocketFilter = 'all' | 'consults' | 'orders' | 'amendments' | 'other'
 
 // What the docket view shows: one page of this project's entries, newest

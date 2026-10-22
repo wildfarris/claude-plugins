@@ -1,13 +1,12 @@
-// Knight overlap, lost agents, levels, the advisor agent, council summons,
-// and the order lifecycle (unsettled orders, settling, releasing, wakes),
-// through the hooks.
+// Knight overlap, lost agents, levels, the order lifecycle (unsettled
+// orders, settling, releasing, wakes), and a court saved before the advisor
+// agent was removed, through the hooks.
 
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Court } from '../types'
-import { SUMMONS_TIMEOUT_MS } from '../hooks/advisors'
 import { baseStandIn, composer, presentation, settle, testPath } from './stand-in'
 
 const ROOT = '/dev/work'
@@ -18,7 +17,7 @@ const REPOS = ['repo1', 'repo2']
 
 type Spawn = { subagentType: string; description: string; prompt: string; model?: string; cwd?: string; resume?: { agentId: string } }
 
-function standIn(on: On, options: { verdict?: (system: string, prompt: string) => string; denyAdvisor?: string } = {}) {
+function standIn(on: On, options: { verdict?: (system: string, prompt: string) => string} = {}) {
   const spawned: Spawn[] = []
   // The engine's agent list: every spawned agent, running unless a test says otherwise.
   const listed = new Map<string, string>()
@@ -36,7 +35,6 @@ function standIn(on: On, options: { verdict?: (system: string, prompt: string) =
   on('model.fork', () => ({ value: { isAnswered: true, text: 'The person wants work done.', usage: USAGE } }))
   on('agent.spawn', ($, e) => {
     const input = e as unknown as Spawn
-    if (options.denyAdvisor !== undefined && (input.subagentType ?? (input as unknown as { subagent_type?: string }).subagent_type) === 'council:advisor') return { deny: options.denyAdvisor }
     // A plugin's own spawn reaches the hooks spelled as the Agent tool's input in this engine build.
     spawned.push({ subagentType: input.subagentType ?? (input as unknown as { subagent_type: string }).subagent_type, description: input.description, prompt: input.prompt, model: input.model, cwd: input.cwd, resume: input.resume })
     const agentId = input.resume?.agentId ?? `agent-${spawned.length}`
@@ -70,12 +68,6 @@ const step = async ($: Engine, agentId: string | undefined, effort?: string) => 
   for await (const _chunk of stream) {
     // drained
   }
-}
-// Lets background work run until the advisor has been spawned; its agent id.
-const advisorSpawned = async (harness: { spawned: Spawn[] }) => {
-  for (let tries = 0; tries < 40 && !harness.spawned.some(entry => entry.subagentType === 'council:advisor'); tries++) await settle()
-  await settle()
-  return `agent-${harness.spawned.findIndex(entry => entry.subagentType === 'council:advisor') + 1}`
 }
 const person = (args: string) => composer('council', args)
 const notPerson = (args: string) => ({ command: 'council', args, origin: { kind: 'sdk' as const }, presentation })
@@ -207,226 +199,6 @@ test('the council rates each order; its agent runs on the level\'s model and eff
   // Dispatched: its level no longer changes; and only the person sets one.
   expect(cmdText(await $.command.run(person('level O1 1')))).toContain('only an approved order not yet dispatched')
   expect(cmdText(await $.command.run(notPerson('level O1 1')))).toContain("Only the person can change an order's level")
-})
-
-// ── The advisor agent ─────────────────────────────────────────────────────
-
-test('nobody but the plugin starts the advisor: Claude and subagents are refused', async ($, on) => {
-  const harness = standIn(on)
-  await start($)
-  // Not even offered to the model.
-  expect(await $.agent.offer({ agent: 'council:advisor', description: 'advisor', source: 'plugin', provider: { plugin: 'council', tier: 'user' } } as never)).toMatchObject({ isOffered: false })
-  expect((await spawn($, 'council:advisor', 'look around')).deny).toContain('started only by the person')
-  expect((await spawn($, 'council:advisor', 'look', { prompt: 'Read.\n\n[council-advisor-token 0123456789abcdef0123]', parentAgentId: 'agent-3' })).deny).toContain('started only by the person')
-  expect(cmdText(await $.command.run(notPerson('advise api where are limits?')))).toContain("Only the person can send the council's advisor")
-  expect(harness.spawned.length).toBe(0)
-})
-
-test('/council advise sends the advisor to one folder, read-only; its report goes to Claude with the next message', async ($, on) => {
-  const harness = standIn(on)
-  await start($)
-  expect(cmdText(await $.command.run(person('advise ../etc anything')))).toContain('must be a subfolder')
-  expect(cmdText(await $.command.run(person('advise nope anything')))).toContain('no folder nope/')
-  expect(cmdText(await $.command.run(person('advise api where are rate limits enforced?')))).toContain('A1: opus at low effort, read-only')
-  expect(await advisorSpawned(harness)).toBe('agent-1')
-  const [advisor] = harness.spawned
-  expect(advisor).toMatchObject({ subagentType: 'council:advisor', model: 'opus' })
-  expect(testPath(advisor!.cwd ?? '')).toBe(`${ROOT}/api`)
-  expect(advisor!.prompt).toContain('where are rate limits enforced?')
-  expect(advisor!.prompt).not.toContain('council-advisor-token')
-  // Its requests run at the level's effort.
-  await step($, 'agent-1', 'high')
-  expect(harness.steps[0]!.effort).toBe('low')
-
-  // It reads only, and only in its folder.
-  expect((await $.tool.call({ tool: 'Read', agentId: 'agent-1', file_path: `${ROOT}/web/a.ts` } as never) as { deny?: string }).deny).toContain('reads only in')
-  expect((await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'ls' } as never) as { deny?: string }).deny).toContain('only reads')
-  expect((await $.tool.call({ tool: 'Read', agentId: 'agent-1', file_path: `${ROOT}/api/limits.ts` } as never) as { deny?: string }).deny).toBeUndefined()
-
-  let pane = await mountPane($)
-  expect(await pane.find({ text: /Advisor · api\// })).toBeDefined()
-  expect(await pane.find({ text: /^reading…$/ })).toBeDefined()
-  await pane.unmount()
-
-  await finish($, 'agent-1', 'Limits live in api/limits.ts:12.')
-  await settle()
-  expect(harness.toasts.some(toast => toast.includes('A1: the advisor is back from api/'))).toBe(true)
-  pane = await mountPane($)
-  await pane.press({ key: 'advisor-toggle-A1' })
-  expect(await pane.find({ text: /^Limits live in api\/limits\.ts:12\.$/ })).toBeDefined()
-  await pane.unmount()
-
-  // The next message carries the report to Claude, once.
-  const first = (await $.prompt.submit({ text: 'Go on.', origin: { kind: 'composer' } } as never)) as { context?: string[] }
-  expect((first.context ?? []).join('\n')).toContain('Limits live in api/limits.ts:12.')
-  const second = (await $.prompt.submit({ text: 'And?', origin: { kind: 'composer' } } as never)) as { context?: string[] }
-  expect((second.context ?? []).join('\n')).not.toContain('Limits live')
-})
-
-test('/council advise deep runs on the second advisor level', { options: { advisorAgentLevels: 'sonnet:low,opus:max' } }, async ($, on) => {
-  const harness = standIn(on)
-  await start($)
-  expect(cmdText(await $.command.run(person('advise deep web why so slow?')))).toContain('opus at max effort')
-  await advisorSpawned(harness)
-  expect(harness.spawned[0]).toMatchObject({ subagentType: 'council:advisor', model: 'opus' })
-  await step($, 'agent-1', 'low')
-  expect(harness.steps[0]!.effort).toBe('max')
-})
-
-// ── Council summons ───────────────────────────────────────────────────────
-
-const FINDINGS = 'The key is not committed; tests cover the limiter (api/limits_test.go:4).'
-// Round 1: three members ask (two the same question); round 2, with the findings, all settle.
-const summonsVerdicts = (system: string, prompt: string) => {
-  if (prompt.includes('ITS FINDINGS')) return 'CONCERN: 1\nVERDICT: Checked and fine.\nLEVEL 1: 1'
-  if (system.includes('You are The Castellan')) return 'CONCERN: 3\nVERDICT: Is a key committed?\nDETAIL: Unclear.\nCHECK: Is an API key committed in api/?'
-  if (system.includes('You are The Lord Treasurer')) return 'CONCERN: 4\nVERDICT: Check the key.\nCHECK: is an API key committed in api/'
-  if (system.includes('You are The Seneschal')) return 'CONCERN: 3\nVERDICT: Tests?\nCHECK: Do tests cover the limiter?'
-  // A content member's CHECK is not acted on.
-  return 'CONCERN: 1\nVERDICT: Fine.\nCHECK: Is the README current?'
-}
-
-// Lets background work (timers, the second round) run until `isDone` holds.
-const until = async (harness: { clock: { settle: () => Promise<void> } }, isDone: () => boolean) => {
-  for (let tries = 0; tries < 40 && !isDone(); tries++) {
-    await harness.clock.settle()
-    await settle()
-  }
-}
-
-test('members who ask CHECK questions hold the orders and summon one advisor; propose_orders answers at once', async ($, on) => {
-  const harness = standIn(on, { verdict: summonsVerdicts })
-  const session = mock.session(on)
-  await start($)
-  // The tool answers before the advisor reports.
-  const held = text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }, { folder: 'web', role: 'scout' }]))
-  expect(held).toContain('The council holds O1, O2 while its advisor (A1, read-only) checks:')
-  expect(held).toContain('1. Is an API key committed in api/? (asked by The Castellan, The Lord Treasurer)')
-  expect(held).toContain('2. Do tests cover the limiter? (asked by The Seneschal)')
-  expect(held).toContain('It rules again when the advisor reports')
-  // Exactly one advisor, whatever the number of members who asked.
-  const advisors = harness.spawned.filter(entry => entry.subagentType === 'council:advisor')
-  expect(advisors.length).toBe(1)
-  expect(advisors[0]!.model).toBe('opus')
-  // Identical questions are asked once, crediting both members; a content member's is ignored.
-  expect(advisors[0]!.prompt).toContain('1. Is an API key committed in api/? (asked by The Castellan, The Lord Treasurer)')
-  expect(advisors[0]!.prompt).toContain('2. Do tests cover the limiter? (asked by The Seneschal)')
-  expect(advisors[0]!.prompt).not.toContain('README')
-  expect(harness.completions.some(call => call.prompt.includes('ITS FINDINGS'))).toBe(false)
-  // Held orders can't be dispatched, named or not.
-  expect((await spawn($, 'council:knight', 'O1 api')).deny).toBe("O1 is held while the council's advisor checks a fact. You will be told when the council rules; dispatch then.")
-  expect((await spawn($, 'council:scout', 'look in web')).deny).toContain('O2 is held')
-  // The court shows them held, and the advisor reading.
-  let pane = await mountPane($)
-  expect(await pane.find({ text: /^◌$/ })).toBeDefined()
-  expect(await pane.find({ text: /^held: advisor checking$/ })).toBeDefined()
-  expect(await pane.find({ text: /^reading…$/ })).toBeDefined()
-  await pane.unmount()
-
-  // The advisor reports: the second round runs in the background, releases the orders, and Claude is told.
-  await finish($, 'agent-1', FINDINGS)
-  await until(harness, () => mainLines(session).length > 0)
-  const round2 = harness.completions.filter(call => call.prompt.includes('ITS FINDINGS'))
-  expect(round2.length).toBe(5)
-  expect(round2.every(call => !call.prompt.includes('CHECK:'))).toBe(true)
-  expect(mainLines(session)).toEqual([
-    [
-      'Council: the advisor (A1) reported; O1, O2 approved (gravest concern 1/5).',
-      `Findings: ${FINDINGS}`,
-      'Dispatch them as before, the order id in each description: O1 (council:knight, api/), O2 (council:scout, web/).',
-    ].join('\n'),
-  ])
-  expect(harness.toasts.some(toast => toast.includes('O1, O2 released after its advisor (A1)'))).toBe(true)
-  expect((await spawn($, 'council:knight', 'O1 api')).agentId).toBeDefined()
-  // The court shows the advisor, who asked and what; nothing is held.
-  pane = await mountPane($)
-  expect(await pane.find({ text: /summoned by The Castellan, The Lord Treasurer, The Seneschal/ })).toBeDefined()
-  expect(await pane.find({ text: /Do tests cover the limiter\?/ })).toBeDefined()
-  expect(await pane.find({ text: /^reported$/ })).toBeDefined()
-  expect(await pane.find({ text: /^◌$/ })).toBeUndefined()
-  await pane.unmount()
-})
-
-test('a second round that refuses withdraws the held orders, and Claude is told', async ($, on) => {
-  const harness = standIn(on, {
-    verdict: (system, prompt) =>
-      prompt.includes('ITS FINDINGS') ? (system.includes('You are The Castellan') ? 'CONCERN: 5\nVERDICT: A key is committed.\nDETAIL: api/.env holds it.' : 'CONCERN: 1\nVERDICT: Fine.') : summonsVerdicts(system, prompt),
-  })
-  const session = mock.session(on)
-  await start($)
-  expect(text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))).toContain('The council holds O1')
-  await finish($, await advisorSpawned(harness), 'api/.env:1 holds a live key.')
-  await until(harness, () => mainLines(session).length > 0)
-  expect(mainLines(session)).toEqual(['Council: the advisor (A1) reported; it refused O1 (gravest concern 5/5). The Castellan: A key is committed. api/.env holds it. Revise the plan and propose again, or ask the person.'])
-  expect((await spawn($, 'council:knight', 'O1 api')).deny).toContain('No approved order')
-  const pane = await mountPane($)
-  expect(await pane.find({ text: /withdrawn · refused after the advisor's check \(gravest concern 5\/5\)/ })).toBeDefined()
-  await pane.unmount()
-})
-
-test('no CHECK, no summons; with summons off, CHECK lines are ignored', { options: { councilSummons: false } }, async ($, on) => {
-  const harness = standIn(on, { verdict: summonsVerdicts })
-  await start($)
-  const ruled = text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))
-  expect(harness.spawned.filter(entry => entry.subagentType === 'council:advisor').length).toBe(0)
-  expect(harness.completions.some(call => call.prompt.includes('CHECK: <one question'))).toBe(false)
-  expect(ruled).toContain('Conditions:')
-  expect(ruled).not.toContain('summoned')
-})
-
-test('members who ask nothing summon no one', async ($, on) => {
-  const harness = standIn(on, { verdict: () => 'CONCERN: 3\nVERDICT: Split it.\nDETAIL: Two changes.' })
-  await start($)
-  const ruled = text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))
-  expect(harness.spawned.length).toBe(0)
-  expect(ruled).toContain('Conditions:')
-  expect(ruled).not.toContain('summoned')
-})
-
-test('an advisor that does not report in time leaves the council to rule on its first round, and Claude is told', async ($, on) => {
-  const harness = standIn(on, { verdict: summonsVerdicts })
-  const session = mock.session(on)
-  await start($)
-  expect(text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))).toContain('The council holds O1')
-  await harness.clock.advance(SUMMONS_TIMEOUT_MS - 1000)
-  await settle()
-  expect(mainLines(session)).toEqual([])
-  await harness.clock.advance(2000)
-  await until(harness, () => mainLines(session).length > 0)
-  const [line] = mainLines(session)
-  expect(line).toContain('Council: the advisor (A1) did not report in time, so the council ruled on its first round; O1 approved (gravest concern 4/5).')
-  expect(line).toContain('The Lord Treasurer: Check the key.')
-  expect(harness.completions.some(call => call.prompt.includes('ITS FINDINGS'))).toBe(false)
-  const pane = await mountPane($)
-  expect(await pane.find({ text: /^timed out$/ })).toBeDefined()
-  await pane.unmount()
-  // A late report changes nothing.
-  await finish($, 'agent-1', FINDINGS)
-  await until(harness, () => false)
-  expect(mainLines(session).length).toBe(1)
-  expect(harness.completions.some(call => call.prompt.includes('ITS FINDINGS'))).toBe(false)
-})
-
-test('held orders Claude withdraws are not ruled on again', async ($, on) => {
-  const harness = standIn(on, { verdict: summonsVerdicts })
-  const session = mock.session(on)
-  await start($)
-  await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }])
-  expect(text(await $.tool.call({ tool: 'mcp__council__withdraw_orders', ids: ['O1'], reason: 'plan changed' } as never))).toContain('Withdrew O1 (plan changed)')
-  await finish($, 'agent-1', FINDINGS)
-  await until(harness, () => false)
-  expect(harness.completions.some(call => call.prompt.includes('ITS FINDINGS'))).toBe(false)
-  expect(mainLines(session)).toEqual([])
-})
-
-test('an advisor that cannot start leaves the council to rule on its first round at once', async ($, on) => {
-  standIn(on, { verdict: summonsVerdicts, denyAdvisor: 'no agents here' })
-  const session = mock.session(on)
-  await start($)
-  const ruled = text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))
-  expect(ruled).toContain('Council: the advisor (A1) failed, so the council ruled on its first round; O1 approved (gravest concern 4/5).')
-  expect(mainLines(session)).toEqual([])
-  expect((await spawn($, 'council:knight', 'O1 api')).agentId).toBeDefined()
 })
 
 // ── The order lifecycle: unsettled orders, settling, releasing, wakes ─────
@@ -614,63 +386,48 @@ test("after a reload: the unsettled order still holds its place, and its wake ru
   expect(harness.steps.map(entry => entry.effort)).toEqual(['high'])
 })
 
-// A reload mid-summons: the held orders, the summons and the advisor's run
-// are in the court, so the advisor's report still brings the second round.
-let savedSummonsCourt: unknown
+// A court saved by 0.5 mid-summons: a held order, the summons, and the
+// advisor's run, out on agent-1. 0.6.0 has no advisor: it loads cleanly.
+const SAVED_SUMMONS_COURT = {
+  orders: [
+    { id: 'O1', role: 'knight', folder: `${ROOT}/api`, relFolder: 'api', task: 'Rate-limit.', todos: [{ content: 'Do it', status: 'pending', activeForm: 'Do it' }], conditions: [], status: 'held', agentId: null, steps: 0, edits: 0, report: '', startedAt: null, endedAt: null, approvedAt: 1, level: 2 },
+  ],
+  nextOrderId: 2,
+  rulings: [{ plan: 'Earlier.', isApproved: true, gravest: 2, reason: '', summons: { advisorId: 'A0', questions: [], status: 'done', findings: 'Fine.' } }],
+  advisors: [{ id: 'A1', origin: 'council', relFolders: ['api'], questions: [{ question: 'Is a key committed?', askedBy: ['The Castellan'] }], isDeep: false, model: 'opus', effort: 'low', status: 'running', agentId: 'agent-1', report: '', startedAt: 1, endedAt: null }],
+  nextAdvisorId: 2,
+  summonses: [{ runId: 'A1', phase: 'checking', orderIds: ['O1'], startedAt: 1, deadline: 2 }],
+  isInSession: false,
+  heldPrompt: null,
+}
 
-test('before a reload: the council holds O1 while its advisor checks', async ($, on) => {
-  const harness = standIn(on, { verdict: summonsVerdicts })
-  courtStore(on, court => (savedSummonsCourt = court))
-  await start($)
-  expect(text(await propose($, 'Rate-limit the API.', [{ folder: 'api', role: 'knight' }]))).toContain('The council holds O1')
-  expect(await advisorSpawned(harness)).toBe('agent-1')
-  const court = savedSummonsCourt as Court
-  expect(court.orders[0]).toMatchObject({ id: 'O1', status: 'held' })
-  expect(court.summonses).toHaveLength(1)
-  expect(court.summonses![0]).toMatchObject({ runId: 'A1', phase: 'checking', orderIds: ['O1'] })
-  expect(court.advisors![0]).toMatchObject({ id: 'A1', status: 'running', agentId: 'agent-1', effort: 'low' })
-})
-
-test("after a reload: the advisor's report still brings the second round, and no advisor spawn gets through", async ($, on) => {
-  expect(savedSummonsCourt).toBeDefined()
-  const harness = standIn(on, { verdict: summonsVerdicts })
+test('after an upgrade: a held order loads as withdrawn, and advisor runs and summonses are dropped', async ($, on) => {
+  const harness = standIn(on)
   const session = mock.session(on)
   let latest: unknown
-  courtStore(on, court => (latest = court), savedSummonsCourt)
+  courtStore(on, court => (latest = court), SAVED_SUMMONS_COURT)
   harness.listed.set('agent-1', 'running')
   await start($)
-  // No token survives a reload: no advisor spawn gets through, with a token or without.
-  expect((await spawn($, 'council:advisor', 'look around')).deny).toContain('started only by the person')
-  expect((await spawn($, 'council:advisor', 'look', { prompt: 'Read.\n\n[council-advisor-token 0123456789abcdef0123]' })).deny).toContain('started only by the person')
-  // Still held; the advisor still runs at its level's effort and only reads.
-  expect((await spawn($, 'council:knight', 'O1 api')).deny).toContain('O1 is held')
+  const court = latest as Court & Record<string, unknown>
+  expect(court.orders[0]).toMatchObject({ id: 'O1', status: 'withdrawn', withdrawnReason: 'advisors were removed', level: 2 })
+  expect(court).not.toHaveProperty('advisors')
+  expect(court).not.toHaveProperty('nextAdvisorId')
+  expect(court).not.toHaveProperty('summonses')
+  expect(court.rulings[0]).not.toHaveProperty('summons')
+  expect(court).toMatchObject({ nextOrderId: 2, rulings: [{ plan: 'Earlier.', isApproved: true }] })
+  // The withdrawn order can't be dispatched; no second round ever runs, and nothing reaches Claude.
+  expect((await spawn($, 'council:knight', 'O1 api')).deny).toContain('No approved order')
+  await finish($, 'agent-1', 'Findings nobody waits for.')
+  await settle()
+  expect(mainLines(session)).toEqual([])
+  expect((latest as Court).orders.map(order => order.status)).toEqual(['withdrawn'])
+  // The old advisor's requests pass untouched (no effort of its own any more).
   await step($, 'agent-1', 'high')
-  expect(harness.steps.map(entry => entry.effort)).toEqual(['low'])
-  expect((await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'ls' } as never) as { deny?: string }).deny).toContain('only reads')
-  await finish($, 'agent-1', FINDINGS)
-  await until(harness, () => mainLines(session).length > 0)
-  expect(harness.completions.filter(call => call.prompt.includes('ITS FINDINGS')).length).toBe(5)
-  expect(mainLines(session)[0]).toContain('Council: the advisor (A1) reported; O1 approved (gravest concern 1/5).')
-  expect((latest as Court).orders[0]).toMatchObject({ id: 'O1', status: 'approved' })
-  expect((latest as Court).summonses).toEqual([])
-  expect(harness.spawned.filter(entry => entry.subagentType === 'council:advisor')).toEqual([])
-  expect((await spawn($, 'council:knight', 'O1 api')).agentId).toBeDefined()
+  expect(harness.steps.map(entry => entry.effort)).toEqual(['high'])
+  // The court goes on: the next order is O2, and the pane shows no advisors.
+  expect(text(await propose($, 'Rate-limit again.', [{ folder: 'api', role: 'knight' }]))).toContain('- O2: subagent_type "council:knight"')
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /Advisor/ })).toBeUndefined()
+  expect(await pane.find({ text: /O1/ })).toBeDefined()
+  await pane.unmount()
 })
-
-test('after a reload mid-round: the second round starts again from the outcome the summons saved', async ($, on) => {
-  expect(savedSummonsCourt).toBeDefined()
-  // The court as a reload left it: the advisor back, its run cleared, the round sitting.
-  const saved = savedSummonsCourt as Court
-  const midRound: Court = { ...saved, advisors: [], summonses: saved.summonses!.map(entry => ({ ...entry, phase: 'ruling' as const, outcome: { status: 'done' as const, findings: FINDINGS } })) }
-  const harness = standIn(on, { verdict: summonsVerdicts })
-  const session = mock.session(on)
-  let latest: unknown
-  courtStore(on, court => (latest = court), midRound)
-  await start($)
-  await until(harness, () => mainLines(session).length > 0)
-  expect(harness.completions.filter(call => call.prompt.includes('ITS FINDINGS')).length).toBe(5)
-  expect(mainLines(session)).toHaveLength(1)
-  expect(mainLines(session)[0]).toContain('Council: the advisor (A1) reported; O1 approved (gravest concern 1/5).')
-  expect((latest as Court).orders[0]).toMatchObject({ id: 'O1', status: 'approved' })
-})
-

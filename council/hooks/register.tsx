@@ -11,27 +11,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelCompleteRequest, ModelCompleteResult, ModelForkRequest, ModelForkResult, ModelUsage, Register, RenderInput, Timer, TurnUsage } from 'claude-code'
 
-import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, CourtSummons, DocketEntry, DocketFilter, DocketView, LearningView, Order, PersonWords, Roster, RulingSummons, Seat, WordsWindow } from '../types'
-import {
-  ADVISOR_TYPE,
-  SUMMONS_TIMEOUT_MS,
-  advisorDigest,
-  advisorTask,
-  findingsContext,
-  finishedRun,
-  isAdvisorFinished,
-  isClearable,
-  isFoldable,
-  isAdvisorPath,
-  nextAdvisorNumber,
-  parseCheck,
-  readAdviseArgs,
-  summonsDue,
-  summonsQuestions,
-  withAdvisorChanged,
-  withStaleAdvisors,
-  withUnstartedAdvisors,
-} from './advisors'
+import type { AdvisorId, AdvisorReport, Council, Court, DocketEntry, DocketFilter, DocketView, LearningView, Order, PersonWords, Roster, Seat, WordsWindow } from '../types'
 import {
   advisorPrompt,
   advisorSystemPrompt,
@@ -113,8 +93,6 @@ import {
   needsArbiter,
   parseArbiterReply,
   withArbiterReview,
-  conditionAtOf,
-  REFUSE_AT,
   SETTLE_ORDER_DESCRIPTION,
   SETTLE_ORDER_SCHEMA,
   claimHolderText,
@@ -132,16 +110,12 @@ import {
   levelOf,
   orderAsk,
   orderLevels,
-  relativeFolder,
   setOrderLevel,
   withLostAgents,
   joinedReport,
-  heldRefusal,
-  heldText,
-  summonsRuledLine,
   isLeavePending,
-  leaveOnApproval,
   leaveRefusal,
+  withoutAdvisors,
   ruleOnLeave,
   type OrderEvent,
   type ArbiterDecision,
@@ -193,7 +167,6 @@ import {
   docketId,
   docketPage,
   docketPaths,
-  findingsSummary,
   formatLock,
   isDayFileName,
   isLockHeld,
@@ -228,7 +201,7 @@ import {
 } from './learning'
 import { councilView, portraitFor, rosterView } from './views/council'
 import { MAX_SEATS, memberId, mergeMembers, parseMemberFile, resolveReference, seatOf, seatedMembers, trimReferences, tuningFiles, tuningSummary, BUILT_IN_MEMBERS, type MemberDefinition } from './members'
-import { conditionAt, mergeProfiles, parseProfile, profileContext, profileReport, type Profile, type ProfileFields, type ProfileSource } from './profile'
+import { mergeProfiles, parseProfile, profileContext, profileReport, type Profile, type ProfileFields, type ProfileSource } from './profile'
 import { removeInside, type RemoveHost } from './remove'
 import { BEYOND_TOKENS, emptyWords, withAnswerRecorded, withPromptRecorded, wordsWindow } from './words'
 import {
@@ -739,7 +712,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
   }
   await expireOrders($).catch(() => undefined)
   const [court, isChamberShown] = await Promise.all([read($, courtAtom), read($, isChamberShownAtom)])
-  const hasCourt = court.orders.length > 0 || court.isInSession || (court.advisors ?? []).some(run => !run.isFolded)
+  const hasCourt = court.orders.length > 0 || court.isInSession
   if (hasCourt && !isChamberShown) {
     return courtView(table, {
       court,
@@ -773,7 +746,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onToggleVerdict: id => update($, openVerdictAtom, current => (current === id ? null : id)),
       onToggleFinished: () => update($, isFinishedShownAtom, current => !current),
       onToggleSession: () => setCourtSession($, !court.isInSession),
-      onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)), advisors: (current.advisors ?? []).filter(run => !isClearable(run, current)) })),
+      onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)) })),
       onOpenDocket: id => openDocket($, id),
     })
   }
@@ -1029,9 +1002,7 @@ async function consultCouncil($: EngineInterface, input: Record<string, unknown>
 }
 
 // The propose_orders tool: the council rules on Claude's plan; approved
-// dispatches become orders. When members ask CHECK questions, the orders are
-// held and the tool answers at once; the second round runs when the advisor
-// reports (ruleSummons), and the main session is told.
+// dispatches become orders.
 async function proposeOrders($: EngineInterface, input: Record<string, unknown>): Promise<string> {
   const root = await $.session.root()
   const proposal = readProposal(input, root)
@@ -1049,17 +1020,13 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   // Each member's raw answers, newest round first, for the LEVEL lines.
   const replies = new Map<AdvisorId, string>()
   const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
-  // The person's strictness sets which concerns may ask a CHECK.
-  const threshold = conditionAt((await loadProfile($).catch(() => undefined))?.profile.strictness)
   const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal) }), {
     source: 'claude',
     words: await wordsNow($),
-    extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn, hasLeave(proposal), threshold),
+    extra: orderAsk(proposal.dispatches.length, hasLeave(proposal)),
     onReply,
   })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
-  const questions = settings.isSummonsOn ? summonsChecks(council, proposal, replies) : undefined
-  if (questions !== undefined) return holdForAdvisor($, council, proposal, root, replies, questions)
   const { result, levels } = await finalRuling($, council, proposal, replies)
   const now = await $.clock.now()
   const base = await docketBase($)
@@ -1067,7 +1034,7 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   // handed out twice; the court's counter moves past it and clearing never frees it.
   let orders: Order[] = []
   await update($, courtAtom, current => {
-    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now, levels, 'approved', settings.leaveApproval) : []
+    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now, levels, settings.leaveApproval) : []
     return { ...withOrdersAdded(current, orders), rulings: [...current.rulings.slice(-9), rulingRecord(result, base?.id)] }
   })
   recordDocket($, base, {
@@ -1107,7 +1074,6 @@ const rulingRecord = (result: RulingResult, docketEntryId?: string) => ({
   gravest: result.gravest,
   reason: result.reason,
   ...(result.notes ? { notes: result.notes } : {}),
-  ...(result.summons ? { summons: result.summons } : {}),
   ...(result.beyond ? { beyond: result.beyond } : {}),
   ...(docketEntryId !== undefined ? { docketId: docketEntryId } : {}),
 })
@@ -1115,8 +1081,8 @@ const rulingRecord = (result: RulingResult, docketEntryId?: string) => ({
 // The ruling on a council's verdicts, its conditions reviewed by the arbiter
 // (with the person's words the council carried), and each dispatch's level
 // from every member's answers.
-async function finalRuling($: EngineInterface, council: Council, proposal: Proposal, replies: ReadonlyMap<AdvisorId, string>, summons?: RulingSummons) {
-  const ruled = { ...ruling(council, proposal.plan), ...(summons ? { summons } : {}) }
+async function finalRuling($: EngineInterface, council: Council, proposal: Proposal, replies: ReadonlyMap<AdvisorId, string>) {
+  const ruled = ruling(council, proposal.plan)
   const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled) : ruled
   const levels = orderLevels(
     seatsOf(council).flatMap(seat => replies.get(seat.id) ?? []),
@@ -1125,406 +1091,10 @@ async function finalRuling($: EngineInterface, council: Council, proposal: Propo
   return { result, levels }
 }
 
-// ── Advisor agents (council:advisor) ──────────────────────────────────────
-
-type AdvisorOutcome = { status: AdvisorRunStatus; report: string }
-// What a spawn token is for: the run, its folders and model. The secret itself
-// is never saved: a token lost with the module can't be used, so nothing
-// un-tokened gets through after a reload.
-type PendingAdvisor = { runId: string; folders: string[]; model: string }
-
-// The advisor spawns this plugin is about to make, by the one-time token at
-// the end of their prompt: the only council:advisor spawns allowed. Claude and
-// subagents never see a token, so they can't start one.
-const pendingAdvisors = new Map<string, PendingAdvisor>()
-// Runs whose spawn is under way in this module (a run with no agent and no
-// spawn under way has lost its start: advisors.ts withUnstartedAdvisors).
-const spawningRuns = new Set<string>()
-// Each advisor agent's folders, by agent id (the court's runs hold them too).
-const advisorAgents = new Map<string, string[]>()
-
-const TOKEN_LINE = /\s*\[council-advisor-token ([0-9a-f]{16,})\]\s*$/
-const ADVISOR_DENIED = "The council's advisor (council:advisor) is started only by the person (/council advise) or by the council itself; it can't be dispatched. Use a council:scout with an approved order to read a folder."
-const ADVISOR_TOOLS = new Set(['Read', 'Grep', 'Glob'])
-
-// The agent type a spawn names. A plugin's own $.agent.spawn has reached the
-// hooks spelled as the Agent tool's input (subagent_type) in some engine
-// builds, so both spellings are read.
-const spawnTypeOf = (e: { subagentType?: string }) => e.subagentType ?? (e as { subagent_type?: unknown }).subagent_type
-
+// A random hex token (the docket lock's).
 function newToken(): string {
   const uuid = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto?.randomUUID?.()
   return uuid ? uuid.replace(/-/g, '') : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
-}
-
-// A new advisor run in the court, numbered inside the update.
-async function addAdvisorRun($: EngineInterface, fields: Pick<AdvisorRun, 'origin' | 'relFolders' | 'questions' | 'isDeep' | 'model' | 'effort'>): Promise<AdvisorRun> {
-  const now = await $.clock.now()
-  let added: AdvisorRun | undefined
-  await update($, courtAtom, current => {
-    const number = nextAdvisorNumber(current)
-    added = { ...fields, id: `A${number}`, status: 'running', agentId: null, report: '', startedAt: now, endedAt: null }
-    // Running ones are kept; of the rest, the last ten.
-    const kept = (current.advisors ?? []).filter((run, index, all) => run.status === 'running' || index >= all.length - 10)
-    return { ...current, advisors: [...kept, added], nextAdvisorId: number + 1 }
-  })
-  return added!
-}
-
-// Starts the advisor agent ($.agent.spawn; the engine refuses a plugin's own
-// Agent tool call) and returns once it started: undefined, or why it could
-// not. Nothing waits for its answer: its turn.complete finishes the run
-// (finishAdvisorAgent). The agent.spawn hook knows the spawn by its token and
-// sets its model and folder; turn.step reads its effort from the court.
-async function startAdvisorAgent($: EngineInterface, runId: string, folders: string[], task: string, level: ModelEffort): Promise<string | undefined> {
-  const token = newToken()
-  pendingAdvisors.set(token, { runId, folders, model: level.model })
-  spawningRuns.add(runId)
-  try {
-    const started = await $.agent
-      .spawn({ subagentType: ADVISOR_TYPE, description: `${runId} council advisor`, prompt: `${task}\n\n[council-advisor-token ${token}]`, model: level.model })
-      .catch((error: unknown) => ({ deny: error instanceof Error ? error.message : String(error) }))
-    return 'deny' in started && typeof started.deny === 'string' ? started.deny : undefined
-  } finally {
-    pendingAdvisors.delete(token)
-    spawningRuns.delete(runId)
-  }
-}
-
-// The advisor's spawn went through: its agent id noted (its effort is the run's, in the court).
-async function advisorStarted($: EngineInterface, pending: PendingAdvisor, agentId: string): Promise<void> {
-  advisorAgents.set(agentId, pending.folders)
-  usageAgents.set(agentId, { category: 'advisor' })
-  await update($, courtAtom, current => withAdvisorChanged(current, pending.runId, run => ({ ...run, agentId })))
-}
-
-async function finishAdvisor($: EngineInterface, runId: string, outcome: AdvisorOutcome): Promise<void> {
-  const now = await $.clock.now()
-  const before = (await read($, courtAtom)).advisors?.find(run => run.id === runId)
-  await update($, courtAtom, current => withAdvisorChanged(current, runId, run => finishedRun(run, outcome.status, outcome.report, now)))
-  if (before?.origin === 'owner' && before.status === 'running') {
-    $.ui.toast(
-      outcome.status === 'done'
-        ? `${runId}: the advisor is back from ${before.relFolders.join(', ')}/; its report goes to Claude with your next message.`
-        : `${runId}: the advisor ${outcome.status === 'timed-out' ? 'timed out' : 'failed'} in ${before.relFolders.join(', ')}/.`,
-    )
-    // The person's own advisor goes in the docket: where, what, and what it found.
-    await recordSitting($, {
-      kind: 'advise',
-      question: before.questions.map(entry => entry.question).join('\n'),
-      folders: [...before.relFolders],
-      ...(before.isDeep ? { isDeep: true } : {}),
-      outcome: outcome.status,
-      findings: findingsSummary(outcome.report),
-      runId,
-      by: 'person',
-    })
-  }
-}
-
-// An advisor agent's last answer finishes its run; a summoned one's starts
-// its ruling's second round (in the background: kickSummonses).
-async function finishAdvisorAgent($: EngineInterface, agentId: string, answer: string, isFailed: boolean): Promise<void> {
-  const run = (await read($, courtAtom)).advisors?.find(candidate => candidate.agentId === agentId && candidate.status === 'running')
-  if (run === undefined) return
-  await finishAdvisor($, run.id, { status: isFailed ? 'failed' : 'done', report: answer })
-  if (run.origin === 'council') await kickSummonses($)
-}
-
-// The folders an advisor agent may read, or undefined for any other agent.
-async function advisorFoldersOf($: EngineInterface, agentId: string): Promise<string[] | undefined> {
-  const known = advisorAgents.get(agentId)
-  if (known !== undefined) return known
-  const run = (await read($, courtAtom)).advisors?.find(candidate => candidate.agentId === agentId)
-  if (run === undefined) return undefined
-  const root = await $.session.root()
-  return run.relFolders.map(folder => joinUnder(root, folder))
-}
-
-// `/council advise [deep] <folder> <question>`: the person sends the advisor
-// (Opus by default) to read one folder; its report goes to Claude with their
-// next message. The command returns once the run is recorded.
-async function adviseCommand($: EngineInterface, args: string): Promise<string> {
-  const parsed = readAdviseArgs(args)
-  if ('error' in parsed) return parsed.error
-  const root = await $.session.root()
-  const relFolder = relativeFolder(root, parsed.folder)
-  if (relFolder === undefined) return `"${parsed.folder}" must be a subfolder of ${root}.`
-  const folder = joinUnder(root, relFolder)
-  const isFolder = await $.fs
-    .stat(folder)
-    .then(stat => stat.kind === 'dir')
-    .catch(() => false)
-  if (!isFolder) return `There is no folder ${relFolder}/ under ${root}.`
-  const level = settings.advisorAgentLevels[parsed.isDeep ? 1 : 0]!
-  const questions: AdvisorQuestion[] = [{ question: parsed.question, askedBy: ['you'] }]
-  const run = await addAdvisorRun($, { origin: 'owner', relFolders: [relFolder], questions, isDeep: parsed.isDeep, model: level.model, effort: level.effort })
-  await update($, isChamberShownAtom, () => false)
-  await openCouncilPane($)
-  void startAdvisorAgent($, run.id, [folder], advisorTask([folder], questions), level)
-    .then(failure => (failure === undefined ? undefined : finishAdvisor($, run.id, { status: 'failed', report: `It could not start: ${failure}` })))
-    .catch(() => undefined)
-  return `The council's advisor (${run.id}: ${level.model} at ${level.effort} effort, read-only) is looking into ${relFolder}/. Its report goes to Claude with your next message.`
-}
-
-// The person's finished advisors, not yet sent: their reports, for Claude
-// beside the person's prompt (hidden from the transcript), marked sent.
-async function takeAdvisorReports($: EngineInterface): Promise<string[]> {
-  const ready = ((await read($, courtAtom)).advisors ?? []).filter(run => run.origin === 'owner' && isAdvisorFinished(run) && run.isDelivered !== true)
-  if (ready.length === 0) return []
-  const ids = ready.map(run => run.id)
-  await update($, courtAtom, current => ({ ...current, advisors: (current.advisors ?? []).map(run => (ids.includes(run.id) ? { ...run, isDelivered: true } : run)) }))
-  return ready.map(advisorDigest)
-}
-
-// ── Council summons: one advisor per ruling on orders ─────────────────────
-
-// When members whose concern is 3 or 4 ask CHECK questions, the council holds
-// the plan's orders and sends one advisor (never one per member) to its
-// folders with every question, deduped. propose_orders answers at once; when
-// the advisor reports, the members sit a second round with its findings,
-// which releases or refuses the held orders, and the main session is told. A
-// plan already refused by a 5 summons no one. On a timeout or a failure the
-// council rules on its first round. Everything the second round needs is in
-// the court (CourtSummons), so a reload never loses a summons.
-
-// The members' CHECK questions, deduped, or undefined when none apply.
-function summonsChecks(council: Council, proposal: Proposal, replies: ReadonlyMap<AdvisorId, string>): AdvisorQuestion[] | undefined {
-  if (ruling(council, proposal.plan).gravest >= REFUSE_AT) return undefined
-  const checks = seatsOf(council).flatMap(seat => {
-    const report = council.advisors[seat.id]
-    const reply = replies.get(seat.id)
-    if (report?.status !== 'done' || report.concern < conditionAtOf(council) || report.concern >= REFUSE_AT || reply === undefined) return []
-    const question = parseCheck(reply)
-    return question === undefined ? [] : [{ title: seat.title, question }]
-  })
-  return checks.length === 0 ? undefined : summonsQuestions(checks)
-}
-
-// Holds the plan's orders, records the summons, starts the advisor and
-// answers at once. An advisor that can't start leaves the council to rule on
-// its first round now, and that ruling is the answer.
-async function holdForAdvisor($: EngineInterface, council: Council, proposal: Proposal, root: string, replies: ReadonlyMap<AdvisorId, string>, questions: AdvisorQuestion[]): Promise<string> {
-  const level = settings.advisorAgentLevels[0]!
-  const relFolders = [...new Set(proposal.dispatches.map(dispatch => dispatch.folder))]
-  const folders = relFolders.map(folder => joinUnder(root, folder))
-  const run = await addAdvisorRun($, { origin: 'council', relFolders, questions, isDeep: false, model: level.model, effort: level.effort })
-  const now = await $.clock.now()
-  // The first round's levels show on the held orders; the second round's replace them.
-  const levels = orderLevels(
-    seatsOf(council).flatMap(seat => replies.get(seat.id) ?? []),
-    proposal.dispatches.map(dispatch => dispatch.role),
-  )
-  let orders: Order[] = []
-  const base = await docketBase($)
-  await update($, courtAtom, current => {
-    orders = newOrders(current, proposal, root, [], now, levels, 'held', settings.leaveApproval)
-    const summons: CourtSummons = {
-      ...(base !== undefined ? { docketId: base.id } : {}),
-      runId: run.id,
-      phase: 'checking',
-      orderIds: orders.map(order => order.id),
-      proposal,
-      root,
-      council,
-      replies: Object.fromEntries(replies),
-      questions,
-      startedAt: now,
-      deadline: now + SUMMONS_TIMEOUT_MS,
-    }
-    return { ...withOrdersAdded(current, orders), summonses: [...(current.summonses ?? []), summons] }
-  })
-  // The first round, held: its second round's entry follows it (by the run id too).
-  recordDocket($, base, {
-    kind: 'orders',
-    plan: proposal.plan,
-    dispatches: docketDispatches(proposal.dispatches),
-    ...sittingFields(council, replies, proposal.dispatches.length),
-    outcome: 'held',
-    orderIds: orders.map(order => order.id),
-    runId: run.id,
-  })
-  await markCouncilDocket($, council.topic, base?.id)
-  const failure = await startAdvisorAgent($, run.id, folders, advisorTask(folders, questions, proposal.plan), level)
-  if (failure !== undefined) {
-    await finishAdvisor($, run.id, { status: 'failed', report: `It could not start: ${failure}` })
-    rulingSummonses.add(run.id)
-    try {
-      return (await ruleSummons($, run.id, false)) ?? 'The council could not rule on the plan; ask the person.'
-    } finally {
-      rulingSummonses.delete(run.id)
-    }
-  }
-  armSummonsTimer($, run.id, SUMMONS_TIMEOUT_MS)
-  $.ui.toast(`The council holds ${orders.map(order => order.id).join(', ')} while its advisor (${run.id}) checks ${questions.length === 1 ? 'a question' : `${questions.length} questions`}.`)
-  return heldText(orders, run.id, questions, SUMMONS_TIMEOUT_MS)
-}
-
-// The summonses this module is ruling on now, and each one's deadline timer.
-const rulingSummonses = new Set<string>()
-const summonsTimers = new Map<string, Timer>()
-
-// When the deadline passes, look again (the timer only starts the check).
-function armSummonsTimer($: EngineInterface, runId: string, ms: number): void {
-  summonsTimers.get(runId)?.cancel()
-  summonsTimers.set(
-    runId,
-    $.clock.after(ms, () => {
-      summonsTimers.delete(runId)
-      void kickSummonses($).catch(() => undefined)
-    }),
-  )
-}
-
-// Starts the second round of every summons that is due (advisor back, failed
-// or out of time, or a round a reload dropped), each from a timer of its own
-// so no hook waits on it; and arms the deadline timer of any summons still
-// out that has none (after a reload). Cheap: run wherever the court is acted on.
-async function kickSummonses($: EngineInterface): Promise<void> {
-  const court = await read($, courtAtom)
-  const summonses = court.summonses ?? []
-  if (summonses.length === 0) return
-  const now = await $.clock.now()
-  for (const runId of summonsDue(summonses, court.advisors ?? [], now, rulingSummonses)) {
-    rulingSummonses.add(runId)
-    $.clock.after(0, () => {
-      void ruleSummons($, runId)
-        .catch(() => undefined)
-        .finally(() => rulingSummonses.delete(runId))
-    })
-  }
-  for (const summons of summonses) {
-    if (summons.phase === 'checking' && !rulingSummonses.has(summons.runId) && !summonsTimers.has(summons.runId)) armSummonsTimer($, summons.runId, Math.max(0, summons.deadline - now))
-  }
-}
-
-// The second round of a held ruling, then the release or refusal of its held
-// orders, recorded as the court's ruling; the main session is told (`isTold`),
-// and the line is returned. Run outside any hook (a timer), or awaited by
-// propose_orders only when the advisor could not start.
-async function ruleSummons($: EngineInterface, runId: string, isTold = true): Promise<string | undefined> {
-  const now = await $.clock.now()
-  let summons: CourtSummons | undefined
-  await update($, courtAtom, current => {
-    summons = current.summonses?.find(candidate => candidate.runId === runId)
-    if (summons === undefined) return current
-    // A round a reload dropped starts again from the outcome it saved.
-    if (summons.phase === 'ruling' && summons.outcome !== undefined) return current
-    // Past its deadline, an advisor still out has timed out.
-    const found = current.advisors?.find(candidate => candidate.id === runId)
-    const timedOut = found?.status === 'running' && now >= summons.deadline ? withAdvisorChanged(current, runId, candidate => finishedRun(candidate, 'timed-out', '', now)) : current
-    const run = timedOut.advisors?.find(candidate => candidate.id === runId)
-    if (run?.status === 'running') {
-      summons = undefined
-      return current
-    }
-    // The outcome is saved with the summons, so the round never needs the run again.
-    const status: AdvisorRunStatus = run?.status === 'done' || run?.status === 'timed-out' ? run.status : 'failed'
-    const outcome = { status, findings: status === 'done' ? (run?.report ?? '').trim() : '' }
-    summons = { ...summons, phase: 'ruling', outcome }
-    const marked = summons
-    return { ...timedOut, summonses: (current.summonses ?? []).map(candidate => (candidate.runId === runId ? marked : candidate)) }
-  })
-  const held = summons as CourtSummons | undefined
-  if (held === undefined || held.outcome === undefined) return undefined
-  summonsTimers.get(runId)?.cancel()
-  summonsTimers.delete(runId)
-  const { status, findings } = held.outcome
-  const record: RulingSummons = { advisorId: runId, questions: held.questions, status, findings }
-  const proposal: Proposal = held.proposal
-  // Orders Claude withdrew meanwhile are left alone; with none left, no second round.
-  const stillHeld = (await read($, courtAtom)).orders.filter(order => held.orderIds.includes(order.id) && order.status === 'held')
-  if (stillHeld.length === 0) {
-    await update($, courtAtom, current => ({ ...current, summonses: (current.summonses ?? []).filter(candidate => candidate.runId !== runId) }))
-    return undefined
-  }
-  const replies = new Map(Object.entries(held.replies))
-  let council = held.council
-  if (status === 'done') {
-    const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
-    // Shown in the chamber only while it still holds this ruling's first round.
-    const isShown = !isCouncilWorking && (await read($, councilAtom))?.topic === held.council.topic
-    council = await secondRound($, held.council, findingsContext(held.questions, record.findings), orderAsk(proposal.dispatches.length, false, hasLeave(proposal)), onReply, isShown)
-  }
-  const { result, levels } = await finalRuling($, council, proposal, replies, record)
-  // Held knights claimed no place: one whose place a knight now holds must wait.
-  const waits: string[] = []
-  if (result.isApproved && stillHeld.some(order => order.role === 'knight')) {
-    await expireOrders($)
-    const working = await workingKnights($, (await read($, courtAtom)).orders)
-    for (const order of stillHeld.filter(candidate => candidate.role === 'knight')) {
-      const place = await placeOf($, order.folder)
-      const clash = knightClash(place, working, order.id)
-      if (clash !== undefined) waits.push(`${order.id} must wait: ${clash.order.id} holds ${clashReason(place, clash.place)}.`)
-    }
-  }
-  const ruledAt = await $.clock.now()
-  const refusal = `refused after the advisor's check (gravest concern ${result.gravest}/5)`
-  const base = await docketBase($)
-  let settled: Order[] = []
-  await update($, courtAtom, current => {
-    settled = []
-    const orders = current.orders.map(order => {
-      const index = held.orderIds.indexOf(order.id)
-      if (index < 0) return order
-      const level = levels[index]
-      const next = result.isApproved
-        ? moved(order, 'approve', ruledAt, { conditions: result.conditions, approvedAt: ruledAt, ...(level !== undefined ? { level } : {}), ...leaveOnApproval(order, settings.leaveApproval) })
-        : moved(order, 'refuse', ruledAt, { withdrawnReason: refusal })
-      if (next === undefined) return order
-      settled.push(next)
-      return next
-    })
-    return { ...current, orders, summonses: (current.summonses ?? []).filter(candidate => candidate.runId !== runId), rulings: [...current.rulings.slice(-9), rulingRecord(result, base?.id)] }
-  })
-  // The second round, linked to the first by its entry and the run id.
-  recordDocket($, base, {
-    kind: 'summons',
-    plan: proposal.plan,
-    dispatches: docketDispatches(proposal.dispatches),
-    ...sittingFields(council, replies, proposal.dispatches.length),
-    outcome: result.isApproved ? 'approved' : 'refused',
-    ...rulingFields(result),
-    orderIds: settled.length > 0 ? settled.map(order => order.id) : stillHeld.map(order => order.id),
-    runId,
-    ...(held.docketId !== undefined ? { follows: held.docketId } : {}),
-    findings: status === 'done' ? findingsSummary(findings) : `The advisor ${status === 'timed-out' ? 'timed out' : 'failed'}; the council ruled on its first round.`,
-  })
-  await markCouncilDocket($, held.council.topic, base?.id)
-  if (settled.length === 0) return undefined
-  const line = summonsRuledLine(result, settled, waits)
-  $.ui.toast(`Council: ${settled.map(order => order.id).join(', ')} ${result.isApproved ? 'released' : 'refused'} after its advisor (${runId}).`)
-  if (result.isApproved) toastPendingLeave($, settled)
-  if (isTold) await tellMain($, line)
-  return line
-}
-
-// The members reconsider once, with `context` (the advisor's findings) added:
-// the second round of a ruling. Shown in the chamber when `isShown`.
-async function secondRound($: EngineInterface, council: Council, context: string, extra: string, onReply: (seatId: AdvisorId, text: string) => void, isShown: boolean): Promise<Council> {
-  let current = withReconsidering(council, context)
-  const generation = isShown ? ++councilGeneration : undefined
-  const isMirrored = () => generation !== undefined && generation === councilGeneration
-  const mirror = async () => {
-    if (isMirrored()) await update($, councilAtom, () => current)
-  }
-  await mirror()
-  if (isMirrored()) isCouncilWorking = true
-  try {
-    await Promise.all(
-      seatsOf(current).map(async seat => {
-        const report = current.advisors[seat.id]
-        if (report === undefined) return
-        const reply = await askAdvisorModel($, { purpose: 'summons-round2' }, current.isDeep, advisorSystemPrompt(seat, current.standing), reconsiderPrompt(current, report, extra), 450 + (current.words ? BEYOND_TOKENS : 0)).catch(() => undefined)
-        if (reply?.isAnswered) onReply(seat.id, reply.text)
-        current = withVerdict(current, seat.id, reply?.isAnswered ? reply.text : undefined)
-        await mirror()
-      }),
-    )
-  } finally {
-    if (isMirrored()) isCouncilWorking = false
-  }
-  return current
 }
 
 // ── Knight overlap ────────────────────────────────────────────────────────
@@ -1581,25 +1151,23 @@ async function listedAgents($: EngineInterface): Promise<Set<string> | undefined
 // Orders approved long ago and never dispatched expire: withdrawn as
 // "expired" (court.ts withExpired). A dispatched, unsettled or waiting order
 // whose agent the engine no longer lists becomes lost (court.ts
-// withLostAgents), and a running advisor whose agent is gone fails. Run
-// wherever the court is looked at or acted on, so no timer is needed (the
-// agent list is read only while an agent is out).
+// withLostAgents). A court saved before council 0.6.0 sheds its advisor runs
+// and summonses, and its held orders are withdrawn (court.ts withoutAdvisors).
+// Run wherever the court is looked at or acted on (session.start first), so
+// no timer is needed (the agent list is read only while an agent is out).
 async function expireOrders($: EngineInterface): Promise<void> {
   const [now, court] = await Promise.all([$.clock.now(), read($, courtAtom)])
-  const hasAgents = court.orders.some(order => order.agentId !== null && nextStatus(order.status, 'gone') !== undefined) || (court.advisors ?? []).some(run => run.status === 'running' && run.agentId !== null)
+  const hasAgents = court.orders.some(order => order.agentId !== null && nextStatus(order.status, 'gone') !== undefined)
   let listed: Set<string> | undefined
   if (hasAgents) listed = await listedAgents($)
   // A knight whose spawn is under way has no agent id yet, and is never lost.
   const release = (current: Court): Court => {
-    const orders = withExpired(current.orders, now)
+    const base = withoutAdvisors(current, now)
+    const orders = withExpired(base.orders, now)
     const released = listed === undefined ? orders : withLostAgents(orders, listed, now)
-    const started = current.advisors === undefined ? undefined : withUnstartedAdvisors(current.advisors, spawningRuns, now)
-    const advisors = listed === undefined || started === undefined ? started : withStaleAdvisors(started, listed, now)
-    return released === current.orders && advisors === current.advisors ? current : { ...current, orders: [...released], ...(advisors ? { advisors: [...advisors] } : {}) }
+    return released === base.orders ? base : { ...base, orders: [...released] }
   }
   if (release(court) !== court) await update($, courtAtom, release)
-  // A summons whose advisor is back, gone or out of time is ruled on (in the background).
-  await kickSummonses($)
 }
 
 // The withdraw_orders tool: Claude retires approved orders it won't dispatch.
@@ -1660,8 +1228,6 @@ async function dispatchOrder($: EngineInterface, e: { subagentType: string; desc
   }
   const order = matchOrder(court.orders, e.subagentType, e.description, e.prompt)
   if (order === undefined) {
-    const held = heldRefusal(court.orders, e.subagentType, e.description, e.prompt)
-    if (held !== undefined) return { deny: held }
     const open = court.orders.filter(isOpen).map(candidate => `${candidate.id} (${candidate.role}, ${candidate.relFolder}/)`)
     return {
       deny: open.length > 0 ? `Name the order this carries in the description: open orders are ${open.join(', ')}.` : 'No approved order for this dispatch. Propose it with mcp__council__propose_orders first.',
@@ -1795,7 +1361,7 @@ async function stepEffortFor($: EngineInterface, agentId: string): Promise<strin
   const known = stepEfforts.get(agentId)
   if (known !== undefined) return known
   const court = await read($, courtAtom)
-  const effort = court.orders.find(order => order.agentId === agentId)?.effort ?? court.advisors?.find(run => run.agentId === agentId)?.effort
+  const effort = court.orders.find(order => order.agentId === agentId)?.effort
   if (effort !== undefined) stepEfforts.set(agentId, effort)
   return effort
 }
@@ -1942,7 +1508,7 @@ async function messageCommand($: EngineInterface, id: string, text: string): Pro
 }
 
 // The amend_order tool: refusals in code first (no model call); otherwise the
-// seated council rules on it as on a plan (no summons, no levels, no arbiter),
+// seated council rules on it as on a plan (no levels, no arbiter),
 // and an approved amendment is sent to the agent. The pending entry holds the
 // slot while the council sits, so it counts toward the cap at once.
 async function amendOrderTool($: EngineInterface, input: Record<string, unknown>): Promise<string> {
@@ -2115,7 +1681,7 @@ async function courtCommand($: EngineInterface, action: string): Promise<string>
     return action === 'on' ? 'Court mode is on: your prompts go to the council before Claude, and work is dispatched through approved orders.' : 'Court mode is off.'
   }
   if (action === 'clear') {
-    await update($, courtAtom, court => ({ ...court, orders: court.orders.filter(order => !isFinished(order)), advisors: (court.advisors ?? []).filter(run => !isClearable(run, court)) }))
+    await update($, courtAtom, court => ({ ...court, orders: court.orders.filter(order => !isFinished(order)) }))
     return 'Finished orders cleared.'
   }
   await update($, isChamberShownAtom, () => false)
@@ -2499,8 +2065,7 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   // A subcommand only when it's used as one, so "reset the DB first?" or
   // "ask users for consent?" are still questions for the council.
   const isAlone = trimmed.split(/\s+/).length === 1
-  // The advisor agent and order levels are the person's alone.
-  if (action === 'advise') return isPersonOrigin(origin) ? adviseCommand($, trimmed.replace(/^advise\b/, '')) : "Only the person can send the council's advisor: type /council advise at the prompt."
+  // Order levels are the person's alone.
   if (action === 'level' && /^O\d+$/i.test(target) && words.length === 1) return isPersonOrigin(origin) ? levelCommand($, target, words[0]!) : "Only the person can change an order's level: type /council level at the prompt."
   if ((action === 'grant' || action === 'deny-leave') && (target === '' || /^O\d+$/i.test(target)) && words.length === 0) {
     return isPersonOrigin(origin) ? leaveAction($, target, action === 'grant' ? 'grant' : 'deny') : `Only the person can rule on an order's leave: type /council ${action} at the prompt.`
@@ -2557,7 +2122,7 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
 // or the request it records. A failure is toasted once and changes nothing else.
 
 // What a model call is for: `member:<id>`, `herald`, `brief`, `triage`,
-// `arbiter`, `summons-round2`, `amend`, `report` or `guidance`.
+// `arbiter`, `amend`, `report` or `guidance`.
 type ModelUse = { purpose: string; orderId?: string; level?: number }
 
 // Call records not yet written.
@@ -2567,7 +2132,7 @@ const stepDeltas = new Map<string, { agentId?: string; model: string; tokens: To
 let unflushedSteps = 0
 // Turns whose requests turn.step saw (a turn it didn't see counts from its turn.complete).
 const steppedTurns = new Set<string>()
-// Agents known by their spawn: an order's, or the council's advisor.
+// Agents known by their spawn: an order's.
 const usageAgents = new Map<string, AgentKind>()
 // The file as last read or written: its call records and step totals.
 let usageFile: { path: string; calls: UsageRecord[]; steps: Map<string, StepTotal> } | null = null
@@ -2654,12 +2219,11 @@ function usageFailed($: EngineInterface, error: unknown): void {
   }
 }
 
-// Who an agent's requests belong to: an order's (with its level), the
-// council's advisor, or (undefined) another subagent.
+// Who an agent's requests belong to: an order's (with its level), or
+// (undefined) another subagent.
 function agentKindOf(court: Court | undefined, agentId: string): AgentKind | undefined {
   const order = court?.orders.find(candidate => candidate.agentId === agentId)
   if (order !== undefined) return { category: 'dispatch', orderId: order.id, level: levelOf(order), role: order.role, folder: order.relFolder }
-  if (advisorAgents.has(agentId) || court?.advisors?.some(run => run.agentId === agentId)) return { category: 'advisor' }
   return usageAgents.get(agentId)
 }
 
@@ -2790,7 +2354,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|usage [since YYYY-MM-DD]|forget-words|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|usage [since YYYY-MM-DD]|forget-words|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)
@@ -2870,12 +2434,8 @@ export const register: Register = (on, options) => {
     return order === undefined ? next(e) : { isDelivered: false as const, reason: blockedSendReason(order, e.agentId !== undefined) }
   }).catch(($, e, next) => next(e))
 
-  // The advisor is never offered to the model: only the plugin starts it.
-  on('agent.offer', { agent: 'council:advisor' }, () => ({ isOffered: false }))
-
   // Every dispatch: council agents carry an approved order, on their level's
-  // model; the advisor only when the plugin started it; in court mode,
-  // nothing else is dispatched. A wake is refused only for a settled knight
+  // model; in court mode, nothing else is dispatched. A wake is refused only for a settled knight
   // order whose place another knight now holds.
   on('agent.spawn', async ($, e, next) => {
     // An agent waking (a timer, a background task, a message) continues under
@@ -2883,15 +2443,6 @@ export const register: Register = (on, options) => {
     if (e.resume !== undefined) {
       const refusal = await wakeOrder($, e.resume.agentId)
       return refusal ?? next(e)
-    }
-    if (spawnTypeOf(e) === ADVISOR_TYPE) {
-      const token = TOKEN_LINE.exec(e.prompt)?.[1]
-      const pending = token === undefined ? undefined : pendingAdvisors.get(token)
-      if (token === undefined || pending === undefined) return { deny: ADVISOR_DENIED }
-      pendingAdvisors.delete(token)
-      const result = await next({ ...e, prompt: e.prompt.replace(TOKEN_LINE, ''), model: pending.model, ...(pending.folders[0] ? { cwd: pending.folders[0] } : {}) })
-      if (result.agentId !== undefined) await advisorStarted($, pending, result.agentId)
-      return result
     }
     const outcome = await dispatchOrder($, e)
     if (outcome === undefined) return next(e)
@@ -2912,11 +2463,9 @@ export const register: Register = (on, options) => {
     // A wake whose check failed goes on: a deny would park it on a fault of ours.
     next.called || e.resume !== undefined
       ? next(e)
-      : spawnTypeOf(e) === ADVISOR_TYPE
-        ? { deny: ADVISOR_DENIED }
-        : Object.values(AGENT_TYPES).includes(e.subagentType)
-          ? { deny: 'The council could not check this dispatch against its orders; try again.' }
-          : next(e),
+      : Object.values(AGENT_TYPES).includes(e.subagentType)
+        ? { deny: 'The council could not check this dispatch against its orders; try again.' }
+        : next(e),
   )
 
   // A council agent's model requests run at its level's effort; everything
@@ -2939,23 +2488,11 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  // A council agent's calls: progress, edits, and its folder's bounds; the
-  // advisor reads only, and only in its folders.
+  // A council agent's calls: progress, edits, and its folder's bounds.
   // (The progress tool is answered here too, so its list is always folded in.)
   on('tool.call', async ($, e, next) => {
     const isProgress = e.tool === PROGRESS_TOOL
     if (e.agentId === undefined) return isProgress ? { deny: 'The progress tool is for council scouts and knights carrying an order.' } : next(e)
-    const advisorFolders = await advisorFoldersOf($, e.agentId)
-    if (advisorFolders !== undefined) {
-      const tool = String(e.tool)
-      if (!ADVISOR_TOOLS.has(tool)) return { deny: "The council's advisor only reads (Read, Grep, Glob)." }
-      const input = e as unknown as { file_path?: unknown; path?: unknown }
-      const path = tool === 'Read' ? input.file_path : input.path
-      if (!isAdvisorPath(advisorFolders, typeof path === 'string' ? path : undefined)) {
-        return { deny: `The council's advisor reads only in ${advisorFolders.join(', ')}; ${String(path)} is outside.` }
-      }
-      return next(e)
-    }
     // A recalled agent may still read and report progress; nothing else.
     const recalled = await recalledOrderOf($, e.agentId)
     if (recalled !== undefined && !RECALL_ALLOWED_TOOLS.has(String(e.tool))) return { deny: recallDenial(recalled.recall!) }
@@ -2971,7 +2508,7 @@ export const register: Register = (on, options) => {
     return result
   }).catch(($, e, next) => (next.called ? next(e) : FILE_TOOLS.has(String(e.tool)) && e.agentId !== undefined ? { deny: 'The council could not check this edit against its order; try again.' } : next(e)))
 
-  // A council agent's last answer is its report; an advisor's, its findings.
+  // A council agent's last answer is its report.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     noteTurnEnd($, e)
@@ -2980,7 +2517,6 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) {
       const answer = 'answer' in e ? e.answer : ''
       await finishOrder($, e.agentId, answer, e.reason).catch(() => undefined)
-      await finishAdvisorAgent($, e.agentId, answer, e.reason !== 'answer').catch(() => undefined)
     }
     return result
   })
@@ -2988,8 +2524,9 @@ export const register: Register = (on, options) => {
   // Court mode: what you type goes to the council first.
   // The prompt waits here while the council sits (the model calls in flight
   // don't count against the hook's time), then enters as typed, with the
-  // council's digest beside it for Claude only. A report from the person's
-  // own advisor goes beside their next prompt the same way, court mode or not.
+  // council's digest beside it for Claude only. Lines for the main session
+  // that could not be appended go beside the next prompt the same way, court
+  // mode or not.
   on('prompt.submit', async ($, e, next) => {
     // The person's own words, as typed at the prompt (or through Remote
     // Control) in the main session: never a command, a hidden row, or what a
@@ -2997,14 +2534,14 @@ export const register: Register = (on, options) => {
     const isTyped = isPersonOrigin(e.origin) && e.isMeta !== true && e.command === undefined && (e as { agentId?: string }).agentId === undefined && !e.text.trim().startsWith('/')
     if (isTyped) await recordPrompt($, e.text).catch(() => undefined)
     if (e.origin.kind !== 'composer') return next(e)
-    // Your next message folds away the orders and advisors that have finished since.
+    // Your next message folds away the orders that have finished since.
     await expireOrders($).catch(() => undefined)
     const before = await read($, courtAtom)
-    if (before.orders.some(order => isFinished(order) && !order.isFolded) || (before.advisors ?? []).some(isFoldable)) {
-      await update($, courtAtom, current => ({ ...current, orders: withFinishedFolded(current.orders), ...(current.advisors ? { advisors: current.advisors.map(run => (isFoldable(run) ? { ...run, isFolded: true } : run)) } : {}) }))
+    if (before.orders.some(order => isFinished(order) && !order.isFolded)) {
+      await update($, courtAtom, current => ({ ...current, orders: withFinishedFolded(current.orders) }))
     }
     if (e.text.trim().startsWith('/')) return next(e)
-    const reports = [...(await takeNotices($).catch(() => [])), ...(await takeAdvisorReports($).catch(() => []))]
+    const reports = await takeNotices($).catch(() => [])
     const withReports = reports.length > 0 ? { ...e, context: [...(e.context ?? []), ...reports] } : e
     const court = await read($, courtAtom)
     if (!court.isInSession) return next(withReports)

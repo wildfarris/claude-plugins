@@ -279,7 +279,7 @@ export function recallStep(order: Order): { order: Order; isAnswered: boolean } 
 // ── The tools ─────────────────────────────────────────────────────────────
 
 export const AMEND_ORDER_DESCRIPTION =
-  "Change the task of a council order already under way (dispatched, unsettled or waiting). Direct messages to order agents are blocked; this is how you steer one. The council rules on the change as it rules on a plan (no summons); an approved amendment is sent to the order's agent with its conditions, and its todos are added to the order. Each order takes at most amendmentsPerOrder amendments (default 1), refused ones included; a repeat of a change already ruled on, or one to a finished order, is refused without the council sitting. For new work, propose a new order; to stop one, mcp__council__recall_order. Main session only."
+  "Change the task of a council order already under way (dispatched, unsettled or waiting). Direct messages to order agents are blocked; this is how you steer one. The council rules on the change as it rules on a plan; an approved amendment is sent to the order's agent with its conditions, and its todos are added to the order. Each order takes at most amendmentsPerOrder amendments (default 1), refused ones included; a repeat of a change already ruled on, or one to a finished order, is refused without the council sitting. For new work, propose a new order; to stop one, mcp__council__recall_order. Main session only."
 
 export const AMEND_ORDER_SCHEMA = {
   type: 'object',

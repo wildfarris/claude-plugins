@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 
 import type { Council } from '../types'
 import { newCouncil, advisorSystemPrompt } from '../hooks/council'
-import { orderAsk, ruling } from '../hooks/court'
+import { ruling } from '../hooks/court'
 import { BUILT_IN_SEATS } from '../hooks/members'
 import { DEFAULT_PROFILE, conditionAt, mergeProfiles, parseProfile, profileContext, profileReport, PROFILE_LIMITS } from '../hooks/profile'
 import { USAGE, baseStandIn, composer, settle, testPath } from './stand-in'
@@ -102,12 +102,6 @@ describe('strictness moves the condition threshold, never the refusal', () => {
     expect(ruling({ ...threes, strictness: 2 }, 'x').conditions.length).toBe(2)
     expect(ruling(sat({ castellan: 5 }, -2), 'x').isApproved).toBe(false)
   })
-
-  test('a CHECK is asked only within the threshold', () => {
-    expect(orderAsk(1, true)).toContain('Only if your concern is 3 or 4')
-    expect(orderAsk(1, true, false, 4)).toContain('Only if your concern is 4 and')
-    expect(orderAsk(1, true, false, 2)).toContain('Only if your concern is 2 to 4')
-  })
 })
 
 // ── In a session ──────────────────────────────────────────────────────────
@@ -157,8 +151,8 @@ test("a lenient project profile over the person's own: members read it, a 3 is n
   const systems = memberCalls(harness).map(call => call.system)
   expect(systems.length).toBe(5)
   expect(systems.every(system => system.includes('Strictness: lenient') && system.includes('Scale: small-business') && system.includes('low-traffic cafe'))).toBe(true)
-  // The ruling asked a CHECK only at 4.
-  expect(harness.completions.find(call => call.system.includes('Seneschal'))!.prompt).toContain('Only if your concern is 4 and')
+  // The ruling asks no CHECK.
+  expect(harness.completions.find(call => call.system.includes('Seneschal'))!.prompt).not.toContain('CHECK')
 
   const shown = (await $.command.run(composer('council', 'profile'))).text
   expect(shown).toContain("strictness: lenient (-2) (from this project's profile): a concern of 4 or more")

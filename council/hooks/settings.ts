@@ -23,11 +23,6 @@ export type CouncilSettings = {
   // What each order level (1 to 3) runs on, per role: index 0 is level 1.
   scoutLevels: ModelEffort[]
   knightLevels: ModelEffort[]
-  // The advisor agent (council:advisor): [plain, deep]. Not the members'
-  // model (advisorModel), which is a plain model call.
-  advisorAgentLevels: ModelEffort[]
-  // A ruling on orders may summon one advisor agent when members ask a CHECK.
-  isSummonsOn: boolean
   // How many amendments (mcp__council__amend_order) one order takes, refused ones included.
   amendmentsPerOrder: number
   // Who grants an order's leave: the person, with /council grant (the
@@ -42,7 +37,6 @@ export type ModelEffort = { model: string; effort: Effort }
 
 export const DEFAULT_SCOUT_LEVELS = 'haiku:low,haiku:high,sonnet:medium'
 export const DEFAULT_KNIGHT_LEVELS = 'sonnet:medium,opus:low,opus:high'
-export const DEFAULT_ADVISOR_AGENT_LEVELS = 'opus:low,opus:high'
 
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
@@ -89,8 +83,6 @@ export function readSettings(options: PluginOptions): CouncilSettings {
     isTallyShown: booleanOption(options.callTally, true),
     scoutLevels: levelsOption(options.scoutLevels, DEFAULT_SCOUT_LEVELS, 3),
     knightLevels: levelsOption(options.knightLevels, DEFAULT_KNIGHT_LEVELS, 3),
-    advisorAgentLevels: levelsOption(options.advisorAgentLevels, DEFAULT_ADVISOR_AGENT_LEVELS, 2),
-    isSummonsOn: booleanOption(options.councilSummons, true),
     amendmentsPerOrder: countOption(options.amendmentsPerOrder, 1, 0, 10),
     // Anything but exactly "council" leaves it with the person.
     leaveApproval: options.leaveApproval === 'council' ? 'council' : 'owner',

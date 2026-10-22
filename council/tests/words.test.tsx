@@ -1,8 +1,8 @@
 // The person's own words: their main-session prompts recorded as typed
 // (redacted, the last ten, for the session), the window a sitting Claude
-// starts carries (consult, orders, an amendment, a summons' second round and
-// the arbiter), the members told whose words are whose, and the BEYOND line
-// shown in the ruling, the court, the chamber and the docket.
+// starts carries (consult, orders, an amendment and the arbiter), the
+// members told whose words are whose, and the BEYOND line shown in the
+// ruling, the court, the chamber and the docket.
 
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
@@ -439,30 +439,4 @@ test('a ruling with no BEYOND line says nothing of it, to Claude or in the court
   const pane = await $.ui.mount({ plugin: 'council', surface: 'desktop', component: 'Pane', requestId: 'council-chamber', props: PANE })
   expect(await pane.find({ text: /Beyond your request/ })).toBeUndefined()
   await pane.unmount()
-})
-
-test("the summons' second round and its arbiter carry the words the first round did", { options: { arbiter: 'jester' } }, async ($, on) => {
-  const harness = standIn(on, {
-    verdict: (system, prompt) =>
-      prompt.includes('ITS FINDINGS')
-        ? system.includes('You are The Seneschal')
-          ? 'CONCERN: 3\nVERDICT: Still wide.\nBEYOND: adds SSO'
-          : 'CONCERN: 1\nVERDICT: Checked.'
-        : system.includes('You are The Castellan')
-          ? 'CONCERN: 3\nVERDICT: Is a key committed?\nCHECK: Is an API key committed in api/?'
-          : 'CONCERN: 1\nVERDICT: Fine.',
-    arbiter: () => '{"decisions":[{"index":1,"keep":true,"reason":"Warranted."}]}',
-  })
-  await start($, harness)
-  await say($, 'Fix the login bug only.')
-  expect(text(await propose($))).toContain('The council holds O1')
-  const advisor = harness.spawned.findIndex(entry => entry.subagentType === 'council:advisor') + 1
-  await answer($, 'No key is committed.', `agent-${advisor}`)
-  await until(harness, () => arbiterCalls(harness).length > 0)
-  const round2 = memberCalls(harness).filter(call => call.prompt.includes('ITS FINDINGS'))
-  expect(round2.length).toBe(5)
-  expect(round2.every(call => call.prompt.includes('<<<WORDS\nFix the login bug only.\nWORDS>>>') && call.prompt.includes(BEYOND_ASK))).toBe(true)
-  expect(arbiterCalls(harness)[0]!.prompt).toContain('<<<WORDS\nFix the login bug only.\nWORDS>>>')
-  await until(harness, () => written(harness.files).some(entry => entry.kind === 'summons'))
-  expect(written(harness.files).find(entry => entry.kind === 'summons')).toMatchObject({ words: { prompts: ['Fix the login bug only.'] }, beyond: [{ text: 'adds SSO', by: ['Seneschal'] }] })
 })

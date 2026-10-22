@@ -1,6 +1,6 @@
 {
   "name": "council",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Convene a council of advisors on a question or on a repo's recent work: built-in members plus your own member files, chosen per project, with animated pixel portraits and a brain trust mode.",
   "author": {
     "name": "Jeremy Phares"
@@ -80,18 +80,6 @@
       "title": "Knight levels",
       "description": "What a knight runs on at each level the council gives its order (1, 2, 3): three model:effort entries, comma-separated.",
       "default": "sonnet:medium,opus:low,opus:high"
-    },
-    "advisorAgentLevels": {
-      "type": "string",
-      "title": "Advisor agent levels",
-      "description": "The read-only advisor agent (council:advisor), not the members: two model:effort entries, for /council advise (and a council summons) and for /council advise deep.",
-      "default": "opus:low,opus:high"
-    },
-    "councilSummons": {
-      "type": "boolean",
-      "title": "Council summons",
-      "description": "When a member's concern on a plan of orders hinges on a fact it can't see, it may ask a CHECK question; the council then sends one read-only advisor agent (the first advisor agent level) to the plan's folders and rules again on its findings. At most one per ruling. Off: CHECK questions are ignored.",
-      "default": true
     },
     "amendmentsPerOrder": {
       "type": "number",

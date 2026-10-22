@@ -145,11 +145,6 @@ describe('settings', () => {
         { model: 'opus', effort: 'low' },
         { model: 'opus', effort: 'high' },
       ],
-      advisorAgentLevels: [
-        { model: 'opus', effort: 'low' },
-        { model: 'opus', effort: 'high' },
-      ],
-      isSummonsOn: true,
       amendmentsPerOrder: 1,
       leaveApproval: 'owner',
     })

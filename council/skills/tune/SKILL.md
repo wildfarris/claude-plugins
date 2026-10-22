@@ -68,9 +68,10 @@ The docket records every sitting of the council:
   round each year), and stop once you have 5 votes or have read about 14 days.
 - Format: one JSON object per line. Skip any line that doesn't parse or whose `v` is
   not `1`. The fields that matter here: `time` (ISO), `kind` (consult, orders,
-  summons, amendment, court, council, leave, advise, recall), `project`, `question`
-  or `plan` (what was judged), `outcome` (approved, refused, held, adjourned,
-  dissolved, a consult's `option 2`, `advice`…), and `votes`: one per member, each
+  amendment, court, council, leave, recall; and summons or advise in entries from
+  before council 0.6.0), `project`, `question` or `plan` (what was judged),
+  `outcome` (approved, refused, adjourned, dissolved, a consult's `option 2`,
+  `advice`…; held in older entries), and `votes`: one per member, each
   `{ "id", "title", "status", "concern", "verdict", "detail" }`, where `status` is
   `done`, `abstained` or `failed` and `concern` is 1 to 5 (0 when none).
 

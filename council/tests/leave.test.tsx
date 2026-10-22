@@ -10,7 +10,7 @@ import type { On } from 'claude-code'
 
 import type { Order } from '../types'
 import { readAmendment } from '../hooks/control'
-import { dispatchPrompt, emptyCourt, leaveOnApproval, newOrders, orderAsk, proposalBrief, readProposal, ruleOnLeave, rulingText, type Proposal } from '../hooks/court'
+import { dispatchPrompt, emptyCourt, newOrders, orderAsk, proposalBrief, readProposal, ruleOnLeave, rulingText, type Proposal } from '../hooks/court'
 import { courtView, type CourtViewProps } from '../hooks/views/court'
 import { baseStandIn, composer, presentation } from './stand-in'
 
@@ -62,21 +62,16 @@ describe('leave is ruled on with the plan', () => {
     const proposal = read([SYSTEMCTL]) as Proposal
     expect(proposalBrief(proposal)).toContain(`LEAVE ASKED (exceptions to the policy judge's default rules on the machine, for this knight only; rule on them with the plan): "${SYSTEMCTL}"`)
     expect(proposalBrief(read() as Proposal)).not.toContain('LEAVE')
-    expect(orderAsk(1, false, true)).toContain('Weigh each leave as a widening of what that agent may do on the machine')
-    expect(orderAsk(1, false)).not.toContain('LEAVE')
+    expect(orderAsk(1, true)).toContain('Weigh each leave as a widening of what that agent may do on the machine')
+    expect(orderAsk(1)).not.toContain('LEAVE')
   })
 
   test('the approved order stores it: pending with the person, granted with the council', () => {
     const proposal = read([SYSTEMCTL]) as Proposal
     const [owned] = newOrders(emptyCourt(), proposal, ROOT, [])
     expect([owned!.leave, owned!.leaveStatus]).toEqual([[SYSTEMCTL], 'pending'])
-    const [ruled] = newOrders(emptyCourt(), proposal, ROOT, [], 1, undefined, 'approved', 'council')
+    const [ruled] = newOrders(emptyCourt(), proposal, ROOT, [], 1, undefined, 'council')
     expect(ruled!.leaveStatus).toBe('granted')
-    // A held order waits for its release, which grants it with the council's setting only.
-    const [held] = newOrders(emptyCourt(), proposal, ROOT, [], 1, undefined, 'held', 'council')
-    expect(held!.leaveStatus).toBe('pending')
-    expect(leaveOnApproval(held!, 'council')).toEqual({ leaveStatus: 'granted' })
-    expect(leaveOnApproval(held!, 'owner')).toEqual({})
     expect(newOrders(emptyCourt(), read() as Proposal, ROOT, [])[0]).not.toHaveProperty('leave')
     expect(newOrders(emptyCourt(), read() as Proposal, ROOT, [])[0]).not.toHaveProperty('leaveStatus')
     // Claude is told, and told to wait for the person.

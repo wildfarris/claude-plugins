@@ -14,7 +14,6 @@
 // file (DOCKET_LOCK), so neither overwrites the other's line.
 
 import type { AdvisorStatus, Council, DocketEntry, DocketFilter, DocketKind, DocketTally, DocketVote, OrderRole } from '../types'
-import { parseCheck } from './advisors'
 import { beyondOf, seatsOf } from './council'
 import { conditionAtOf, parseLevels } from './court'
 import { isPathInside } from './paths'
@@ -49,6 +48,9 @@ export const DAY_MS = 24 * 60 * 60 * 1000
 // up and counts as failed.
 export const DOCKET_LOCK = { staleMs: 10_000, settleMs: 40, retryMs: 100, waitMs: 15_000 } as const
 
+// Every kind a line may hold. 'summons' and 'advise' are written no more
+// (council 0.6.0 removed the advisor agent), but older entries of them are
+// still read and shown.
 export const DOCKET_KINDS: readonly DocketKind[] = ['consult', 'orders', 'summons', 'amendment', 'court', 'council', 'leave', 'advise', 'recall']
 
 // ── Where it lives ────────────────────────────────────────────────────────
@@ -120,13 +122,12 @@ const replyOf = (replies: Replies | undefined, id: string): string | undefined =
   replies === undefined ? undefined : typeof (replies as ReadonlyMap<string, string>).get === 'function' ? (replies as ReadonlyMap<string, string>).get(id) : (replies as Readonly<Record<string, string>>)[id]
 
 // Each seated member's vote; with the members' raw replies (newest round
-// first) and the number of dispatches, its LEVEL ratings and CHECK too.
+// first) and the number of dispatches, its LEVEL ratings too.
 export function votesOf(council: Council, replies?: Replies, dispatchCount = 0): DocketVote[] {
   return seatsOf(council).map(seat => {
     const report = council.advisors[seat.id]
     const reply = replyOf(replies, seat.id)
     const ratings = reply !== undefined && dispatchCount > 0 ? parseLevels(reply, dispatchCount) : undefined
-    const check = reply !== undefined ? parseCheck(reply) : undefined
     const status: AdvisorStatus = report?.status ?? 'failed'
     return {
       id: seat.id,
@@ -137,7 +138,6 @@ export function votesOf(council: Council, replies?: Replies, dispatchCount = 0):
       detail: report?.detail ?? '',
       ...(typeof report?.choice === 'number' ? { choice: report.choice } : {}),
       ...(ratings !== undefined && ratings.size > 0 ? { levels: Array.from({ length: dispatchCount }, (_, index) => ratings.get(index + 1) ?? null) } : {}),
-      ...(check !== undefined ? { check } : {}),
     }
   })
 }
@@ -191,10 +191,6 @@ export function sittingFields(council: Council, replies?: Replies, dispatchCount
 // A plan's dispatches as the docket keeps them: folder, role and leave asked.
 export const docketDispatches = (dispatches: ReadonlyArray<{ folder: string; role: OrderRole; leave?: string[] }>): NonNullable<DocketEntry['dispatches']> =>
   dispatches.map(dispatch => ({ folder: dispatch.folder, role: dispatch.role, ...(dispatch.leave && dispatch.leave.length > 0 ? { leave: [...dispatch.leave] } : {}) }))
-
-// An advisor's report as the docket keeps it: on one line, cut to
-// DOCKET_LIMITS.findings when the entry is sealed.
-export const findingsSummary = (report: string) => report.replace(/\s+/g, ' ').trim()
 
 // `20261022T101500-ab12`: the time, then four random hex digits.
 export const docketId = (now: number, random: number) =>
