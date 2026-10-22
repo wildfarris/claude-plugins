@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { baseStandIn, composer, settle, type Unanswered } from './stand-in'
+import { baseStandIn, composer, settle, testPath, type Unanswered } from './stand-in'
 
 const ROOT = '/dev/work'
 const USAGE = { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
@@ -30,8 +30,8 @@ function courtStandIn(on: On, options: { verdict?: (system: string) => string; a
           : (options.verdict?.(system) ?? 'CONCERN: 2\nVERDICT: Reasonable.\nDETAIL: Scoped well.'),
   })
   const spawned: Array<{ subagentType: string; description: string; prompt: string }> = []
-  on('fs.stat', ($, e) => (['api', 'web', 'infra'].some(folder => e.path === `${ROOT}/${folder}`) ? { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } : { deny: 'no such file' }))
-  on('fs.read', ($, e) => (e.path === `${ROOT}/api/CLAUDE.md` ? { value: 'Never log request bodies.' } : { deny: 'no such file' }))
+  on('fs.stat', ($, e) => (['api', 'web', 'infra'].some(folder => testPath(e.path) === `${ROOT}/${folder}`) ? { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } : { deny: 'no such file' }))
+  on('fs.read', ($, e) => (testPath(e.path) === `${ROOT}/api/CLAUDE.md` ? { value: 'Never log request bodies.' } : { deny: 'no such file' }))
   on('fs.list', () => ({ deny: 'no such directory' }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '/home/me\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('model.fork', () => ({ value: { isAnswered: true, text: 'The person wants rate limiting.', usage: USAGE } }))

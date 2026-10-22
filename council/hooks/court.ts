@@ -4,9 +4,9 @@
 // proposal's checks, the brief, the ruling, matching a dispatch to its order,
 // the dispatched agent's instructions, and folding its progress in.
 
-import type { AdvisorId, Council, Court, ForbidOp, ForbidRule, Order, OrderRole, OrderTodo, Ruling, Seat } from '../types'
+import type { AdvisorId, Council, Court, ForbidOp, ForbidRule, Order, OrderLevel, OrderRole, OrderTodo, Ruling, Seat } from '../types'
 import { seatsOf } from './council'
-import { isPathInside, joinUnder, pathStyleOf, relativeToRoot } from './paths'
+import { canonicalPath, isPathInside, joinUnder, nativePath, parseAbsolute, pathStyleOf, relativeToRoot, segmentsBelow } from './paths'
 
 export const AGENT_TYPES: Record<OrderRole, string> = { scout: 'council:scout', knight: 'council:knight' }
 
@@ -299,10 +299,12 @@ export const withOrdersAdded = (court: Court, orders: readonly Order[]): Court =
   nextOrderId: Math.max(nextOrderNumber(court), ...orders.map(order => (orderNumber(order.id) ?? 0) + 1)),
 })
 
-// `now` (ms) stamps when each order was approved, which starts its expiry clock.
-export function newOrders(court: Court, proposal: Proposal, root: string, conditions: string[], now?: number): Order[] {
+// `now` (ms) stamps when each order was approved, which starts its expiry
+// clock; `levels`, the council's rating of each dispatch (court.ts orderLevels).
+export function newOrders(court: Court, proposal: Proposal, root: string, conditions: string[], now?: number, levels?: readonly OrderLevel[]): Order[] {
   const next = nextOrderNumber(court)
   return proposal.dispatches.map((dispatch, index) => ({
+    ...(levels?.[index] !== undefined ? { level: levels[index] } : {}),
     id: `O${next + index}`,
     role: dispatch.role,
     // In the root's own separators: never a mixed `C:\root/folder`.
@@ -326,10 +328,13 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
 
 // What the tool tells Claude after the ruling.
 export function rulingText(result: Ruling & { conditions: string[] }, orders: readonly Order[]): string {
-  if (!result.isApproved) return `The council refused the plan (gravest concern ${result.gravest}/5). ${result.reason}\nRevise the plan and propose again, or ask the person.`
+  if (!result.isApproved) {
+    return [`The council refused the plan (gravest concern ${result.gravest}/5). ${result.reason}`, ...summonsLines(result.summons), 'Revise the plan and propose again, or ask the person.'].join('\n')
+  }
   const notes = result.notes ?? []
   return [
     `The council approved the plan (gravest concern ${result.gravest}/5).`,
+    ...summonsLines(result.summons),
     ...(result.conditions.length > 0 ? ['Conditions:', ...result.conditions.map(condition => `- ${condition}`)] : []),
     ...(notes.length > 0 ? ['Notes (not conditions; the orders do not carry them):', ...notes.map(note => `- ${note}`)] : []),
     'Dispatch each order with the Agent tool, its subagent_type as given, and its order id in the description (e.g. "O1 api limits"). An order you decide not to dispatch, withdraw with mcp__council__withdraw_orders; an undispatched order expires after a day:',
@@ -341,13 +346,14 @@ export function rulingText(result: Ruling & { conditions: string[] }, orders: re
   ].join('\n')
 }
 
-// The approved order a dispatch carries: named by id in its description or
-// prompt, else the only approved order of its role whose folder it names.
+// The approved order a dispatch carries: named by id in its description (or,
+// when the description names none, its prompt), else the only approved order
+// of its role whose folder it names.
 export function matchOrder(orders: readonly Order[], subagentType: string, description: string, prompt: string): Order | undefined {
   const role = (Object.keys(AGENT_TYPES) as OrderRole[]).find(key => AGENT_TYPES[key] === subagentType)
   if (role === undefined) return undefined
   const open = orders.filter(order => isOpen(order) && order.role === role)
-  const named = /\bO(\d+)\b/.exec(`${description} ${prompt}`)
+  const named = /\bO(\d+)\b/.exec(description) ?? /\bO(\d+)\b/.exec(prompt)
   if (named) return open.find(order => order.id === `O${named[1]}`)
   const byFolder = open.filter(order => `${description} ${prompt}`.includes(order.relFolder))
   return byFolder.length === 1 ? byFolder[0] : open.length === 1 ? open[0] : undefined
@@ -619,4 +625,167 @@ export const PROGRESS_SCHEMA = {
     },
   },
   required: ['todos'],
+}
+
+// ── Levels: how demanding the council rates each order ────────────────────
+
+export const LEVELS: readonly OrderLevel[] = [1, 2, 3]
+
+// An order's level, or its role's default for one saved before levels.
+export const levelOf = (order: Pick<Order, 'role' | 'level'>): OrderLevel => order.level ?? (order.role === 'knight' ? 2 : 1)
+
+// What a ruling on orders asks of every member beyond its three lines: one
+// LEVEL line per dispatch, and (when summons are on) an optional CHECK. No
+// extra model call: it rides on the ruling's own.
+export function orderAsk(count: number, isSummonsOn: boolean): string {
+  return [
+    `Also rate how demanding each numbered dispatch is, one line per dispatch: LEVEL <dispatch number>: <1 to 3>, where 1 = a simple lookup or mechanical edit, 2 = ordinary work, 3 = needs deep reasoning or is risky. (${count} dispatch${count === 1 ? '' : 'es'}: LEVEL 1${count > 1 ? ` to LEVEL ${count}` : ''}.)`,
+    ...(isSummonsOn
+      ? [
+          'Only if your concern is 3 or 4 and hinges on a fact you cannot see in the brief (what a file in those folders says, whether something exists there), add one line: CHECK: <one question a read-only agent could answer by reading the dispatch folders>. Otherwise leave CHECK out.',
+        ]
+      : []),
+  ].join('\n')
+}
+
+// The ratings one member gave, by dispatch number: `LEVEL 2: 3`, `**Level 2**: 3`,
+// `LEVEL #2 = 3`, or a bare `LEVEL: 3` when there is one dispatch. Lenient:
+// a rating outside 1 to 3, a number outside the plan, or a repeat is ignored.
+export function parseLevels(text: string, count: number): Map<number, OrderLevel> {
+  const ratings = new Map<number, OrderLevel>()
+  for (const line of text.split('\n')) {
+    const numbered = /^\W*LEVEL\b[\s*#]*(?:dispatch\s*|no\.?\s*)?(\d+)[\s*]*[:=)–-][\s*]*(\d+)/i.exec(line)
+    const bare = numbered ? undefined : /^\W*LEVEL\b[\s*]*[:=][\s*]*(\d+)/i.exec(line)
+    const index = numbered ? Number(numbered[1]) : bare && count === 1 ? 1 : undefined
+    const rating = Number(numbered ? numbered[2] : bare?.[1])
+    if (index === undefined || index < 1 || index > count || ratings.has(index)) continue
+    if (rating === 1 || rating === 2 || rating === 3) ratings.set(index, rating)
+  }
+  return ratings
+}
+
+// The median of the ratings, a half rounded up; undefined for none.
+export function medianLevel(ratings: readonly number[]): OrderLevel | undefined {
+  if (ratings.length === 0) return undefined
+  const sorted = [...ratings].sort((left, right) => left - right)
+  const middle = sorted.length / 2
+  const median = sorted.length % 2 === 1 ? sorted[Math.floor(middle)]! : (sorted[middle - 1]! + sorted[middle]!) / 2
+  return Math.min(3, Math.max(1, Math.ceil(median))) as OrderLevel
+}
+
+// Each dispatch's level from every member's reply: the median of the valid
+// ratings, or the role's default (2 for a knight, 1 for a scout) when none.
+export function orderLevels(replies: readonly string[], roles: readonly OrderRole[]): OrderLevel[] {
+  const parsed = replies.map(reply => parseLevels(reply, roles.length))
+  return roles.map((role, index) => medianLevel(parsed.flatMap(ratings => (ratings.has(index + 1) ? [ratings.get(index + 1)!] : []))) ?? levelOf({ role }))
+}
+
+// `L2`, as the court shows a level.
+export const levelLabel = (order: Pick<Order, 'role' | 'level'>) => `L${levelOf(order)}`
+
+// `/council level <order> <1-3>`: the person changes an approved order's
+// level before it is dispatched.
+export function setOrderLevel(orders: readonly Order[], id: string, text: string): { orders: Order[]; message: string } | { error: string } {
+  if (!/^[1-3]$/.test(text.trim())) return { error: 'Usage: /council level <order id> <1-3>, e.g. /council level O3 2' }
+  const level = Number(text.trim()) as OrderLevel
+  const wanted = id.trim().toUpperCase()
+  const order = orders.find(candidate => candidate.id === wanted)
+  if (order === undefined) return { error: `No order ${wanted || '(none named)'}.` }
+  if (!isOpen(order)) return { error: `${order.id} is ${order.status}: only an approved order not yet dispatched can change level.` }
+  return {
+    orders: orders.map(candidate => (candidate.id === order.id ? { ...candidate, level } : candidate)),
+    message: `${order.id} (${order.role}, ${order.relFolder}/) is now level ${level} (was ${levelOf(order)}).`,
+  }
+}
+
+// ── Overlap: two knights never work in the same place at once ─────────────
+
+// Where a knight works: its folder (absolute) and the git repository holding
+// it (the nearest folder at or above it with a .git), null when none was found.
+export type Place = { folder: string; repo: string | null }
+
+// One folder at or inside the other (names compared case-insensitively on
+// Windows, the cautious reading); false when either can't be placed.
+function isNested(left: string, right: string): boolean {
+  const style = pathStyleOf(left)
+  const a = parseAbsolute(left, style)
+  const b = parseAbsolute(right, style)
+  if (a === undefined || b === undefined) return false
+  return segmentsBelow(a, b) !== undefined || segmentsBelow(b, a) !== undefined
+}
+
+function sameFolder(left: string, right: string): boolean {
+  const style = pathStyleOf(left)
+  const a = canonicalPath(left, style)
+  const b = canonicalPath(right, style)
+  return a !== undefined && b !== undefined && (style === 'windows' ? a.toLowerCase() === b.toLowerCase() : a === b)
+}
+
+// Two places overlap when one folder is the other or inside it, or both sit in
+// the same git repository (sidekick's git backstop puts every change in a
+// repo down to one agent, so two knights in one repo can't be told apart).
+export const placesOverlap = (a: Place, b: Place) => isNested(a.folder, b.folder) || (a.repo !== null && b.repo !== null && sameFolder(a.repo, b.repo))
+
+// The dispatched knight order whose place overlaps `place`, if any (`except`: the order itself).
+export function knightClash(place: Place, others: ReadonlyArray<{ order: Order; place: Place }>, except?: string): { order: Order; place: Place } | undefined {
+  return others.find(other => other.order.id !== except && other.order.role === 'knight' && other.order.status === 'dispatched' && placesOverlap(place, other.place))
+}
+
+// Why two places overlap: the same folder, one inside the other, or one repository.
+export function clashReason(place: Place, other: Place): string {
+  if (sameFolder(place.folder, other.folder)) return 'the same folder'
+  if (isNested(place.folder, other.folder)) return 'one folder inside the other'
+  return `the same git repository (${other.repo})`
+}
+
+// The folders that may hold a folder's git repository, nearest first: the
+// folder, then each one above it, never the drive or filesystem root itself.
+export function repoCandidates(folder: string): string[] {
+  const parsed = parseAbsolute(folder)
+  if (parsed === undefined) return []
+  return parsed.segments.map((_, index) => nativePath({ prefix: parsed.prefix, segments: parsed.segments.slice(0, parsed.segments.length - index) }))
+}
+
+// ── Releasing orders whose agent is gone ──────────────────────────────────
+
+export const STALE_REPORT = 'agent ended without reporting'
+
+// A dispatched order whose agent the engine no longer lists at all becomes
+// failed, so it never holds its place forever. An agent that is listed in any
+// status (running, waiting on a timer or a background task, idle, even ended,
+// which a message may yet resume) is not gone. `live`: every listed agent id.
+// The same array when nothing changes.
+export function withStaleReleased(orders: readonly Order[], live: ReadonlySet<string>, now: number): readonly Order[] {
+  let isChanged = false
+  const next = orders.map((order): Order => {
+    if (order.status !== 'dispatched' || order.agentId === null || live.has(order.agentId)) return order
+    isChanged = true
+    return { ...order, status: 'failed', report: STALE_REPORT, endedAt: now }
+  })
+  return isChanged ? next : orders
+}
+
+// What the ruling tells Claude of its summons.
+function summonsLines(summons: Ruling['summons']): string[] {
+  if (summons === undefined) return []
+  const head = [`The council summoned an advisor (${summons.advisorId}) to check:`, ...summons.questions.map((entry, index) => `  ${index + 1}. ${entry.question} (asked by ${entry.askedBy.join(', ')})`)]
+  if (summons.status !== 'done') return [...head, `It ${summons.status === 'timed-out' ? 'did not report in time' : 'failed'}, so the council ruled on its first round.`]
+  const findings = summons.findings.replace(/\s+/g, ' ').trim()
+  return [...head, `Its findings, which the council ruled on: ${findings.length > 1200 ? `${findings.slice(0, 1197)}…` : findings}`]
+}
+
+// ── Waking: an agent that ended its turn to wait comes back ────────────────
+
+export const WAKE_MARK = '[woke and went on]'
+
+// An order whose agent woke (a timer, a background task, a message): back on
+// the road, its earlier report kept for the next one to follow.
+export const withWoken = (order: Order): Order =>
+  order.status === 'dispatched' ? order : { ...order, status: 'dispatched', wakes: (order.wakes ?? 0) + 1, endedAt: null, isFolded: false }
+
+// The report after a wake: the earlier one, then the new; the tail kept when long.
+export function joinedReport(earlier: string, answer: string): string {
+  const before = earlier === STALE_REPORT ? '' : earlier.trim()
+  const joined = before === '' ? answer : answer === '' ? before : `${before}\n\n${WAKE_MARK}\n${answer}`
+  return joined.length > 6000 ? `…${joined.slice(joined.length - 5999)}` : joined
 }

@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { USAGE, baseStandIn, composer, settle, type Harness } from './stand-in'
+import { USAGE, baseStandIn, composer, settle, testPath, type Harness } from './stand-in'
 
 const ROOT = '/dev/work'
 const COUNCIL_PANE_ID = 'council-chamber'
@@ -227,11 +227,11 @@ function repoStandIn(on: On, now: number) {
   }
   // Files are read through git (HEAD), never the working tree.
   on('fs.read', () => ({ deny: 'read through git show instead' }))
-  on('fs.exists', ($, e) => ({ value: e.path === `${REPO}/.git` }))
+  on('fs.exists', ($, e) => ({ value: testPath(e.path) === `${REPO}/.git` }))
   on('fs.stat', ($, e) =>
-    e.path === `${COMMON_DIR}/FETCH_HEAD`
+    testPath(e.path) === `${COMMON_DIR}/FETCH_HEAD`
       ? { value: { kind: 'file', size: 1, mtimeMs: now - 3 * 86_400_000, isLink: false } }
-      : e.path === REPO
+      : testPath(e.path) === REPO
         ? { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } }
         : { deny: 'no such file' },
   )
@@ -325,11 +325,11 @@ const HOME = '/home/me'
 function memberFiles(on: On, files: Record<string, string>) {
   mock.env(on, { HOME })
   on('fs.list', ($, e) => {
-    const prefix = `${e.path}/`
+    const prefix = `${testPath(e.path)}/`
     const names = Object.keys(files).filter(path => path.startsWith(prefix) && !path.slice(prefix.length).includes('/'))
     return names.length === 0 ? { deny: 'no such directory' } : { value: names.map(path => ({ name: path.slice(prefix.length), kind: 'file', size: 1, mtimeMs: 0, isLink: false })) }
   })
-  on('fs.read', ($, e) => (files[e.path] !== undefined ? { value: files[e.path]! } : { deny: 'no such file' }))
+  on('fs.read', ($, e) => (files[testPath(e.path)] !== undefined ? { value: files[testPath(e.path)]! } : { deny: 'no such file' }))
 }
 
 test('member files seat new members with their references; the roster unseats per project', async ($, on) => {

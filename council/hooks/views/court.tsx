@@ -5,9 +5,10 @@
 
 import type { ElementTable } from 'claude-code'
 
-import type { AdvisorReport, Council, Court, Order, Seat } from '../../types'
+import type { AdvisorReport, AdvisorRun, Council, Court, Order, Seat } from '../../types'
 import { seatsOf } from '../council'
-import { currentTodo, isFinished, isFolded, progressOf } from '../court'
+import { isAdvisorFinished } from '../advisors'
+import { currentTodo, isFinished, isFolded, levelLabel, progressOf } from '../court'
 import { callsLabel } from '../tally'
 
 export type CourtViewProps = {
@@ -62,6 +63,8 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
         <Box flexDirection="row" gap={1} flexShrink={1}>
           <Text bold wrap="truncate-end">{`${ROLE_GLYPH[order.role]} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`}</Text>
           <Text dimColor>{order.id}</Text>
+          <Text key={`order-level-${order.id}`} dimColor>{levelLabel(order)}</Text>
+          {order.wakes !== undefined && <Text key={`order-woke-${order.id}`} color="warning">{order.wakes > 1 ? `woke ×${order.wakes}` : 'woke'}</Text>}
         </Box>
         <Text color={isWaiting ? 'inactive' : 'claude'}>{`${done}/${total}${order.edits > 0 ? ` · ${order.edits} edit${order.edits === 1 ? '' : 's'}` : ''}${calls === '' ? '' : ` · ${calls}`}`}</Text>
       </Box>
@@ -72,6 +75,11 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
       {order.forbid && order.forbid.length > 0 && (
         <Text key={`order-forbid-${order.id}`} dimColor wrap="truncate-end">
           {`forbids ${order.forbid.map(rule => (rule.ops.length === 3 ? rule.glob : `${rule.glob} (${rule.ops.join(', ')})`)).join(' · ')}`}
+        </Text>
+      )}
+      {order.warning && (
+        <Text key={`order-warning-${order.id}`} color="warning" wrap="wrap">
+          {`⚠ ${order.warning}`}
         </Text>
       )}
       {order.policy && order.policy.length > 0 && (
@@ -110,11 +118,54 @@ function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: 
         <Text color={isDone ? 'success' : 'error'}>{isDone ? '✓' : '✕'}</Text>
         <Button key={`order-toggle-${order.id}`} label={`${isOpen ? '▾' : '▸'} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`} plain onPress={() => onToggle(order.id)} />
         <Text dimColor>{order.id}</Text>
+        <Text key={`order-level-${order.id}`} dimColor>{levelLabel(order)}</Text>
+        {order.wakes !== undefined && <Text key={`order-woke-${order.id}`} color="warning">woke</Text>}
         {calls !== '' && <Text dimColor>{calls}</Text>}
       </Box>
       {isOpen && (
         <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={isDone ? 'success' : 'error'}>
           <Text wrap="wrap">{reportText(order)}</Text>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+const ADVISOR_STATUS: Record<AdvisorRun['status'], string> = { running: 'reading…', done: 'reported', failed: 'failed', 'timed-out': 'timed out' }
+
+// An advisor agent: a bishop, where it reads, who sent it and what it was
+// asked; once back, pressed, its whole report.
+function advisorRow(el: ElementTable, run: AdvisorRun, isOpen: boolean, onToggle: (id: string) => unknown) {
+  const { Box, Text, Button } = el
+  const isBack = isAdvisorFinished(run)
+  const color = run.status === 'running' ? 'claude' : run.status === 'done' ? 'success' : 'error'
+  const where = `Advisor · ${run.relFolders.map(folder => `${folder}/`).join(', ')}`
+  const sentBy = run.origin === 'owner' ? `sent by you${run.isDeep ? ' · deep' : ''}` : `summoned by ${[...new Set(run.questions.flatMap(entry => entry.askedBy))].join(', ')}`
+  return (
+    <Box key={`advisor-${run.id}`} flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Box flexDirection="row" gap={1} flexShrink={1}>
+          <Text color={color}>♝</Text>
+          {isBack ? (
+            <Button key={`advisor-toggle-${run.id}`} label={`${isOpen ? '▾' : '▸'} ${where}`} plain onPress={() => onToggle(run.id)} />
+          ) : (
+            <Text bold wrap="truncate-end">
+              {where}
+            </Text>
+          )}
+          <Text dimColor>{run.id}</Text>
+        </Box>
+        <Text color={color}>{ADVISOR_STATUS[run.status]}</Text>
+      </Box>
+      <Text dimColor italic wrap="truncate-end">{`${sentBy} · ${run.model}, ${run.effort} effort`}</Text>
+      {run.questions.map((entry, index) => (
+        <Text key={`advisor-question-${run.id}-${index}`} dimColor wrap="wrap">
+          {`${run.questions.length > 1 ? `${index + 1}. ` : '? '}${entry.question}`}
+        </Text>
+      ))}
+      {isOpen && isBack && (
+        <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={color}>
+          <Text wrap="wrap">{(run.report.trim() || (run.status === 'done' ? 'Back with no report.' : 'No report.')).replace(/\*\*|__|`/g, '').replace(/^#+\s*/gm, '')}</Text>
         </Box>
       )}
     </Box>
@@ -141,7 +192,9 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
   const active = court.orders.filter(order => !isFinished(order)).sort((left, right) => (left.status === right.status ? newestFirst(left, right) : left.status === 'dispatched' ? -1 : 1))
   const home = court.orders.filter(order => isFinished(order) && !isFolded(order)).sort(newestFirst)
   const archived = court.orders.filter(order => isFolded(order)).sort(newestFirst)
-  const hasFinished = home.length + archived.length > 0
+  // Advisors not yet folded away, newest first.
+  const advisors = (court.advisors ?? []).filter(run => run.isFolded !== true).reverse()
+  const hasFinished = home.length + archived.length > 0 || advisors.some(isAdvisorFinished)
   const seats = council ? seatsOf(council) : []
   const openSeat = seats.find(seat => seat.id === props.openVerdictId)
   const openReport = openSeat && council ? council.advisors[openSeat.id] : undefined
@@ -207,13 +260,14 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
           ))}
         </Box>
       )}
-      {court.orders.length === 0 && (
+      {court.orders.length === 0 && advisors.length === 0 && (
         <Box marginTop={1}>
           <Text dimColor wrap="wrap">
             No orders yet. Claude proposes dispatches with the council's propose_orders tool; approved ones appear here as roads.
           </Text>
         </Box>
       )}
+      {advisors.length > 0 && section(el, 'section-advisors', `Advisors · ${advisors.length}`, advisors.map(run => advisorRow(el, run, props.openOrderId === run.id, props.onToggleOrder)))}
       {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road)))}
       {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
       {archived.length > 0 && (

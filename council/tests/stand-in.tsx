@@ -56,6 +56,7 @@ export function baseStandIn(
   })
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('command.register', e => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__council__${e.name}` } }))
   on('command.run', () => ({ text: '' }))
   on('tool.check', ($, e) => ({ decision: (options.decide ?? (() => 'ask'))(String(e.tool), e.input) }))
   on('tool.call', ($, e) => {
@@ -92,3 +93,7 @@ export function baseStandIn(
   })
   return harness
 }
+
+// A path as the tests spell it: the engine on Windows hands a POSIX test path
+// (`/dev/work/api`) to the fs hooks as `C:\dev\work\api`; this reads it back.
+export const testPath = (path: string) => (/^[A-Za-z]:[\\/]/.test(path) ? path.slice(2).replace(/\\/g, '/') : path)

@@ -20,9 +20,42 @@ export type CouncilSettings = {
   arbiter: AdvisorId | null
   // The road's work sites and tents (tally.ts, sprites.ts roadSvg).
   isTallyShown: boolean
+  // What each order level (1 to 3) runs on, per role: index 0 is level 1.
+  scoutLevels: ModelEffort[]
+  knightLevels: ModelEffort[]
+  // The advisor agent (council:advisor): [plain, deep]. Not the members'
+  // model (advisorModel), which is a plain model call.
+  advisorAgentLevels: ModelEffort[]
+  // A ruling on orders may summon one advisor agent when members ask a CHECK.
+  isSummonsOn: boolean
 }
 
+// One level's model (an alias such as sonnet, or a full id) and effort.
+export type ModelEffort = { model: string; effort: Effort }
+
+export const DEFAULT_SCOUT_LEVELS = 'haiku:low,haiku:high,sonnet:medium'
+export const DEFAULT_KNIGHT_LEVELS = 'sonnet:medium,opus:low,opus:high'
+export const DEFAULT_ADVISOR_AGENT_LEVELS = 'opus:low,opus:high'
+
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
+// `model:effort` entries, comma-separated, exactly `count` of them; undefined
+// when any entry is malformed (an empty or odd model name, an unknown effort).
+export function parseModelEfforts(text: unknown, count: number): ModelEffort[] | undefined {
+  if (typeof text !== 'string') return undefined
+  const entries = text.split(',').map(entry => entry.trim())
+  if (entries.length !== count) return undefined
+  const parsed = entries.map(entry => {
+    const colon = entry.lastIndexOf(':')
+    if (colon <= 0) return undefined
+    const model = entry.slice(0, colon).trim()
+    const effort = EFFORTS.find(candidate => candidate === entry.slice(colon + 1).trim().toLowerCase())
+    return effort !== undefined && /^[A-Za-z0-9][\w.\-[\]/@]*$/.test(model) ? { model, effort } : undefined
+  })
+  return parsed.every((entry): entry is ModelEffort => entry !== undefined) ? parsed : undefined
+}
+
+const levelsOption = (value: unknown, fallback: string, count: number) => parseModelEfforts(value, count) ?? parseModelEfforts(fallback, count)!
 
 const textOption = (value: unknown, fallback: string) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
 const effortOption = (value: unknown, fallback: Effort) => EFFORTS.find(effort => effort === value) ?? fallback
@@ -44,5 +77,9 @@ export function readSettings(options: PluginOptions): CouncilSettings {
     triageModel: textOption(options.triageModel, 'haiku'),
     arbiter: memberOption(options.arbiter),
     isTallyShown: booleanOption(options.callTally, true),
+    scoutLevels: levelsOption(options.scoutLevels, DEFAULT_SCOUT_LEVELS, 3),
+    knightLevels: levelsOption(options.knightLevels, DEFAULT_KNIGHT_LEVELS, 3),
+    advisorAgentLevels: levelsOption(options.advisorAgentLevels, DEFAULT_ADVISOR_AGENT_LEVELS, 2),
+    isSummonsOn: booleanOption(options.councilSummons, true),
   }
 }

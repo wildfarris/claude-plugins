@@ -17,7 +17,7 @@ import {
 } from '../hooks/learning'
 import { BUILT_IN_SEATS } from '../hooks/members'
 import type { Lesson } from '../types'
-import { baseStandIn, composer, settle } from './stand-in'
+import { baseStandIn, composer, settle, testPath } from './stand-in'
 
 const ROOT = '/dev/game'
 const HOME = '/home/me'
@@ -81,9 +81,9 @@ function learningStandIn(on: On, files: Map<string, string>) {
         : 'CONCERN: 2\nVERDICT: Fine.\nDETAIL: Ok.',
   })
   mock.env(on, { HOME })
-  on('fs.read', ($, e) => (files.has(e.path) ? { value: files.get(e.path)! } : { deny: 'no such file' }))
+  on('fs.read', ($, e) => (files.has(testPath(e.path)) ? { value: files.get(testPath(e.path))! } : { deny: 'no such file' }))
   on('fs.write', ($, e) => {
-    files.set(e.path, e.text)
+    files.set(testPath(e.path), e.text)
     return { value: undefined }
   })
   on('fs.list', () => ({ deny: 'no such directory' }))

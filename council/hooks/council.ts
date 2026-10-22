@@ -56,9 +56,11 @@ export const ABSTAIN_LABEL = 'ABSTAIN:'
 export const optionsBlock = (options: readonly string[] | undefined) =>
   options && options.length > 0 ? `OPTIONS:\n${options.map((option, index) => `${index + 1}. ${option}`).join('\n')}` : undefined
 
-export function advisorPrompt(topic: string, brief: string, options?: readonly string[]): string {
+// `extra`: a sitting's own request after the usual one (a ruling on orders
+// asks for LEVEL and CHECK lines, court.ts orderAsk).
+export function advisorPrompt(topic: string, brief: string, options?: readonly string[], extra?: string): string {
   const block = optionsBlock(options)
-  return [`TOPIC:\n${topic}`, `THE HERALD'S BRIEF:\n${brief}`, ...(block ? [block, 'Give your three lines and your CHOICE line.'] : ['Give your three lines.'])].join('\n\n')
+  return [`TOPIC:\n${topic}`, `THE HERALD'S BRIEF:\n${brief}`, ...(block ? [block, 'Give your three lines and your CHOICE line.'] : ['Give your three lines.']), ...(extra ? [extra] : [])].join('\n\n')
 }
 
 export function followUpPrompt(topic: string, brief: string, report: AdvisorReport, question: string): string {
@@ -70,7 +72,7 @@ export function followUpPrompt(topic: string, brief: string, report: AdvisorRepo
   ].join('\n\n')
 }
 
-export function reconsiderPrompt(council: Council, report: AdvisorReport): string {
+export function reconsiderPrompt(council: Council, report: AdvisorReport, extra?: string): string {
   return [
     `TOPIC:\n${council.topic}`,
     `THE HERALD'S BRIEF:\n${council.brief}`,
@@ -81,6 +83,7 @@ export function reconsiderPrompt(council: Council, report: AdvisorReport): strin
         : 'You gave no verdict earlier.',
     `NEW CONTEXT FROM THE PERSON WHO ASKED:\n${council.context.map((text, index) => `${index + 1}. ${text}`).join('\n')}`,
     ...(optionsBlock(council.options) ? [optionsBlock(council.options)!, 'Reconsider and give your three lines and your CHOICE line.'] : ['Reconsider and give your three lines.']),
+    ...(extra ? [extra] : []),
   ].join('\n\n')
 }
 
@@ -96,6 +99,8 @@ const LABELS = { concern: LABEL('CONCERN'), verdict: LABEL('VERDICT'), detail: L
 export type ParsedVerdict = Pick<AdvisorReport, 'concern' | 'verdict' | 'detail'> & { isAbstained?: boolean; choice?: number }
 
 const CHOICE = /^\W*CHOICE\b[^:\n]{0,12}:\W*(\d+)/im
+// A ruling on orders' extra lines (court.ts orderAsk): they end the DETAIL too.
+const EXTRA_LINE = /^\W*(?:LEVEL|CHECK)\b/i
 
 // An abstention: `ABSTAIN: <why>` with no concern given.
 const ABSTAIN = /^\W*ABSTAIN\b[^:\n]{0,12}:\W*(.*)$/im
@@ -124,7 +129,7 @@ export function parseVerdict(text: string): ParsedVerdict | undefined {
     } else if (detailMatch) {
       detail.push(detailMatch[1]!)
       isInDetail = true
-    } else if (CHOICE.test(line)) {
+    } else if (CHOICE.test(line) || EXTRA_LINE.test(line)) {
       isInDetail = false
     } else if (isInDetail) {
       detail.push(line)

@@ -11,7 +11,24 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderInput, Timer } from 'claude-code'
 
-import type { AdvisorId, AdvisorReport, Council, Court, LearningView, Order, Roster, Seat } from '../types'
+import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, LearningView, Order, Roster, RulingSummons, Seat } from '../types'
+import {
+  ADVISOR_TYPE,
+  SUMMONS_TIMEOUT_MS,
+  advisorDigest,
+  advisorTask,
+  findingsContext,
+  finishedRun,
+  isAdvisorFinished,
+  isFoldable,
+  isAdvisorPath,
+  nextAdvisorNumber,
+  parseCheck,
+  readAdviseArgs,
+  summonsQuestions,
+  withAdvisorChanged,
+  withStaleAdvisors,
+} from './advisors'
 import {
   advisorPrompt,
   advisorSystemPrompt,
@@ -53,7 +70,7 @@ import {
   type ReviewMaterial,
   type ReviewRequest,
 } from './review'
-import { readSettings, type CouncilSettings } from './settings'
+import { readSettings, type CouncilSettings, type ModelEffort } from './settings'
 import { TICK_MS, animatedSvg, moodFor, rasterCells, roadSvg, roadText, spriteFrame, type Appearance } from './sprites'
 import {
   AGENT_TYPES,
@@ -93,7 +110,22 @@ import {
   needsArbiter,
   parseArbiterReply,
   withArbiterReview,
+  CONDITION_AT,
+  REFUSE_AT,
+  STALE_REPORT,
+  clashReason,
+  knightClash,
+  levelOf,
+  orderAsk,
+  orderLevels,
+  relativeFolder,
+  repoCandidates,
+  setOrderLevel,
+  withStaleReleased,
+  withWoken,
+  joinedReport,
   type ArbiterDecision,
+  type Place,
   type Proposal,
   type RulingResult,
 } from './court'
@@ -147,6 +179,9 @@ let isBlitting = false
 // Set while startAnimation awaits, so two overlapping starts make one timer.
 let isStartingAnimation = false
 const lastBlitCells = new Map<AdvisorId, string>()
+// The effort each council agent's requests run at, by agent id (turn.step);
+// rebuilt from the court's orders and runs after a reload.
+const stepEfforts = new Map<string, string>()
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -310,7 +345,11 @@ async function reviewBrief($: EngineInterface, project: string, request: ReviewR
 // The council's work, in the background: the brief, then all five advisors
 // at once, each card turning as its verdict lands. Every write checks that
 // this council is still the current one.
-async function holdCouncil($: EngineInterface, generation: number, topic: string, seats: readonly Seat[], isDeep: boolean, produceBrief: () => Promise<BriefOutcome>): Promise<void> {
+// `extra`: a sitting's own request beside the usual three lines (a ruling on
+// orders: LEVEL and CHECK lines); `onReply`: each member's raw answer, for them.
+type Asking = { extra?: string; onReply?: (seatId: AdvisorId, text: string) => void }
+
+async function holdCouncil($: EngineInterface, generation: number, topic: string, seats: readonly Seat[], isDeep: boolean, produceBrief: () => Promise<BriefOutcome>, asking: Asking = {}): Promise<void> {
   const isCurrent = () => generation === councilGeneration
   const outcome = await produceBrief().catch((): BriefOutcome => ({ failure: 'the herald could not write a brief' }))
   if (!isCurrent()) return
@@ -327,7 +366,8 @@ async function holdCouncil($: EngineInterface, generation: number, topic: string
   await updateCouncil($, council => ({ ...withAdvisorsDeliberating(council, brief), notice: outcome.notice ?? null }))
   await Promise.all(
     seats.map(async advisor => {
-      const verdict = await askAdvisorModel($, isDeep, advisorSystemPrompt(advisor, standing), advisorPrompt(topic, brief, options), 300).catch(() => undefined)
+      const verdict = await askAdvisorModel($, isDeep, advisorSystemPrompt(advisor, standing), advisorPrompt(topic, brief, options, asking.extra), asking.extra ? 450 : 300).catch(() => undefined)
+      if (verdict?.isAnswered) asking.onReply?.(advisor.id, verdict.text)
       if (isCurrent()) await updateCouncil($, council => withVerdict(council, advisor.id, verdict?.isAnswered ? verdict.text : undefined))
     }),
   )
@@ -556,7 +596,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
   }
   await expireOrders($).catch(() => undefined)
   const [court, isChamberShown] = await Promise.all([read($, courtAtom), read($, isChamberShownAtom)])
-  const hasCourt = court.orders.length > 0 || court.isInSession
+  const hasCourt = court.orders.length > 0 || court.isInSession || (court.advisors ?? []).some(run => !run.isFolded)
   if (hasCourt && !isChamberShown) {
     return courtView(table, {
       court,
@@ -587,7 +627,7 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       onToggleVerdict: id => update($, openVerdictAtom, current => (current === id ? null : id)),
       onToggleFinished: () => update($, isFinishedShownAtom, current => !current),
       onToggleSession: () => setCourtSession($, !court.isInSession),
-      onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)) })),
+      onClearFinished: () => update($, courtAtom, current => ({ ...current, orders: current.orders.filter(order => !isFinished(order)), advisors: (current.advisors ?? []).filter(run => !isAdvisorFinished(run)) })),
     })
   }
   if (e.surface === 'terminal' && council !== null) startAnimation($)
@@ -753,7 +793,7 @@ async function conveneAndWait(
   $: EngineInterface,
   topic: string,
   produceBrief: () => Promise<BriefOutcome>,
-  sitting: { onlySeat?: string; options?: string[]; isChamber?: boolean; source?: 'person' | 'claude'; isDeep?: boolean } = {},
+  sitting: { onlySeat?: string; options?: string[]; isChamber?: boolean; source?: 'person' | 'claude'; isDeep?: boolean } & Asking = {},
 ): Promise<Council | undefined> {
   const { seats: seated } = await seatsForProject($)
   // Asked of one member: only it sits.
@@ -768,7 +808,7 @@ async function conveneAndWait(
   await openCouncilPane($)
   isCouncilWorking = true
   try {
-    await holdCouncil($, generation, topic, seats, sitting.isDeep === true, produceBrief)
+    await holdCouncil($, generation, topic, seats, sitting.isDeep === true, produceBrief, { extra: sitting.extra, onReply: sitting.onReply })
   } finally {
     if (generation === councilGeneration) isCouncilWorking = false
   }
@@ -798,34 +838,353 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
       .catch(() => false)
     if (!isFolder) return `There is no folder ${dispatch.folder}/ under ${root}.`
   }
-  const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal, lastPetition) }), { source: 'claude' })
+  // No model spend on a plan whose knight would clash with one at work.
+  const clash = await proposalClash($, proposal, root)
+  if (clash !== undefined) return clash
+  // Each member's raw answers, newest round first, for the LEVEL lines.
+  const replies = new Map<AdvisorId, string>()
+  const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
+  let council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal, lastPetition) }), {
+    source: 'claude',
+    extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn),
+    onReply,
+  })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
-  const ruled = ruling(council, proposal.plan)
+  const summons = settings.isSummonsOn ? await summonForRuling($, council, proposal, root, replies) : undefined
+  if (summons?.round2 !== undefined) council = summons.round2
+  const ruled = { ...ruling(council, proposal.plan), ...(summons ? { summons: summons.record } : {}) }
   const result = needsArbiter(ruled) ? await arbitrate($, council, proposal, ruled) : ruled
+  const levels = orderLevels(
+    seatsOf(council).flatMap(seat => replies.get(seat.id) ?? []),
+    proposal.dispatches.map(dispatch => dispatch.role),
+  )
   const now = await $.clock.now()
   // Numbered inside the update, from the court as it is then, so an id is never
   // handed out twice; the court's counter moves past it and clearing never frees it.
   let orders: Order[] = []
   await update($, courtAtom, current => {
-    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now) : []
+    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now, levels) : []
     return {
       ...withOrdersAdded(current, orders),
       rulings: [
         ...current.rulings.slice(-9),
-        { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason, ...(result.notes ? { notes: result.notes } : {}) },
+        {
+          plan: result.plan,
+          isApproved: result.isApproved,
+          gravest: result.gravest,
+          reason: result.reason,
+          ...(result.notes ? { notes: result.notes } : {}),
+          ...(result.summons ? { summons: result.summons } : {}),
+        },
       ],
     }
   })
   return rulingText(result, orders)
 }
 
+// ── Advisor agents (council:advisor) ──────────────────────────────────────
+
+type AdvisorOutcome = { status: AdvisorRunStatus; report: string }
+type PendingAdvisor = { runId: string; folders: string[]; model: string; effort: string }
+
+// The advisor spawns this plugin is about to make, by the one-time token at
+// the end of their prompt: the only council:advisor spawns allowed. Claude and
+// subagents never see a token, so they can't start one.
+const pendingAdvisors = new Map<string, PendingAdvisor>()
+// Each advisor agent's folders, by agent id (the court's runs hold them too).
+const advisorAgents = new Map<string, string[]>()
+// Each running advisor's waiter (by run id), resolved by its last answer.
+const advisorWaiters = new Map<string, (outcome: AdvisorOutcome) => void>()
+
+const TOKEN_LINE = /\s*\[council-advisor-token ([0-9a-f]{16,})\]\s*$/
+const ADVISOR_DENIED = "The council's advisor (council:advisor) is started only by the person (/council advise) or by the council itself; it can't be dispatched. Use a council:scout with an approved order to read a folder."
+const ADVISOR_TOOLS = new Set(['Read', 'Grep', 'Glob'])
+
+// The agent type a spawn names. A plugin's own $.agent.spawn has reached the
+// hooks spelled as the Agent tool's input (subagent_type) in some engine
+// builds, so both spellings are read.
+const spawnTypeOf = (e: { subagentType?: string }) => e.subagentType ?? (e as { subagent_type?: unknown }).subagent_type
+
+function newToken(): string {
+  const uuid = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto?.randomUUID?.()
+  return uuid ? uuid.replace(/-/g, '') : Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+}
+
+// A new advisor run in the court, numbered inside the update.
+async function addAdvisorRun($: EngineInterface, fields: Pick<AdvisorRun, 'origin' | 'relFolders' | 'questions' | 'isDeep' | 'model' | 'effort'>): Promise<AdvisorRun> {
+  const now = await $.clock.now()
+  let added: AdvisorRun | undefined
+  await update($, courtAtom, current => {
+    const number = nextAdvisorNumber(current)
+    added = { ...fields, id: `A${number}`, status: 'running', agentId: null, report: '', startedAt: now, endedAt: null }
+    // Running ones are kept; of the rest, the last ten.
+    const kept = (current.advisors ?? []).filter((run, index, all) => run.status === 'running' || index >= all.length - 10)
+    return { ...current, advisors: [...kept, added], nextAdvisorId: number + 1 }
+  })
+  return added!
+}
+
+// Starts the advisor agent ($.agent.spawn; the engine refuses a plugin's own
+// Agent tool call) and waits for its last answer, which its turn.complete
+// brings, or for `timeoutMs`. The agent.spawn hook knows the spawn by its
+// token and sets its model and folder; turn.step sets its effort.
+async function runAdvisorAgent($: EngineInterface, runId: string, folders: string[], task: string, level: ModelEffort, timeoutMs?: number): Promise<AdvisorOutcome> {
+  const token = newToken()
+  pendingAdvisors.set(token, { runId, folders, model: level.model, effort: level.effort })
+  const answered = new Promise<AdvisorOutcome>(resolve => advisorWaiters.set(runId, resolve))
+  let timer: Timer | undefined
+  try {
+    const started = await $.agent
+      .spawn({ subagentType: ADVISOR_TYPE, description: `${runId} council advisor`, prompt: `${task}\n\n[council-advisor-token ${token}]`, model: level.model })
+      .catch((error: unknown) => ({ deny: error instanceof Error ? error.message : String(error) }))
+    if ('deny' in started && typeof started.deny === 'string') return { status: 'failed', report: `It could not start: ${started.deny}` }
+    const timedOut =
+      timeoutMs === undefined
+        ? []
+        : [
+            new Promise<AdvisorOutcome>(resolve => {
+              timer = $.clock.after(timeoutMs, () => resolve({ status: 'timed-out', report: '' }))
+            }),
+          ]
+    return await Promise.race([answered, ...timedOut])
+  } finally {
+    timer?.cancel()
+    pendingAdvisors.delete(token)
+    advisorWaiters.delete(runId)
+  }
+}
+
+// The advisor's spawn went through: its agent id, folders and effort noted.
+async function advisorStarted($: EngineInterface, pending: PendingAdvisor, agentId: string): Promise<void> {
+  advisorAgents.set(agentId, pending.folders)
+  stepEfforts.set(agentId, pending.effort)
+  await update($, courtAtom, current => withAdvisorChanged(current, pending.runId, run => ({ ...run, agentId })))
+}
+
+async function finishAdvisor($: EngineInterface, runId: string, outcome: AdvisorOutcome): Promise<void> {
+  const now = await $.clock.now()
+  const before = (await read($, courtAtom)).advisors?.find(run => run.id === runId)
+  await update($, courtAtom, current => withAdvisorChanged(current, runId, run => finishedRun(run, outcome.status, outcome.report, now)))
+  if (before?.origin === 'owner' && before.status === 'running') {
+    $.ui.toast(
+      outcome.status === 'done'
+        ? `${runId}: the advisor is back from ${before.relFolders.join(', ')}/; its report goes to Claude with your next message.`
+        : `${runId}: the advisor ${outcome.status === 'timed-out' ? 'timed out' : 'failed'} in ${before.relFolders.join(', ')}/.`,
+    )
+  }
+}
+
+// An advisor agent's last answer: its waiter takes it, or (after a reload,
+// with no one waiting) the run is finished here.
+async function finishAdvisorAgent($: EngineInterface, agentId: string, answer: string, isFailed: boolean): Promise<void> {
+  const run = (await read($, courtAtom)).advisors?.find(candidate => candidate.agentId === agentId && candidate.status === 'running')
+  if (run === undefined) return
+  const outcome: AdvisorOutcome = { status: isFailed ? 'failed' : 'done', report: answer }
+  const waiter = advisorWaiters.get(run.id)
+  if (waiter) waiter(outcome)
+  else await finishAdvisor($, run.id, outcome)
+}
+
+// The folders an advisor agent may read, or undefined for any other agent.
+async function advisorFoldersOf($: EngineInterface, agentId: string): Promise<string[] | undefined> {
+  const known = advisorAgents.get(agentId)
+  if (known !== undefined) return known
+  const run = (await read($, courtAtom)).advisors?.find(candidate => candidate.agentId === agentId)
+  if (run === undefined) return undefined
+  const root = await $.session.root()
+  return run.relFolders.map(folder => joinUnder(root, folder))
+}
+
+// `/council advise [deep] <folder> <question>`: the person sends the advisor
+// (Opus by default) to read one folder; its report goes to Claude with their
+// next message.
+async function adviseCommand($: EngineInterface, args: string): Promise<string> {
+  const parsed = readAdviseArgs(args)
+  if ('error' in parsed) return parsed.error
+  const root = await $.session.root()
+  const relFolder = relativeFolder(root, parsed.folder)
+  if (relFolder === undefined) return `"${parsed.folder}" must be a subfolder of ${root}.`
+  const folder = joinUnder(root, relFolder)
+  const isFolder = await $.fs
+    .stat(folder)
+    .then(stat => stat.kind === 'dir')
+    .catch(() => false)
+  if (!isFolder) return `There is no folder ${relFolder}/ under ${root}.`
+  const level = settings.advisorAgentLevels[parsed.isDeep ? 1 : 0]!
+  const questions: AdvisorQuestion[] = [{ question: parsed.question, askedBy: ['you'] }]
+  const run = await addAdvisorRun($, { origin: 'owner', relFolders: [relFolder], questions, isDeep: parsed.isDeep, model: level.model, effort: level.effort })
+  await update($, isChamberShownAtom, () => false)
+  await openCouncilPane($)
+  void runAdvisorAgent($, run.id, [folder], advisorTask([folder], questions), level)
+    .then(outcome => finishAdvisor($, run.id, outcome))
+    .catch(() => undefined)
+  return `The council's advisor (${run.id}: ${level.model} at ${level.effort} effort, read-only) is looking into ${relFolder}/. Its report goes to Claude with your next message.`
+}
+
+// The person's finished advisors, not yet sent: their reports, for Claude
+// beside the person's prompt (hidden from the transcript), marked sent.
+async function takeAdvisorReports($: EngineInterface): Promise<string[]> {
+  const ready = ((await read($, courtAtom)).advisors ?? []).filter(run => run.origin === 'owner' && isAdvisorFinished(run) && run.isDelivered !== true)
+  if (ready.length === 0) return []
+  const ids = ready.map(run => run.id)
+  await update($, courtAtom, current => ({ ...current, advisors: (current.advisors ?? []).map(run => (ids.includes(run.id) ? { ...run, isDelivered: true } : run)) }))
+  return ready.map(advisorDigest)
+}
+
+// ── Council summons: one advisor per ruling on orders ─────────────────────
+
+// When members whose concern is 3 or 4 ask CHECK questions, the council sends
+// one advisor (never one per member) to the plan's folders with every
+// question, deduped; its findings go to the members in a second round, which
+// decides. A plan already refused by a 5 summons no one. On a timeout or a
+// failure the council rules on its first round.
+async function summonForRuling($: EngineInterface, council: Council, proposal: Proposal, root: string, replies: Map<AdvisorId, string>): Promise<{ record: RulingSummons; round2?: Council } | undefined> {
+  if (ruling(council, proposal.plan).gravest >= REFUSE_AT) return undefined
+  const checks = seatsOf(council).flatMap(seat => {
+    const report = council.advisors[seat.id]
+    const reply = replies.get(seat.id)
+    if (report?.status !== 'done' || report.concern < CONDITION_AT || report.concern >= REFUSE_AT || reply === undefined) return []
+    const question = parseCheck(reply)
+    return question === undefined ? [] : [{ title: seat.title, question }]
+  })
+  if (checks.length === 0) return undefined
+  const questions = summonsQuestions(checks)
+  const level = settings.advisorAgentLevels[0]!
+  const relFolders = [...new Set(proposal.dispatches.map(dispatch => dispatch.folder))]
+  const folders = relFolders.map(folder => joinUnder(root, folder))
+  // The chamber is ours for the second round only if no other council took it meanwhile.
+  const generation = councilGeneration
+  const run = await addAdvisorRun($, { origin: 'council', relFolders, questions, isDeep: false, model: level.model, effort: level.effort })
+  $.ui.toast(`The council sends its advisor (${run.id}) to check ${questions.length === 1 ? 'a question' : `${questions.length} questions`} before it rules.`)
+  const outcome = await runAdvisorAgent($, run.id, folders, advisorTask(folders, questions, proposal.plan), level, SUMMONS_TIMEOUT_MS)
+  await finishAdvisor($, run.id, outcome)
+  const record: RulingSummons = { advisorId: run.id, questions, status: outcome.status, findings: outcome.status === 'done' ? outcome.report.trim() : '' }
+  if (outcome.status !== 'done') return { record }
+  const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
+  const round2 = await secondRound($, council, findingsContext(questions, record.findings), orderAsk(proposal.dispatches.length, false), onReply, generation === councilGeneration)
+  return { record, round2 }
+}
+
+// The members reconsider once, with `context` (the advisor's findings) added:
+// the second round of a ruling. Shown in the chamber when `isShown`.
+async function secondRound($: EngineInterface, council: Council, context: string, extra: string, onReply: (seatId: AdvisorId, text: string) => void, isShown: boolean): Promise<Council> {
+  let current = withReconsidering(council, context)
+  const generation = isShown ? ++councilGeneration : undefined
+  const isMirrored = () => generation !== undefined && generation === councilGeneration
+  const mirror = async () => {
+    if (isMirrored()) await update($, councilAtom, () => current)
+  }
+  await mirror()
+  if (isMirrored()) isCouncilWorking = true
+  try {
+    await Promise.all(
+      seatsOf(current).map(async seat => {
+        const report = current.advisors[seat.id]
+        if (report === undefined) return
+        const reply = await askAdvisorModel($, current.isDeep, advisorSystemPrompt(seat, current.standing), reconsiderPrompt(current, report, extra), 450).catch(() => undefined)
+        if (reply?.isAnswered) onReply(seat.id, reply.text)
+        current = withVerdict(current, seat.id, reply?.isAnswered ? reply.text : undefined)
+        await mirror()
+      }),
+    )
+  } finally {
+    if (isMirrored()) isCouncilWorking = false
+  }
+  return current
+}
+
+// ── Knight overlap ────────────────────────────────────────────────────────
+
+// Each folder's git repository (the nearest folder at or above it holding a
+// .git file or folder), found once per session.
+const repoCache = new Map<string, string | null>()
+
+async function repoOf($: EngineInterface, folder: string): Promise<string | null> {
+  const cached = repoCache.get(folder)
+  if (cached !== undefined) return cached
+  let found: string | null = null
+  for (const candidate of repoCandidates(folder)) {
+    if (await $.fs.exists(joinUnder(candidate, '.git')).catch(() => false)) {
+      found = candidate
+      break
+    }
+  }
+  repoCache.set(folder, found)
+  return found
+}
+
+async function placeOf($: EngineInterface, folder: string): Promise<Place> {
+  return { folder, repo: await repoOf($, folder) }
+}
+
+// The knights at work now, each with its place.
+async function workingKnights($: EngineInterface, orders: readonly Order[]): Promise<Array<{ order: Order; place: Place }>> {
+  return Promise.all(orders.filter(order => order.role === 'knight' && order.status === 'dispatched').map(async order => ({ order, place: await placeOf($, order.folder) })))
+}
+
+// A proposal's knight that would work where a dispatched knight works now:
+// refused before the council sits. Knights within one proposal, or beside
+// orders only approved, are not refused here: the dispatch check holds them
+// to one at a time.
+async function proposalClash($: EngineInterface, proposal: Proposal, root: string): Promise<string | undefined> {
+  if (!proposal.dispatches.some(dispatch => dispatch.role === 'knight')) return undefined
+  await expireOrders($)
+  const working = await workingKnights($, (await read($, courtAtom)).orders)
+  if (working.length === 0) return undefined
+  for (const [index, dispatch] of proposal.dispatches.entries()) {
+    if (dispatch.role !== 'knight') continue
+    const place = await placeOf($, joinUnder(root, dispatch.folder))
+    const clash = knightClash(place, working)
+    if (clash !== undefined) {
+      return `Dispatch ${index + 1} (a knight in ${dispatch.folder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, a knight still at work in ${clash.order.relFolder}/. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then propose again (knights one after another in one repository are fine).`
+    }
+  }
+  return undefined
+}
+
+// Knight dispatches are checked one at a time, and a knight whose spawn is
+// under way counts as at work, so two dispatched together can't both pass.
+let knightQueue: Promise<unknown> = Promise.resolve()
+const startingKnights = new Map<string, Order>()
+
+function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
+  const run = knightQueue.then(work, work)
+  knightQueue = run.catch(() => undefined)
+  return run
+}
+
+// ── Orders whose agent is gone ────────────────────────────────────────────
+
+// Every agent the engine lists, in any status (a waiting or idle agent is not
+// gone); undefined when the list can't be read, so nothing is released.
+async function listedAgents($: EngineInterface): Promise<Set<string> | undefined> {
+  const agents = await $.agent.list().catch(() => undefined)
+  return Array.isArray(agents) ? new Set(agents.map(agent => agent.id)) : undefined
+}
+
 // Orders approved long ago and never dispatched expire: withdrawn as
-// "expired" (court.ts withExpired). Run wherever the court is looked at or
-// acted on, so no timer is needed.
+// "expired" (court.ts withExpired). A dispatched order (or a running advisor)
+// whose agent the engine no longer lists is released as failed. Run wherever
+// the court is looked at or acted on, so no timer is needed (the agent list
+// is read only while an agent is out).
 async function expireOrders($: EngineInterface): Promise<void> {
   const [now, court] = await Promise.all([$.clock.now(), read($, courtAtom)])
-  if (withExpired(court.orders, now) === court.orders) return
-  await update($, courtAtom, current => ({ ...current, orders: [...withExpired(current.orders, now)] }))
+  const hasAgents = court.orders.some(order => order.status === 'dispatched' && order.agentId !== null) || (court.advisors ?? []).some(run => run.status === 'running' && run.agentId !== null)
+  let listed: Set<string> | undefined
+  if (hasAgents) listed = await listedAgents($)
+  // A knight whose spawn is under way has no agent id yet, and is never released.
+  const release = (current: Court): Court => {
+    const orders = withExpired(current.orders, now)
+    const released = listed === undefined ? orders : withStaleReleased(orders, listed, now)
+    const advisors = listed === undefined || current.advisors === undefined ? current.advisors : withStaleAdvisors(current.advisors, listed, now)
+    return released === current.orders && advisors === current.advisors ? current : { ...current, orders: [...released], ...(advisors ? { advisors: [...advisors] } : {}) }
+  }
+  if (release(court) === court) return
+  await update($, courtAtom, release)
+  // Whoever waits on a gone advisor stops waiting.
+  for (const run of court.advisors ?? []) {
+    if (listed !== undefined && run.status === 'running' && run.agentId !== null && !listed.has(run.agentId)) advisorWaiters.get(run.id)?.({ status: 'failed', report: 'agent ended without reporting' })
+  }
 }
 
 // The withdraw_orders tool: Claude retires approved orders it won't dispatch.
@@ -891,6 +1250,21 @@ async function dispatchOrder($: EngineInterface, e: { subagentType: string; desc
       deny: open.length > 0 ? `Name the order this carries in the description: open orders are ${open.join(', ')}.` : 'No approved order for this dispatch. Propose it with mcp__council__propose_orders first.',
     }
   }
+  // A knight waits while another works in an overlapping place.
+  if (order.role === 'knight') {
+    const refusal = await oneAtATime(async () => {
+      if (startingKnights.has(order.id)) return `${order.id} is already being dispatched.`
+      const working = [...(await workingKnights($, (await read($, courtAtom)).orders)), ...(await Promise.all([...startingKnights.values()].map(async other => ({ order: { ...other, status: 'dispatched' as const }, place: await placeOf($, other.folder) }))))]
+      const place = await placeOf($, order.folder)
+      const clash = knightClash(place, working, order.id)
+      if (clash !== undefined) {
+        return `${order.id} (a knight in ${order.relFolder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, a knight still at work in ${clash.order.relFolder}/. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then dispatch ${order.id}.`
+      }
+      startingKnights.set(order.id, order)
+      return undefined
+    })
+    if (refusal !== undefined) return { deny: refusal }
+  }
   const instructions = await $.fs.read(joinUnder(order.folder, 'CLAUDE.md')).catch(() => undefined)
   return {
     order,
@@ -926,15 +1300,80 @@ async function followAgentCall($: EngineInterface, agentId: string, tool: string
   return { order }
 }
 
+// The order an agent's last answer belongs to: the one it carries, or one
+// released as gone that turns out not to be.
+const isReportedBy = (order: Order, agentId: string) => order.agentId === agentId && (order.status === 'dispatched' || (order.status === 'failed' && order.report === STALE_REPORT))
+
 async function finishOrder($: EngineInterface, agentId: string, answer: string, isFailed: boolean): Promise<void> {
   const court = await read($, courtAtom)
-  const order = court.orders.find(candidate => candidate.agentId === agentId && candidate.status === 'dispatched')
+  const order = court.orders.find(candidate => isReportedBy(candidate, agentId))
   if (order === undefined) return
   const now = await $.clock.now()
-  // The whole report (it opens in full in the court), line breaks kept.
-  const report = answer.replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000)
-  await updateOrder($, candidate => candidate.id === order.id, current => ({ ...current, status: isFailed ? 'failed' : 'done', report, endedAt: now }))
-  $.ui.toast(`${order.id}: the ${order.role} ${isFailed ? 'fell in' : 'is back from'} ${order.relFolder}/.`)
+  // The whole report (it opens in full in the court), line breaks kept; after a
+  // wake, the earlier report comes first.
+  const answered = answer.replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000)
+  await updateOrder(
+    $,
+    candidate => candidate.id === order.id,
+    current => ({ ...current, status: isFailed ? 'failed' : 'done', report: joinedReport(current.wakes !== undefined || current.report === STALE_REPORT ? current.report : '', answered), endedAt: now }),
+  )
+  $.ui.toast(`${order.id}: the ${order.role} (L${levelOf(order)}) ${isFailed ? 'fell in' : 'is back from'} ${order.relFolder}/.`)
+}
+
+// The effort a council agent's request runs at, or undefined for any other
+// agent. Read from the court when this module doesn't know it (after a reload).
+async function stepEffortFor($: EngineInterface, agentId: string): Promise<string | undefined> {
+  const known = stepEfforts.get(agentId)
+  if (known !== undefined) return known
+  const court = await read($, courtAtom)
+  const effort = court.orders.find(order => order.agentId === agentId)?.effort ?? court.advisors?.find(run => run.agentId === agentId)?.effort
+  if (effort !== undefined) stepEfforts.set(agentId, effort)
+  return effort
+}
+
+// `/council level <order> <1-3>`: the person changes an approved order's level.
+async function levelCommand($: EngineInterface, id: string, value: string): Promise<string> {
+  await expireOrders($)
+  const outcome = setOrderLevel((await read($, courtAtom)).orders, id, value)
+  if ('error' in outcome) return outcome.error
+  await update($, courtAtom, current => {
+    const again = setOrderLevel(current.orders, id, value)
+    return 'error' in again ? current : { ...current, orders: again.orders }
+  })
+  return outcome.message
+}
+
+// What an order's level runs on (settings scoutLevels, knightLevels).
+const levelSetting = (order: Order): ModelEffort => (order.role === 'knight' ? settings.knightLevels : settings.scoutLevels)[levelOf(order) - 1]!
+
+// An agent woke (a timer, a background task, a message): its order, done or
+// failed when it ended its turn to wait, goes back on the road. Never refused:
+// a denied wake leaves its agent parked for good. A knight that wakes while
+// another knight works in an overlapping place goes on too, with a warning on
+// both orders.
+async function wakeOrder($: EngineInterface, agentId: string): Promise<void> {
+  const court = await read($, courtAtom)
+  const order = court.orders.find(candidate => candidate.agentId === agentId)
+  if (order === undefined) return
+  if (order.effort !== undefined) stepEfforts.set(agentId, order.effort)
+  if (order.status === 'dispatched') return
+  let warning: string | undefined
+  let clashId: string | undefined
+  if (order.role === 'knight') {
+    const place = await placeOf($, order.folder)
+    const clash = knightClash(place, await workingKnights($, court.orders), order.id)
+    if (clash !== undefined) {
+      clashId = clash.order.id
+      warning = `${order.id} woke while ${clash.order.id} works in ${clashReason(place, clash.place)}`
+    }
+  }
+  await update($, courtAtom, current => ({
+    ...current,
+    orders: current.orders.map(candidate =>
+      candidate.id === order.id ? { ...withWoken(candidate), ...(warning ? { warning } : {}) } : candidate.id === clashId && warning ? { ...candidate, warning } : candidate,
+    ),
+  }))
+  if (warning) $.ui.toast(`Council: ${warning}; both go on.`)
 }
 
 async function setCourtSession($: EngineInterface, isInSession: boolean): Promise<void> {
@@ -982,7 +1421,7 @@ async function courtCommand($: EngineInterface, action: string): Promise<string>
     return action === 'on' ? 'Court mode is on: your prompts go to the council before Claude, and work is dispatched through approved orders.' : 'Court mode is off.'
   }
   if (action === 'clear') {
-    await update($, courtAtom, court => ({ ...court, orders: court.orders.filter(order => order.status === 'approved' || order.status === 'dispatched') }))
+    await update($, courtAtom, court => ({ ...court, orders: court.orders.filter(order => order.status === 'approved' || order.status === 'dispatched'), advisors: (court.advisors ?? []).filter(run => !isAdvisorFinished(run)) }))
     return 'Finished orders cleared.'
   }
   await update($, isChamberShownAtom, () => false)
@@ -1107,12 +1546,19 @@ async function forgetLesson($: EngineInterface, id: string): Promise<void> {
   await refreshLearning($)
 }
 
-async function councilCommand($: EngineInterface, args: string): Promise<string> {
+// Who typed the command: the person at the prompt (or through Remote Control),
+// or anything else (a model, a plugin, a schedule).
+const isPersonOrigin = (origin: { kind: string } | undefined) => origin?.kind === 'composer' || origin?.kind === 'bridge'
+
+async function councilCommand($: EngineInterface, args: string, origin?: { kind: string }): Promise<string> {
   const trimmed = args.trim()
   const [action = '', target = '', ...words] = trimmed.split(/\s+/)
   // A subcommand only when it's used as one, so "reset the DB first?" or
   // "ask users for consent?" are still questions for the council.
   const isAlone = trimmed.split(/\s+/).length === 1
+  // The advisor agent and order levels are the person's alone.
+  if (action === 'advise') return isPersonOrigin(origin) ? adviseCommand($, trimmed.replace(/^advise\b/, '')) : "Only the person can send the council's advisor: type /council advise at the prompt."
+  if (action === 'level' && /^O\d+$/i.test(target) && words.length === 1) return isPersonOrigin(origin) ? levelCommand($, target, words[0]!) : "Only the person can change an order's level: type /council level at the prompt."
   if (action === 'show' && isAlone) {
     if ((await read($, councilAtom)) === null) return 'The council has not convened. /council <topic> to summon it.'
     await openCouncilPane($)
@@ -1147,7 +1593,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|report|members|lessons|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|report|members|lessons|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)
@@ -1168,7 +1614,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'council' }, async ($, e) => ({ text: await councilCommand($, e.args) }))
+  on('command.run', { command: 'council' }, async ($, e) => ({ text: await councilCommand($, e.args, e.origin) }))
 
   on('ui.render', { component: 'Pane', requestId: COUNCIL_PANE_ID }, ($, e) => drawCouncil($, e))
 
@@ -1177,10 +1623,17 @@ export const register: Register = (on, options) => {
   on('tool.check', { tool: 'mcp__council__progress' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__withdraw_orders' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__consult' }, () => ({ decision: 'allow' as const }))
-  on('tool.call', { tool: 'mcp__council__consult' }, async ($, e) => ({ result: await consultCouncil($, e as unknown as Record<string, unknown>) })).catch(() => ({
+
+  // Convening the council is the main session's call: a subagent can't put
+  // questions or plans to it (only the person and Claude can).
+  on('tool.call', { tool: 'mcp__council__consult' }, async ($, e) =>
+    e.agentId !== undefined ? { deny: "Subagents can't consult the council; report to Claude instead." } : { result: await consultCouncil($, e as unknown as Record<string, unknown>) },
+  ).catch(() => ({
     deny: 'The council could not be consulted; ask the person instead.',
   }))
-  on('tool.call', { tool: 'mcp__council__propose_orders' }, async ($, e) => ({ result: await proposeOrders($, e as unknown as Record<string, unknown>) })).catch(() => ({
+  on('tool.call', { tool: 'mcp__council__propose_orders' }, async ($, e) =>
+    e.agentId !== undefined ? { deny: "Subagents can't propose orders; report to Claude instead." } : { result: await proposeOrders($, e as unknown as Record<string, unknown>) },
+  ).catch(() => ({
     deny: 'The council could not rule on the plan; ask the person.',
   }))
 
@@ -1189,25 +1642,77 @@ export const register: Register = (on, options) => {
     e.agentId !== undefined ? { deny: 'Council scouts and knights cannot withdraw orders; report to Claude instead.' } : { result: await withdrawOrdersTool($, e as unknown as Record<string, unknown>) },
   ).catch(() => ({ deny: 'The council could not withdraw the orders; try again.' }))
 
-  // Every dispatch: council agents carry an approved order; in court mode,
-  // nothing else is dispatched.
+  // The advisor is never offered to the model: only the plugin starts it.
+  on('agent.offer', { agent: 'council:advisor' }, () => ({ isOffered: false }))
+
+  // Every dispatch: council agents carry an approved order, on their level's
+  // model; the advisor only when the plugin started it; in court mode,
+  // nothing else is dispatched. A wake is never refused.
   on('agent.spawn', async ($, e, next) => {
+    // An agent waking (a timer, a background task, a message) continues under
+    // its own id; the engine ignores a rewrite, and a deny would park it for good.
+    if (e.resume !== undefined) {
+      await wakeOrder($, e.resume.agentId).catch(() => undefined)
+      return next(e)
+    }
+    if (spawnTypeOf(e) === ADVISOR_TYPE) {
+      const token = TOKEN_LINE.exec(e.prompt)?.[1]
+      const pending = token === undefined ? undefined : pendingAdvisors.get(token)
+      if (token === undefined || pending === undefined) return { deny: ADVISOR_DENIED }
+      pendingAdvisors.delete(token)
+      const result = await next({ ...e, prompt: e.prompt.replace(TOKEN_LINE, ''), model: pending.model, ...(pending.folders[0] ? { cwd: pending.folders[0] } : {}) })
+      if (result.agentId !== undefined) await advisorStarted($, pending, result.agentId)
+      return result
+    }
     const outcome = await dispatchOrder($, e)
     if (outcome === undefined) return next(e)
     if ('deny' in outcome) return { deny: outcome.deny }
-    const result = await next({ ...e, prompt: outcome.prompt, description: outcome.description })
-    if (result.agentId !== undefined) {
-      const now = await $.clock.now()
-      await updateOrder($, order => order.id === outcome.order.id, order => ({ ...order, status: 'dispatched', agentId: result.agentId ?? null, startedAt: now }))
+    const level = levelSetting(outcome.order)
+    try {
+      const result = await next({ ...e, prompt: outcome.prompt, description: outcome.description, model: level.model })
+      if (result.agentId !== undefined) {
+        stepEfforts.set(result.agentId, level.effort)
+        const now = await $.clock.now()
+        await updateOrder($, order => order.id === outcome.order.id, order => ({ ...order, status: 'dispatched', agentId: result.agentId ?? null, startedAt: now, effort: level.effort }))
+      }
+      return result
+    } finally {
+      startingKnights.delete(outcome.order.id)
     }
-    return result
-  }).catch(($, e, next) => (next.called ? next(e) : Object.values(AGENT_TYPES).includes(e.subagentType) ? { deny: 'The council could not check this dispatch against its orders; try again.' } : next(e)))
+  }).catch(($, e, next) =>
+    next.called || e.resume !== undefined
+      ? next(e)
+      : spawnTypeOf(e) === ADVISOR_TYPE
+        ? { deny: ADVISOR_DENIED }
+        : Object.values(AGENT_TYPES).includes(e.subagentType)
+          ? { deny: 'The council could not check this dispatch against its orders; try again.' }
+          : next(e),
+  )
 
-  // A council agent's calls: progress, edits, and its folder's bounds.
+  // A council agent's model requests run at its level's effort; everything
+  // else passes untouched. A model that takes no effort is left alone.
+  on('turn.step', async function* ($, e, next) {
+    const effort = e.agentId === undefined || e.effort === undefined ? undefined : await stepEffortFor($, e.agentId)
+    return yield* next(effort === undefined || effort === e.effort ? e : { ...e, effort: effort as typeof e.effort })
+  })
+
+  // A council agent's calls: progress, edits, and its folder's bounds; the
+  // advisor reads only, and only in its folders.
   // (The progress tool is answered here too, so its list is always folded in.)
   on('tool.call', async ($, e, next) => {
     const isProgress = e.tool === PROGRESS_TOOL
     if (e.agentId === undefined) return isProgress ? { deny: 'The progress tool is for council scouts and knights carrying an order.' } : next(e)
+    const advisorFolders = await advisorFoldersOf($, e.agentId)
+    if (advisorFolders !== undefined) {
+      const tool = String(e.tool)
+      if (!ADVISOR_TOOLS.has(tool)) return { deny: "The council's advisor only reads (Read, Grep, Glob)." }
+      const input = e as unknown as { file_path?: unknown; path?: unknown }
+      const path = tool === 'Read' ? input.file_path : input.path
+      if (!isAdvisorPath(advisorFolders, typeof path === 'string' ? path : undefined)) {
+        return { deny: `The council's advisor reads only in ${advisorFolders.join(', ')}; ${String(path)} is outside.` }
+      }
+      return next(e)
+    }
     const outcome = await followAgentCall($, e.agentId, String(e.tool), e as unknown as Record<string, unknown>)
     if (isProgress) return { result: outcome === undefined ? 'No order of yours is in progress; nothing noted.' : 'Noted.' }
     if (outcome !== undefined && 'deny' in outcome) return { deny: outcome.deny }
@@ -1218,12 +1723,14 @@ export const register: Register = (on, options) => {
     return result
   }).catch(($, e, next) => (next.called ? next(e) : FILE_TOOLS.has(String(e.tool)) && e.agentId !== undefined ? { deny: 'The council could not check this edit against its order; try again.' } : next(e)))
 
-  // A council agent's last answer is its report.
+  // A council agent's last answer is its report; an advisor's, its findings.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined) {
       const isFailed = e.reason !== 'answer'
-      await finishOrder($, e.agentId, 'answer' in e ? e.answer : '', isFailed).catch(() => undefined)
+      const answer = 'answer' in e ? e.answer : ''
+      await finishOrder($, e.agentId, answer, isFailed).catch(() => undefined)
+      await finishAdvisorAgent($, e.agentId, answer, isFailed).catch(() => undefined)
     }
     return result
   })
@@ -1231,24 +1738,28 @@ export const register: Register = (on, options) => {
   // Court mode: what you type goes to the council first.
   // The prompt waits here while the council sits (the model calls in flight
   // don't count against the hook's time), then enters as typed, with the
-  // council's digest beside it for Claude only.
+  // council's digest beside it for Claude only. A report from the person's
+  // own advisor goes beside their next prompt the same way, court mode or not.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind !== 'composer') return next(e)
-    // Your next message folds away the orders that have finished since.
+    // Your next message folds away the orders and advisors that have finished since.
     await expireOrders($).catch(() => undefined)
-    if ((await read($, courtAtom)).orders.some(order => isFinished(order) && !order.isFolded)) {
-      await update($, courtAtom, current => ({ ...current, orders: withFinishedFolded(current.orders) }))
+    const before = await read($, courtAtom)
+    if (before.orders.some(order => isFinished(order) && !order.isFolded) || (before.advisors ?? []).some(isFoldable)) {
+      await update($, courtAtom, current => ({ ...current, orders: withFinishedFolded(current.orders), ...(current.advisors ? { advisors: current.advisors.map(run => (isFoldable(run) ? { ...run, isFolded: true } : run)) } : {}) }))
     }
     if (e.text.trim().startsWith('/')) return next(e)
+    const reports = await takeAdvisorReports($).catch(() => [])
+    const withReports = reports.length > 0 ? { ...e, context: [...(e.context ?? []), ...reports] } : e
     const court = await read($, courtAtom)
-    if (!court.isInSession) return next(e)
+    if (!court.isInSession) return next(withReports)
     const route = await triage($, e.text)
-    if (route === 'pass') return next(e)
+    if (route === 'pass') return next(withReports)
     const onlySeat = typeof route === 'object' ? route.seat : undefined
     await update($, courtAtom, current => ({ ...current, heldPrompt: e.text }))
     try {
       const digest = await petitionDigest($, e.text, route !== 'review', onlySeat)
-      return await next({ ...e, context: [...(e.context ?? []), digest] })
+      return await next({ ...withReports, context: [...(withReports.context ?? []), digest] })
     } finally {
       await update($, courtAtom, current => ({ ...current, heldPrompt: null }))
     }

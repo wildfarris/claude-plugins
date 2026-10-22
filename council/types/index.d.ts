@@ -186,7 +186,59 @@ export type Order = {
   // Finished, and folded away at the person's next prompt. Absent in orders
   // saved before folding existed.
   isFolded?: boolean
+  // How demanding the council rated it, 1 to 3: picks the agent's model and
+  // effort (settings scoutLevels, knightLevels). Absent in older orders (read
+  // as the role's default: 2 for a knight, 1 for a scout).
+  level?: OrderLevel
+  // The effort its agent's requests run at (from its level), kept with the
+  // order so it survives a reload and applies after a wake. Absent: untouched.
+  effort?: string
+  // How many times its agent woke after reporting (a timer, a background
+  // task, a message): each wake reopens the order. Absent: never.
+  wakes?: number
+  // A note on the order the person should see (e.g. it woke while another
+  // knight was working in an overlapping place).
+  warning?: string
 }
+
+export type OrderLevel = 1 | 2 | 3
+
+// ── Advisor agents (council:advisor): read-only investigators ─────────────
+
+// 'timed-out': the council stopped waiting for it (a summons only).
+export type AdvisorRunStatus = 'running' | 'done' | 'failed' | 'timed-out'
+
+// One question put to an advisor, and who asked it: member titles for a
+// summons, 'you' for the person's own.
+export type AdvisorQuestion = { question: string; askedBy: string[] }
+
+// One advisor agent's run: started by the person (/council advise) or
+// summoned by the council during a ruling on orders.
+export type AdvisorRun = {
+  // A1, A2…
+  id: string
+  origin: 'owner' | 'council'
+  // The folders it may read, relative to the session root.
+  relFolders: string[]
+  questions: AdvisorQuestion[]
+  // /council advise deep: the second advisor agent level.
+  isDeep: boolean
+  model: string
+  effort: string
+  status: AdvisorRunStatus
+  agentId: string | null
+  // Its findings, trimmed.
+  report: string
+  startedAt: number
+  endedAt: number | null
+  // The person's own: its report has gone to Claude with their next prompt.
+  isDelivered?: boolean
+  // Finished, and folded away at the person's next prompt.
+  isFolded?: boolean
+}
+
+// What a ruling's summons asked and found.
+export type RulingSummons = { advisorId: string; questions: AdvisorQuestion[]; status: AdvisorRunStatus; findings: string }
 
 // One proposal the council ruled on.
 export type Ruling = {
@@ -198,6 +250,8 @@ export type Ruling = {
   // What the arbiter's review left beside the conditions: each one it
   // dropped and why, or that its review failed (court.ts). Absent before it.
   notes?: string[]
+  // The advisor the council summoned before ruling, if any.
+  summons?: RulingSummons
 }
 
 export type Court = {
@@ -207,6 +261,10 @@ export type Court = {
   // saved before it existed: ids then continue after the highest saved one.
   nextOrderId?: number
   rulings: Ruling[]
+  // Advisor agents, oldest first. Absent in courts saved before them.
+  advisors?: AdvisorRun[]
+  // The number the next advisor gets (A<n>).
+  nextAdvisorId?: number
   // Court mode: every prompt goes to the council before Claude.
   isInSession: boolean
   // A prompt held for the council, while it sits.
