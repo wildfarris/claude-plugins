@@ -378,7 +378,7 @@ test('orders and an amendment carry the words in place of the old petition; the 
   const harness = standIn(on, {
     verdict: (system, prompt) =>
       system.includes('You are The Seneschal')
-        ? `CONCERN: 3\nVERDICT: Wider than asked.\nDETAIL: The auth rewrite was not asked.${prompt.includes('<<<WORDS') ? '\nBEYOND: rewrites the auth module' : ''}`
+        ? `CONCERN: 3\nVERDICT: Wider than asked.\nDETAIL: The auth rewrite was not asked.${prompt.includes('<<<WORDS') ? '\nBEYOND: rewrites the auth module and the session store, migrates every stored token to the new format, and renames the login routes across the whole API surface' : ''}`
         : 'CONCERN: 2\nVERDICT: Fine.',
     arbiter: () => '{"decisions":[{"index":1,"keep":true,"reason":"Warranted."}]}',
   })
@@ -398,12 +398,12 @@ test('orders and an amendment carry the words in place of the old petition; the 
   expect(arbiterCalls(harness)[0]!.prompt).toContain('<<<WORDS\nFix the login bug.\nWORDS>>>')
   expect(arbiterCalls(harness)[0]!.prompt).not.toContain('REQUEST>>>')
   // Claude is told what goes beyond, once.
-  expect(ruled).toContain('Beyond your request (per Seneschal): rewrites the auth module')
+  expect(ruled).toContain('Beyond your request (per Seneschal): rewrites the auth module and the session store, migrates every stored token to the new format, and renames the login routes across the whole API surface')
   expect(ruled.split('Beyond your request').length).toBe(2)
 
   // The court shows it under the latest ruling.
   let pane = await $.ui.mount({ plugin: 'council', surface: 'desktop', component: 'Pane', requestId: 'council-chamber', props: PANE })
-  expect(await pane.find({ text: /· Beyond your request \(per Seneschal\): rewrites the auth module/ })).toBeDefined()
+  expect(await pane.find({ text: /· Beyond your request \(per Seneschal\): rewrites the auth module and the session store, migrates every stored token to the new format, and renames the login routes across the whole API surface/ })).toBeDefined()
   await pane.unmount()
 
   // An amendment carries them too.
@@ -413,13 +413,13 @@ test('orders and an amendment carry the words in place of the old petition; the 
   const amended = text(await $.tool.call({ tool: 'mcp__council__amend_order', id: 'O1', change: 'Also fix logout and add SSO.', reason: 'The person asked.' } as never))
   expect(memberCalls(harness)[0]!.prompt).toContain('<<<WORDS\n[1] Fix the login bug.\n[2] Also fix the logout button while you are in there.\nWORDS>>>')
   expect(memberCalls(harness)[0]!.prompt).not.toContain('The person asked:')
-  expect(amended).toContain('Beyond your request (per Seneschal): rewrites the auth module')
+  expect(amended).toContain('Beyond your request (per Seneschal): rewrites the auth module and the session store, migrates every stored token to the new format, and renames the login routes across the whole API surface')
 
   // The docket keeps the words and the BEYOND line of each sitting that carried them.
   await until(harness, () => written(harness.files).filter(entry => entry.kind === 'orders' || entry.kind === 'amendment').length === 2)
   const orders = written(harness.files).find(entry => entry.kind === 'orders')!
   expect(orders.words).toEqual({ prompts: ['Fix the login bug.'] })
-  expect(orders.beyond).toEqual([{ text: 'rewrites the auth module', by: ['Seneschal'] }])
+  expect(orders.beyond).toEqual([{ text: 'rewrites the auth module and the session store, migrates every stored token to the new format, and renames the login routes across the whole API surface', by: ['Seneschal'] }])
   const court = written(harness.files).find(entry => entry.kind === 'court')!
   expect(court.words).toBeUndefined()
   // And the docket view shows them.
@@ -427,7 +427,7 @@ test('orders and an amendment carry the words in place of the old petition; the 
   pane = await $.ui.mount({ plugin: 'council', surface: 'desktop', component: 'Pane', requestId: 'council-chamber', props: PANE })
   await pane.press({ key: `docket-entry-${orders.id}` })
   expect(await pane.find({ text: /^Your words$/ })).toBeDefined()
-  expect(await pane.find({ text: /Beyond your request \(per Seneschal\): rewrites the auth module/ })).toBeDefined()
+  expect(await pane.find({ text: /Beyond your request \(per Seneschal\): rewrites the auth module and the session store, migrates every stored token to the new format, and renames the login routes across the whole API surface/ })).toBeDefined()
   await pane.unmount()
 })
 

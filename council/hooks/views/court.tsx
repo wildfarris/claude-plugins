@@ -400,7 +400,7 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
             </Text>
           ))}
           {lastRuling?.beyond?.map((entry, index) => (
-            <Text key={`ruling-beyond-${index}`} color="warning" wrap="truncate-end">
+            <Text key={`ruling-beyond-${index}`} color="warning" wrap="wrap">
               {`· ${beyondText(entry)}`}
             </Text>
           ))}
