@@ -265,7 +265,7 @@ describe('settling and releasing', () => {
 })
 
 describe('wakes', () => {
-  const other = { order: order('O9', { status: 'dispatched' }), place: { folder: '/dev/work/api', repo: null } }
+  const other = { order: order('O9', { status: 'dispatched' }), place: { folder: '/dev/work/api' } }
   test('an order on the road, unsettled or waiting, and any scout wake; a settled knight wakes only while its place is free', () => {
     for (const status of ['dispatched', 'unsettled', 'waiting'] as const) expect(wakeVerdict(order('O1', { status }), other)).toEqual({ allow: true })
     for (const status of ['done', 'stopped-early', 'failed', 'lost'] as const) {

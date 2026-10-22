@@ -133,7 +133,6 @@ import {
   orderAsk,
   orderLevels,
   relativeFolder,
-  repoCandidates,
   setOrderLevel,
   withLostAgents,
   joinedReport,
@@ -1530,26 +1529,8 @@ async function secondRound($: EngineInterface, council: Council, context: string
 
 // ── Knight overlap ────────────────────────────────────────────────────────
 
-// Each folder's git repository (the nearest folder at or above it holding a
-// .git file or folder), found once per session.
-const repoCache = new Map<string, string | null>()
-
-async function repoOf($: EngineInterface, folder: string): Promise<string | null> {
-  const cached = repoCache.get(folder)
-  if (cached !== undefined) return cached
-  let found: string | null = null
-  for (const candidate of repoCandidates(folder)) {
-    if (await $.fs.exists(joinUnder(candidate, '.git')).catch(() => false)) {
-      found = candidate
-      break
-    }
-  }
-  repoCache.set(folder, found)
-  return found
-}
-
-async function placeOf($: EngineInterface, folder: string): Promise<Place> {
-  return { folder, repo: await repoOf($, folder) }
+async function placeOf(_$: EngineInterface, folder: string): Promise<Place> {
+  return { folder }
 }
 
 // The knights holding a place now (dispatched, unsettled or waiting), each with its place.
@@ -1571,7 +1552,7 @@ async function proposalClash($: EngineInterface, proposal: Proposal, root: strin
     const place = await placeOf($, joinUnder(root, dispatch.folder))
     const clash = knightClash(place, working)
     if (clash !== undefined) {
-      return `Dispatch ${index + 1} (a knight in ${dispatch.folder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, ${claimHolderText(clash.order)}. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then propose again (knights one after another in one repository are fine).`
+      return `Dispatch ${index + 1} (a knight in ${dispatch.folder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, ${claimHolderText(clash.order)}. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then propose again.`
     }
   }
   return undefined

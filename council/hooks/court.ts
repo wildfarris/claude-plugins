@@ -883,9 +883,8 @@ export function setOrderLevel(orders: readonly Order[], id: string, text: string
 
 // ── Overlap: two knights never work in the same place at once ─────────────
 
-// Where a knight works: its folder (absolute) and the git repository holding
-// it (the nearest folder at or above it with a .git), null when none was found.
-export type Place = { folder: string; repo: string | null }
+// Where a knight works: its folder (absolute).
+export type Place = { folder: string }
 
 // One folder at or inside the other (names compared case-insensitively on
 // Windows, the cautious reading); false when either can't be placed.
@@ -904,10 +903,10 @@ function sameFolder(left: string, right: string): boolean {
   return a !== undefined && b !== undefined && (style === 'windows' ? a.toLowerCase() === b.toLowerCase() : a === b)
 }
 
-// Two places overlap when one folder is the other or inside it, or both sit in
-// the same git repository (sidekick's git backstop puts every change in a
-// repo down to one agent, so two knights in one repo can't be told apart).
-export const placesOverlap = (a: Place, b: Place) => isNested(a.folder, b.folder) || (a.repo !== null && b.repo !== null && sameFolder(a.repo, b.repo))
+// Two places overlap when one folder is the other or inside it. Knights in
+// different folders of one git repository do not overlap: sidekick scopes its
+// git backstop to each order's folder.
+export const placesOverlap = (a: Place, b: Place) => isNested(a.folder, b.folder)
 
 // A knight order holds its place (the folder claim) while its agent is on it,
 // ended with todos open, or waits to wake: no other knight works there until
@@ -926,20 +925,11 @@ export function claimHolderText(order: Order): string {
   return `a knight still at work in ${order.relFolder}/`
 }
 
-// Why two places overlap: the same folder, one inside the other, or one repository.
+// Why two places overlap: the same folder, or one inside the other.
 export function clashReason(place: Place, other: Place): string {
-  if (sameFolder(place.folder, other.folder)) return 'the same folder'
-  if (isNested(place.folder, other.folder)) return 'one folder inside the other'
-  return `the same git repository (${other.repo})`
+  return sameFolder(place.folder, other.folder) ? 'the same folder' : 'one folder inside the other'
 }
 
-// The folders that may hold a folder's git repository, nearest first: the
-// folder, then each one above it, never the drive or filesystem root itself.
-export function repoCandidates(folder: string): string[] {
-  const parsed = parseAbsolute(folder)
-  if (parsed === undefined) return []
-  return parsed.segments.map((_, index) => nativePath({ prefix: parsed.prefix, segments: parsed.segments.slice(0, parsed.segments.length - index) }))
-}
 
 // ── The order lifecycle ───────────────────────────────────────────────────
 

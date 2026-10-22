@@ -16,7 +16,6 @@ import {
   orderLevels,
   parseLevels,
   placesOverlap,
-  repoCandidates,
   rulingText,
   setOrderLevel,
   withLostAgents,
@@ -126,17 +125,17 @@ describe('matching a dispatch to its order', () => {
 })
 
 describe('knight overlap', () => {
-  const place = (folder: string, repo: string | null = null) => ({ folder, repo })
-  test('the same folder, one inside the other, or one repository overlap; different repos do not', () => {
+  const place = (folder: string) => ({ folder })
+  test('the same folder, or one inside the other overlap; sibling folders of one repository do not', () => {
     expect(placesOverlap(place('/w/api'), place('/w/api'))).toBe(true)
     expect(placesOverlap(place('/w/api'), place('/w/api/src'))).toBe(true)
     expect(placesOverlap(place('/w/api/src'), place('/w/api'))).toBe(true)
-    expect(placesOverlap(place('/w/repo/a', '/w/repo'), place('/w/repo/b', '/w/repo'))).toBe(true)
-    expect(placesOverlap(place('/w/one', '/w/one'), place('/w/two', '/w/two'))).toBe(false)
+    expect(placesOverlap(place('/w/repo/a'), place('/w/repo/b'))).toBe(false)
+    expect(placesOverlap(place('/w/one'), place('/w/two'))).toBe(false)
     expect(placesOverlap(place('/w/api'), place('/w/apis'))).toBe(false)
-    // No repository found: folders alone decide.
     expect(placesOverlap(place('/w/a'), place('/w/b'))).toBe(false)
-    expect(placesOverlap(place('C:\\w\\Api', 'C:\\w'), place('c:/w/web', 'C:/W'))).toBe(true)
+    expect(placesOverlap(place('C:\\w\\Api'), place('c:/w/api/src'))).toBe(true)
+    expect(placesOverlap(place('C:\\w\\Api'), place('c:/w/web'))).toBe(false)
   })
 
   test('only a knight holding its place clashes (dispatched, unsettled or waiting); scouts, approved and settled orders do not', () => {
@@ -149,11 +148,6 @@ describe('knight overlap', () => {
     for (const status of ['done', 'stopped-early', 'failed', 'lost', 'withdrawn'] as const) expect(knightClash(place('/dev/work/api'), [at(order('O4', { status }))])).toBeUndefined()
   })
 
-  test('a repository is looked for at the folder and each one above it, never at the root', () => {
-    expect(repoCandidates('/dev/work/api')).toEqual(['/dev/work/api', '/dev/work', '/dev'])
-    expect(repoCandidates('C:\\w\\api')).toEqual(['C:\\w\\api', 'C:\\w'])
-    expect(repoCandidates('relative')).toEqual([])
-  })
 })
 
 describe('orders whose agent is gone', () => {

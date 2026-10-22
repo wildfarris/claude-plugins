@@ -82,10 +82,9 @@ const notPerson = (args: string) => ({ command: 'council', args, origin: { kind:
 
 // ── Knight overlap ────────────────────────────────────────────────────────
 
-test('knights in one repository go one after another: the second waits, scouts and other repos do not', async ($, on) => {
+test('knights in different folders of one repository work at once; scouts are never held back', async ($, on) => {
   const harness = standIn(on)
   await start($)
-  // Several knights for one repo in one proposal are fine: they run in turn.
   expect(text(await propose($, 'Two steps in repo1, a look, and repo2.', [
     { folder: 'repo1/a', role: 'knight' },
     { folder: 'repo1/b', role: 'knight' },
@@ -93,15 +92,10 @@ test('knights in one repository go one after another: the second waits, scouts a
     { folder: 'repo2', role: 'knight' },
   ]))).toContain('The council approved the plan')
   expect((await spawn($, 'council:knight', 'O1 repo1 a')).agentId).toBe('agent-1')
-  const refused = await spawn($, 'council:knight', 'O2 repo1 b')
-  expect(refused.deny).toContain('the same git repository')
-  expect(refused.deny).toContain('wait for O1 to finish')
-  // Scouts are never held back; another repository is another place.
+  // A sibling folder in the same repository is another place.
+  expect((await spawn($, 'council:knight', 'O2 repo1 b')).agentId).toBeDefined()
   expect((await spawn($, 'council:scout', 'O3 repo1 b')).agentId).toBeDefined()
   expect((await spawn($, 'council:knight', 'O4 repo2')).agentId).toBeDefined()
-  // Once O1 is back, O2 may go.
-  await finishAll($, 'agent-1', 'Done in a.')
-  expect((await spawn($, 'council:knight', 'O2 repo1 b')).agentId).toBeDefined()
   expect(harness.spawned.filter(entry => entry.subagentType === 'council:knight').length).toBe(3)
 })
 
@@ -126,12 +120,12 @@ test('a proposal whose knight would clash with one at work is refused before the
   await propose($, 'Limits.', [{ folder: 'repo1/a', role: 'knight' }])
   await spawn($, 'council:knight', 'O1 repo1')
   const calls = harness.completions.length
-  const refused = text(await propose($, 'More in repo1.', [{ folder: 'repo1/b', role: 'knight' }, { folder: 'web', role: 'scout' }]))
-  expect(refused).toContain('Dispatch 1 (a knight in repo1/b/) would work in the same git repository')
+  const refused = text(await propose($, 'More in repo1.', [{ folder: 'repo1/a', role: 'knight' }, { folder: 'web', role: 'scout' }]))
+  expect(refused).toContain('Dispatch 1 (a knight in repo1/a/) would work in the same folder')
   expect(refused).toContain('wait for O1 to finish')
   expect(harness.completions.length).toBe(calls)
-  // A scout there, or a knight elsewhere, is put to the council.
-  expect(text(await propose($, 'Look in repo1.', [{ folder: 'repo1/b', role: 'scout' }, { folder: 'repo2', role: 'knight' }]))).toContain('The council approved the plan')
+  // A scout there, or a knight in a sibling folder, is put to the council.
+  expect(text(await propose($, 'Look in repo1.', [{ folder: 'repo1/a', role: 'scout' }, { folder: 'repo1/b', role: 'knight' }]))).toContain('The council approved the plan')
 })
 
 // ── Releasing orders whose agent is gone ──────────────────────────────────
