@@ -129,6 +129,9 @@ export type Roster = {
 export type OrderRole = 'scout' | 'knight'
 
 // The order lifecycle (court.ts ORDER_LIFECYCLE holds every transition):
+// 'held': approved on the first round while the council's summoned advisor
+// checks a fact (CourtSummons); not dispatchable, holding no place, until the
+// second round releases it ('approved') or refuses it ('withdrawn');
 // 'approved': waiting for Claude to dispatch it; 'dispatched': an agent is on
 // it; 'unsettled': its agent ended a turn with todos open, so the main session
 // judges how it ended (settle_order); 'waiting': settled as waiting for a wake
@@ -139,7 +142,7 @@ export type OrderRole = 'scout' | 'knight'
 // recalled it (`recall`), and its agent's turn has ended (or it was not
 // running). A knight order holds its place (the folder claim) while
 // dispatched, unsettled or waiting.
-export type OrderStatus = 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn' | 'recalled'
+export type OrderStatus = 'held' | 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn' | 'recalled'
 
 // A message the person sent an order's agent (/council message).
 export type OrderMessage = { text: string; at: number; isDelivered: boolean; reason?: string }
@@ -285,6 +288,37 @@ export type AdvisorRun = {
   isFolded?: boolean
 }
 
+// A plan the council held for its summoned advisor: the dispatches as
+// proposed (court.ts Proposal).
+export type SummonsProposal = {
+  plan: string
+  dispatches: Array<{ folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[] }>
+}
+
+// A summons in progress, kept in the court so a reload never loses it: the
+// held orders, the plan, the first round (its council and each member's raw
+// answer, for the LEVEL lines), the questions and the deadline. 'checking':
+// the advisor (run `runId`) is out; 'ruling': the second round is sitting.
+// Removed once the held orders are released or refused.
+export type CourtSummons = {
+  runId: string
+  phase: 'checking' | 'ruling'
+  orderIds: string[]
+  proposal: SummonsProposal
+  root: string
+  // The person's petition the plan answered (court mode), for the arbiter.
+  petition: string | null
+  council: Council
+  replies: Record<AdvisorId, string>
+  questions: AdvisorQuestion[]
+  startedAt: number
+  // When the council stops waiting and rules on its first round (ms).
+  deadline: number
+  // How the advisor ended, saved as the second round starts, so a round a
+  // reload dropped starts again without the run. Absent while checking.
+  outcome?: { status: AdvisorRunStatus; findings: string }
+}
+
 // What a ruling's summons asked and found.
 export type RulingSummons = { advisorId: string; questions: AdvisorQuestion[]; status: AdvisorRunStatus; findings: string }
 
@@ -317,6 +351,8 @@ export type Court = {
   isInSession: boolean
   // A prompt held for the council, while it sits.
   heldPrompt: string | null
+  // Summonses whose held orders wait for the second round. Absent when none.
+  summonses?: CourtSummons[]
   // Lines for the main session (an order left unsettled) that could not be
   // appended to its conversation: they go beside the person's next prompt.
   // Absent when there are none.

@@ -83,12 +83,21 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
   const { Box, Text } = el
   const { done, total } = progressOf(order)
   const calls = callsLabel(order.steps)
-  const isWaiting = order.status === 'approved'
-  const now = isWaiting ? 'approved · waiting to be dispatched' : order.recall ? 'recalled · winding down' : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
+  // Held: approved on the first round, waiting for the advisor's check and the second.
+  const isHeld = order.status === 'held'
+  const isWaiting = order.status === 'approved' || isHeld
+  const now = isHeld
+    ? 'held: advisor checking'
+    : order.status === 'approved'
+      ? 'approved · waiting to be dispatched'
+      : order.recall
+        ? 'recalled · winding down'
+        : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
   return (
     <Box key={`order-${order.id}`} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
         <Box flexDirection="row" gap={1} flexShrink={1}>
+          {isHeld && <Text key={`order-held-${order.id}`} color="warning">◌</Text>}
           <Text bold wrap="truncate-end">{`${ROLE_GLYPH[order.role]} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`}</Text>
           <Text dimColor>{order.id}</Text>
           <Text key={`order-level-${order.id}`} dimColor>{levelLabel(order)}</Text>

@@ -3,13 +3,20 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { Order } from '../types'
+import type { AdvisorRun, CourtSummons, Order } from '../types'
+import { summonsDue, withUnstartedAdvisors } from '../hooks/advisors'
 import {
+  ORDER_EXPIRY_MS,
   ORDER_LIFECYCLE,
   RELEASED_NOTE,
+  heldRefusal,
+  heldText,
   holdsClaim,
   isFinished,
+  matchOrder,
   moved,
+  summonsRuledLine,
+  withExpired,
   nextStatus,
   readSettlement,
   releaseOrder,
@@ -42,12 +49,16 @@ const order = (id: string, patch: Partial<Order> = {}): Order => ({
   ...patch,
 })
 
-const STATUSES: Order['status'][] = ['approved', 'dispatched', 'unsettled', 'waiting', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn', 'recalled']
-const EVENTS: OrderEvent[] = ['spawn', 'withdraw', 'expire', 'turn-done', 'turn-open', 'turn-failed', 'gone', 'settle-done', 'settle-stopped-early', 'settle-failed', 'settle-waiting', 'wake', 'release', 'recall']
+const STATUSES: Order['status'][] = ['held', 'approved', 'dispatched', 'unsettled', 'waiting', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn', 'recalled']
+const EVENTS: OrderEvent[] = ['spawn', 'withdraw', 'expire', 'turn-done', 'turn-open', 'turn-failed', 'gone', 'settle-done', 'settle-stopped-early', 'settle-failed', 'settle-waiting', 'wake', 'release', 'recall', 'approve', 'refuse']
 
 // The whole table, written out: every transition the lifecycle allows. Any
 // (status, event) pair not here must be refused.
 const ALLOWED: ReadonlyArray<[Order['status'], OrderEvent, Order['status']]> = [
+  ['held', 'approve', 'approved'],
+  ['held', 'refuse', 'withdrawn'],
+  ['held', 'withdraw', 'withdrawn'],
+  ['held', 'expire', 'withdrawn'],
   ['approved', 'spawn', 'dispatched'],
   ['approved', 'withdraw', 'withdrawn'],
   ['approved', 'expire', 'withdrawn'],
@@ -118,6 +129,91 @@ describe('the order lifecycle table', () => {
     expect(STATUSES.filter(status => holdsClaim({ role: 'knight', status }))).toEqual(['dispatched', 'unsettled', 'waiting'])
     expect(STATUSES.filter(status => holdsClaim({ role: 'scout', status }))).toEqual([])
     expect(STATUSES.filter(status => isFinished({ status }))).toEqual(['done', 'stopped-early', 'failed', 'lost', 'withdrawn', 'recalled'])
+  })
+})
+
+describe('held orders', () => {
+  test('a held order holds no place, is not finished, and is not open to a dispatch', () => {
+    expect(holdsClaim({ role: 'knight', status: 'held' })).toBe(false)
+    expect(isFinished({ status: 'held' })).toBe(false)
+    expect(matchOrder([order('O4', { status: 'held' })], 'council:knight', 'O4 api', '')).toBeUndefined()
+  })
+
+  test('released by the second round it carries its conditions, level and a fresh approval time; refused, it is withdrawn', () => {
+    const held = order('O4', { status: 'held', approvedAt: 1, level: 1 })
+    expect(moved(held, 'approve', 50, { conditions: ['The Castellan: keep keys out.'], level: 3, approvedAt: 50 })).toMatchObject({ status: 'approved', conditions: ['The Castellan: keep keys out.'], level: 3, approvedAt: 50, endedAt: null })
+    expect(moved(held, 'refuse', 50, { withdrawnReason: 'refused' })).toMatchObject({ status: 'withdrawn', withdrawnReason: 'refused', endedAt: 50 })
+  })
+
+  test('a dispatch naming a held order is refused with why; one naming an open order is not', () => {
+    const orders = [order('O4', { status: 'held' }), order('O5', { status: 'held', role: 'scout' }), order('O6', { status: 'approved', role: 'scout' })]
+    expect(heldRefusal(orders, 'council:knight', 'O4 api', '')).toBe("O4 is held while the council's advisor checks a fact. You will be told when the council rules; dispatch then.")
+    // No id named: the role's held orders, unless one of that role is open.
+    expect(heldRefusal(orders, 'council:knight', 'api work', '')).toContain('O4 is held')
+    expect(heldRefusal(orders, 'council:scout', 'look around', '')).toBeUndefined()
+    expect(heldRefusal(orders, 'council:scout', 'O6 look', '')).toBeUndefined()
+    expect(heldRefusal(orders, 'general-purpose', 'O4', '')).toBeUndefined()
+  })
+
+  test('a held order expires like an approved one', () => {
+    const [expired] = withExpired([order('O4', { status: 'held', approvedAt: 0 })], ORDER_EXPIRY_MS + 1)
+    expect(expired).toMatchObject({ status: 'withdrawn', withdrawnReason: 'expired' })
+  })
+
+  test('propose_orders names the held orders and the questions; the line for the main session says how the council ruled', () => {
+    const held = [order('O4', { status: 'held' }), order('O5', { status: 'held', role: 'scout', relFolder: 'web' })]
+    const questions = [{ question: 'Is a key committed?', askedBy: ['The Castellan'] }]
+    expect(heldText(held, 'A1', questions, 8 * 60 * 1000)).toBe(
+      [
+        'The council holds O4, O5 while its advisor (A1, read-only) checks:',
+        '1. Is a key committed? (asked by The Castellan)',
+        "It rules again when the advisor reports (within 8 minutes), and you will be told. Held orders can't be dispatched yet: carry on with other work, or end your turn.",
+      ].join('\n'),
+    )
+    const released = held.map(entry => ({ ...entry, status: 'approved' as const }))
+    const summons = { advisorId: 'A1', questions, status: 'done' as const, findings: 'No key in api/.' }
+    expect(summonsRuledLine({ plan: 'p', isApproved: true, gravest: 3, reason: '', conditions: ['The Seneschal: split it.'], summons }, released, ['O4 must wait: O2 holds the same folder.'])).toBe(
+      [
+        'Council: the advisor (A1) reported; O4, O5 approved (gravest concern 3/5).',
+        'Conditions: The Seneschal: split it.',
+        'Findings: No key in api/.',
+        'Dispatch them as before, the order id in each description: O4 (council:knight, api/), O5 (council:scout, web/).',
+        'O4 must wait: O2 holds the same folder.',
+      ].join('\n'),
+    )
+    expect(summonsRuledLine({ plan: 'p', isApproved: false, gravest: 5, reason: 'The Castellan: a key is committed.', conditions: [], summons }, held)).toBe(
+      'Council: the advisor (A1) reported; it refused O4, O5 (gravest concern 5/5). The Castellan: a key is committed. Revise the plan and propose again, or ask the person.',
+    )
+    expect(summonsRuledLine({ plan: 'p', isApproved: true, gravest: 4, reason: '', conditions: [], summons: { ...summons, status: 'timed-out', findings: '' } }, released)).toContain(
+      'Council: the advisor (A1) did not report in time, so the council ruled on its first round; O4, O5 approved',
+    )
+  })
+})
+
+describe('summonses', () => {
+  const summons = (runId: string, patch: Partial<CourtSummons> = {}) => ({ runId, phase: 'checking', deadline: 100, ...patch }) as CourtSummons
+  const run = (id: string, status: AdvisorRun['status'], patch: Partial<AdvisorRun> = {}) =>
+    ({ id, origin: 'council', relFolders: ['api'], questions: [], isDeep: false, model: 'opus', effort: 'low', status, agentId: 'agent-1', report: '', startedAt: 0, endedAt: null, ...patch }) as AdvisorRun
+
+  test('a summons is due once its advisor is back or failed, its deadline passed, or its round was dropped by a reload', () => {
+    const summonses = [summons('A1'), summons('A2'), summons('A3'), summons('A4', { phase: 'ruling' }), summons('A5')]
+    const runs = [run('A1', 'running'), run('A2', 'done'), run('A3', 'failed'), run('A4', 'done'), run('A5', 'running')]
+    expect(summonsDue(summonses, runs, 50, new Set())).toEqual(['A2', 'A3', 'A4'])
+    expect(summonsDue(summonses, runs, 100, new Set())).toEqual(['A1', 'A2', 'A3', 'A4', 'A5'])
+    // One this module is already ruling on is not started twice.
+    expect(summonsDue(summonses, runs, 50, new Set(['A2', 'A4']))).toEqual(['A3'])
+    // A run cleared away counts as back.
+    expect(summonsDue([summons('A9')], [], 50, new Set())).toEqual(['A9'])
+  })
+
+  test('a run whose start was lost (no agent, no spawn under way, over a minute old) fails', () => {
+    const runs = [run('A1', 'running', { agentId: null }), run('A2', 'running', { agentId: null }), run('A3', 'running', { agentId: null, startedAt: 90_000 }), run('A4', 'running')]
+    const next = withUnstartedAdvisors(runs, new Set(['A2']), 100_000)
+    expect(next.map(entry => entry.status)).toEqual(['failed', 'running', 'running', 'running'])
+    expect(next[0]!.report).toContain('its start was lost')
+    // Nothing to fail: the same array.
+    const unchanged = runs.slice(1)
+    expect(withUnstartedAdvisors(unchanged, new Set(['A2']), 100_000)).toBe(unchanged)
   })
 })
 

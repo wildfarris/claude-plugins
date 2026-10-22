@@ -4,13 +4,28 @@
 // members ask CHECK questions. Nothing else may start one: register.tsx denies
 // any council:advisor spawn the plugin did not make itself. Pure.
 
-import type { AdvisorQuestion, AdvisorRun, AdvisorRunStatus, Court } from '../types'
+import type { AdvisorQuestion, AdvisorRun, AdvisorRunStatus, Court, CourtSummons } from '../types'
 import { isPathInside, joinUnder } from './paths'
 
 export const ADVISOR_TYPE = 'council:advisor'
 
-// How long a ruling waits for its summoned advisor before ruling on round 1.
+// How long held orders wait for the summoned advisor before the council
+// rules on its first round.
 export const SUMMONS_TIMEOUT_MS = 8 * 60 * 1000
+
+// The summonses whose second round should start now (their run ids): the
+// advisor is back, failed, or past its deadline; or the round was sitting when
+// a reload dropped it. `busy`: the ones this module is already ruling on.
+export function summonsDue(summonses: readonly CourtSummons[], runs: readonly AdvisorRun[], now: number, busy: ReadonlySet<string>): string[] {
+  return summonses
+    .filter(summons => {
+      if (busy.has(summons.runId)) return false
+      if (summons.phase === 'ruling') return true
+      const run = runs.find(candidate => candidate.id === summons.runId)
+      return run === undefined || isAdvisorFinished(run) || now >= summons.deadline
+    })
+    .map(summons => summons.runId)
+}
 
 export const MAX_CHECK = 300
 export const MAX_ADVISOR_REPORT = 6000
@@ -90,6 +105,9 @@ export const nextAdvisorNumber = (court: Pick<Court, 'advisors' | 'nextAdvisorId
 
 export const isAdvisorFinished = (run: Pick<AdvisorRun, 'status'>) => run.status !== 'running'
 
+// A finished run "clear finished" may drop: not one a summons still rules on.
+export const isClearable = (run: AdvisorRun, court: Pick<Court, 'summonses'>) => isAdvisorFinished(run) && !(court.summonses ?? []).some(summons => summons.runId === run.id)
+
 // The run with `change` applied to the one with `id`.
 export const withAdvisorChanged = (court: Court, id: string, change: (run: AdvisorRun) => AdvisorRun): Court => ({
   ...court,
@@ -108,6 +126,22 @@ export function withStaleAdvisors(runs: readonly AdvisorRun[], live: ReadonlySet
     if (run.status !== 'running' || run.agentId === null || live.has(run.agentId)) return run
     isChanged = true
     return finishedRun(run, 'failed', 'agent ended without reporting', now)
+  })
+  return isChanged ? next : runs
+}
+
+// How long a run may wait for its agent id before its start counts as lost.
+export const ADVISOR_START_GRACE_MS = 60 * 1000
+
+// A running advisor that never got an agent, whose spawn is not under way in
+// this module (`spawning`: run ids) and began over a minute ago, fails: its
+// start was lost with the module that made it. The same array when nothing changes.
+export function withUnstartedAdvisors(runs: readonly AdvisorRun[], spawning: ReadonlySet<string>, now: number): readonly AdvisorRun[] {
+  let isChanged = false
+  const next = runs.map(run => {
+    if (run.status !== 'running' || run.agentId !== null || spawning.has(run.id) || now - run.startedAt < ADVISOR_START_GRACE_MS) return run
+    isChanged = true
+    return finishedRun(run, 'failed', 'its start was lost (the plugin reloaded)', now)
   })
   return isChanged ? next : runs
 }
