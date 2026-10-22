@@ -42,8 +42,8 @@ const order = (id: string, patch: Partial<Order> = {}): Order => ({
   ...patch,
 })
 
-const STATUSES: Order['status'][] = ['approved', 'dispatched', 'unsettled', 'waiting', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn']
-const EVENTS: OrderEvent[] = ['spawn', 'withdraw', 'expire', 'turn-done', 'turn-open', 'turn-failed', 'gone', 'settle-done', 'settle-stopped-early', 'settle-failed', 'settle-waiting', 'wake', 'release']
+const STATUSES: Order['status'][] = ['approved', 'dispatched', 'unsettled', 'waiting', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn', 'recalled']
+const EVENTS: OrderEvent[] = ['spawn', 'withdraw', 'expire', 'turn-done', 'turn-open', 'turn-failed', 'gone', 'settle-done', 'settle-stopped-early', 'settle-failed', 'settle-waiting', 'wake', 'release', 'recall']
 
 // The whole table, written out: every transition the lifecycle allows. Any
 // (status, event) pair not here must be refused.
@@ -55,6 +55,7 @@ const ALLOWED: ReadonlyArray<[Order['status'], OrderEvent, Order['status']]> = [
   ['dispatched', 'turn-open', 'unsettled'],
   ['dispatched', 'turn-failed', 'failed'],
   ['dispatched', 'gone', 'lost'],
+  ['dispatched', 'recall', 'recalled'],
   ['unsettled', 'settle-done', 'done'],
   ['unsettled', 'settle-stopped-early', 'stopped-early'],
   ['unsettled', 'settle-failed', 'failed'],
@@ -62,12 +63,14 @@ const ALLOWED: ReadonlyArray<[Order['status'], OrderEvent, Order['status']]> = [
   ['unsettled', 'wake', 'dispatched'],
   ['unsettled', 'gone', 'lost'],
   ['unsettled', 'release', 'lost'],
+  ['unsettled', 'recall', 'recalled'],
   ['waiting', 'wake', 'dispatched'],
   ['waiting', 'settle-done', 'done'],
   ['waiting', 'settle-stopped-early', 'stopped-early'],
   ['waiting', 'settle-failed', 'failed'],
   ['waiting', 'gone', 'lost'],
   ['waiting', 'release', 'lost'],
+  ['waiting', 'recall', 'recalled'],
   ['done', 'wake', 'dispatched'],
   ['stopped-early', 'wake', 'dispatched'],
   ['failed', 'wake', 'dispatched'],
@@ -101,10 +104,20 @@ describe('the order lifecycle table', () => {
     expect(moved(moved(woken, 'turn-done', 9)!, 'wake', 10)).toMatchObject({ wakes: 2 })
   })
 
+  test('a recall ends the order: a stamp, no way out, and its place freed', () => {
+    const recall = { reason: 'wrong repo', at: 3, by: 'claude' as const, steps: 0 }
+    const recalled = moved(order('O1', { status: 'dispatched', agentId: 'a', recall }), 'recall', 9, { report: 'Stopped.' })!
+    expect(recalled).toMatchObject({ status: 'recalled', endedAt: 9, report: 'Stopped.', recall })
+    expect(holdsClaim(recalled)).toBe(false)
+    expect(EVENTS.map(event => nextStatus('recalled', event))).toEqual(EVENTS.map(() => undefined))
+    expect(wakeVerdict(recalled, undefined)).toEqual({ deny: 'O1 was recalled: the wake is refused.' })
+    expect(wakeVerdict({ ...recalled, role: 'scout' }, undefined)).toHaveProperty('deny')
+  })
+
   test('the place is held while dispatched, unsettled or waiting, by knights only; settled and lost orders are finished', () => {
     expect(STATUSES.filter(status => holdsClaim({ role: 'knight', status }))).toEqual(['dispatched', 'unsettled', 'waiting'])
     expect(STATUSES.filter(status => holdsClaim({ role: 'scout', status }))).toEqual([])
-    expect(STATUSES.filter(status => isFinished({ status }))).toEqual(['done', 'stopped-early', 'failed', 'lost', 'withdrawn'])
+    expect(STATUSES.filter(status => isFinished({ status }))).toEqual(['done', 'stopped-early', 'failed', 'lost', 'withdrawn', 'recalled'])
   })
 })
 

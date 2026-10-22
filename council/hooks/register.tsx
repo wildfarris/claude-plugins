@@ -140,6 +140,38 @@ import {
   type Proposal,
   type RulingResult,
 } from './court'
+import {
+  AMEND_ORDER_DESCRIPTION,
+  AMEND_ORDER_SCHEMA,
+  RECALL_ALLOWED_TOOLS,
+  RECALL_ORDER_DESCRIPTION,
+  RECALL_ORDER_SCHEMA,
+  amendRefusal,
+  amendmentBrief,
+  amendmentResultText,
+  amendmentText,
+  blockedSendReason,
+  isUnderWay,
+  messageRefusal,
+  orderForRecipient,
+  pendingAmendment,
+  personMessageText,
+  readAmendment,
+  readRecall,
+  recallDenial,
+  recallNotice,
+  recallOrder,
+  recallReply,
+  recallStep,
+  recallText,
+  recalledLine,
+  recalledReport,
+  withAmendmentRuled,
+  withMessage,
+  withTouched,
+  withoutAmendment,
+  type RecallRequest,
+} from './control'
 import { NO_HOME, homeFromEnvironment, joinUnder } from './paths'
 import { carryCalls, creditCall, sitesOf } from './tally'
 import { courtView } from './views/court'
@@ -1367,6 +1399,14 @@ async function finishOrder($: EngineInterface, agentId: string, answer: string, 
     await updateOrder($, candidate => candidate.id === order.id, current => ({ ...current, report }))
     return
   }
+  // A recalled agent's turn end recalls its order, whatever its todos.
+  if (order.recall !== undefined) {
+    const recalled = await moveOrder($, order.id, 'recall', { report: recalledReport(order, report) })
+    if (recalled === undefined) return
+    $.ui.toast(`${order.id}: the ${order.role} is recalled from ${order.relFolder}/.`)
+    await tellMain($, recalledLine(recalled))
+    return
+  }
   const finished = await moveOrder($, order.id, turnEvent(order, reason), { report })
   if (finished === undefined) return
   $.ui.toast(`${order.id}: the ${order.role} (L${levelOf(order)}) ${ENDINGS[finished.status] ?? 'is back from'} ${order.relFolder}/.`)
@@ -1411,6 +1451,14 @@ async function wakeOrder($: EngineInterface, agentId: string): Promise<{ deny: s
   if (found === undefined) return undefined
   if (found.effort !== undefined) stepEfforts.set(agentId, found.effort)
   if (found.status === 'dispatched') return undefined
+  // A recalled order never goes back on the road.
+  if (found.status === 'recalled') {
+    const verdict = wakeVerdict(found, undefined)
+    if ('deny' in verdict) {
+      $.ui.toast(`Council: ${verdict.deny} Its agent stays parked.`)
+      return verdict
+    }
+  }
   const needsClaim = found.role === 'knight' && !holdsClaim(found)
   if (!needsClaim) {
     await moveOrder($, found.id, 'wake')
@@ -1460,6 +1508,144 @@ async function releaseCommand($: EngineInterface, id: string): Promise<string> {
     return 'error' in again ? current : { ...current, orders: again.orders }
   })
   return outcome.message
+}
+
+// ── Steering orders under way: messages, amendments, recalls ──────────────
+
+// The order whose agent a model's SendMessage names: by agent id, the name the
+// dispatch gave it, or its order id; else, through the engine's agent list, a
+// teammate address (`name@team`) or its name alone.
+async function orderAddressed($: EngineInterface, to: string): Promise<Order | undefined> {
+  const orders = (await read($, courtAtom)).orders.filter(order => order.agentId !== null)
+  if (orders.length === 0) return undefined
+  const direct = orderForRecipient(orders, to)
+  if (direct !== undefined) return direct
+  const agents = await $.agent.list().catch(() => [])
+  const wanted = to.trim().toLowerCase()
+  const agent = agents.find(entry => entry.teammateId !== undefined && (entry.teammateId.toLowerCase() === wanted || entry.teammateId.toLowerCase().split('@')[0] === wanted))
+  return agent === undefined ? undefined : orders.find(order => order.agentId === agent.id)
+}
+
+// `/council message <order> <text>`: the person's own word to an order's agent,
+// sent by the plugin (a wake follows the wake rules), recorded on the order.
+async function messageCommand($: EngineInterface, id: string, text: string): Promise<string> {
+  await expireOrders($)
+  const order = (await read($, courtAtom)).orders.find(candidate => candidate.id === id.trim().toUpperCase())
+  const refusal = messageRefusal(order, id, text)
+  if (refusal !== undefined || order === undefined || order.agentId === null) return refusal ?? `No order ${id}.`
+  const sent = await $.session.send({ to: { agentId: order.agentId }, text: personMessageText(order, text) }).catch((error: unknown) => ({ isDelivered: false as const, reason: error instanceof Error ? error.message : String(error) }))
+  const now = await $.clock.now()
+  await updateOrder($, candidate => candidate.id === order.id, current => withMessage(current, text, now, sent))
+  return sent.isDelivered ? `Sent to ${order.id}'s agent (${order.role} in ${order.relFolder}/).` : `Could not reach ${order.id}'s agent: ${sent.reason}`
+}
+
+// The amend_order tool: refusals in code first (no model call); otherwise the
+// seated council rules on it as on a plan (no summons, no levels, no arbiter),
+// and an approved amendment is sent to the agent. The pending entry holds the
+// slot while the council sits, so it counts toward the cap at once.
+async function amendOrderTool($: EngineInterface, input: Record<string, unknown>): Promise<string> {
+  const amendment = readAmendment(input)
+  if ('error' in amendment) return amendment.error
+  await expireOrders($)
+  const at = await $.clock.now()
+  let refusal = undefined as string | undefined
+  let order = undefined as Order | undefined
+  let index = -1
+  await update($, courtAtom, current => {
+    const found = current.orders.find(candidate => candidate.id === amendment.id)
+    refusal = amendRefusal(found, amendment, settings.amendmentsPerOrder)
+    if (refusal !== undefined || found === undefined) return current
+    index = (found.amendments ?? []).length
+    order = { ...found, amendments: [...(found.amendments ?? []), pendingAmendment(amendment, at)] }
+    return { ...current, orders: current.orders.map(candidate => (candidate.id === found.id ? order! : candidate)) }
+  })
+  if (refusal !== undefined || order === undefined) return refusal ?? `No order ${amendment.id}.`
+  const asked = order
+  const changeOne = (change: (current: Order) => Order) => updateOrder($, candidate => candidate.id === asked.id, change)
+  let council: Council | undefined
+  try {
+    council = await conveneAndWait($, `Amendment to ${asked.id}: ${amendment.change}`, async () => ({ brief: amendmentBrief(asked, amendment, lastPetition) }), { source: 'claude' })
+  } catch {
+    council = undefined
+  }
+  if (council === undefined) {
+    await changeOne(current => withoutAmendment(current, index))
+    return 'The council could not sit on the amendment (no one is seated, or another council replaced it); it does not count. Try again, or ask the person.'
+  }
+  const result = ruling(council, `Amend ${asked.id}: ${amendment.change}`)
+  const now = await $.clock.now()
+  const current = (await read($, courtAtom)).orders.find(candidate => candidate.id === asked.id) ?? asked
+  // Sent only while the order is still under way and not recalled meanwhile.
+  const canSend = result.isApproved && current.agentId !== null && isUnderWay(current) && current.recall === undefined
+  const delivery = canSend
+    ? await $.session
+        .send({ to: { agentId: current.agentId! }, text: amendmentText(current, amendment, result.conditions) })
+        .catch((error: unknown) => ({ isDelivered: false as const, reason: error instanceof Error ? error.message : String(error) }))
+    : undefined
+  await update($, courtAtom, court => ({
+    ...court,
+    orders: court.orders.map(candidate =>
+      candidate.id === asked.id
+        ? withAmendmentRuled(candidate, index, {
+            status: result.isApproved ? 'approved' : 'refused',
+            gravest: result.gravest,
+            ...(result.isApproved ? { conditions: result.conditions, isDelivered: delivery?.isDelivered === true } : { refusal: result.reason }),
+            at: now,
+          })
+        : candidate,
+    ),
+    rulings: [...court.rulings.slice(-9), { plan: result.plan, isApproved: result.isApproved, gravest: result.gravest, reason: result.reason }],
+  }))
+  const ruled = (await read($, courtAtom)).orders.find(candidate => candidate.id === asked.id) ?? current
+  return amendmentResultText(ruled, result, delivery, settings.amendmentsPerOrder)
+}
+
+// A recall, by Claude's tool or the person's command: no ruling. A running
+// agent is told in its own conversation (its changing calls are refused from
+// now on); an unsettled or waiting order is recalled at once.
+async function recallOrderAction($: EngineInterface, request: RecallRequest, by: 'claude' | 'person'): Promise<string> {
+  await expireOrders($)
+  const now = await $.clock.now()
+  let outcome = { error: `No order ${request.id}.` } as ReturnType<typeof recallOrder>
+  await update($, courtAtom, current => {
+    outcome = recallOrder(current.orders, request, by, now)
+    return 'error' in outcome ? current : { ...current, orders: outcome.orders }
+  })
+  if ('error' in outcome) return outcome.error
+  const { order } = outcome
+  if (order.status === 'recalled') {
+    $.ui.toast(`${order.id}: recalled from ${order.relFolder}/.`)
+    // Claude hears of a recall the person made; its own tool's answer says it.
+    if (by === 'person') await tellMain($, recalledLine(order))
+  } else if (order.agentId !== null) {
+    await $.session.append({ agentId: order.agentId, message: { type: 'user', content: [{ type: 'text', text: recallNotice(order) }] } }).catch(() => undefined)
+  }
+  return recallText(order)
+}
+
+// A council agent's model request after its order was recalled: counted, and
+// once it has had RECALL_STEPS, answered with the council's final reply (the
+// text), which ends its turn between steps. Undefined: let it through.
+async function recallCeiling($: EngineInterface, agentId: string): Promise<string | undefined> {
+  const found = (await read($, courtAtom)).orders.find(order => order.agentId === agentId && order.status === 'dispatched' && order.recall !== undefined)
+  if (found === undefined) return undefined
+  let reply = undefined as string | undefined
+  await updateOrder(
+    $,
+    order => order.id === found.id,
+    order => {
+      if (order.recall === undefined) return order
+      const step = recallStep(order)
+      reply = step.isAnswered ? recallReply(step.order) : undefined
+      return step.order
+    },
+  )
+  return reply
+}
+
+// The recalled order a council agent's tool call belongs to, if any.
+async function recalledOrderOf($: EngineInterface, agentId: string): Promise<Order | undefined> {
+  return (await read($, courtAtom)).orders.find(order => order.agentId === agentId && order.status === 'dispatched' && order.recall !== undefined)
 }
 
 async function setCourtSession($: EngineInterface, isInSession: boolean): Promise<void> {
@@ -1646,6 +1832,14 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   if (action === 'advise') return isPersonOrigin(origin) ? adviseCommand($, trimmed.replace(/^advise\b/, '')) : "Only the person can send the council's advisor: type /council advise at the prompt."
   if (action === 'level' && /^O\d+$/i.test(target) && words.length === 1) return isPersonOrigin(origin) ? levelCommand($, target, words[0]!) : "Only the person can change an order's level: type /council level at the prompt."
   if (action === 'release' && (target === '' || /^O\d+$/i.test(target)) && words.length === 0) return isPersonOrigin(origin) ? releaseCommand($, target) : 'Only the person can release an order: type /council release at the prompt.'
+  if (action === 'message' && /^O\d+$/i.test(target)) {
+    return isPersonOrigin(origin) ? messageCommand($, target, trimmed.replace(/^message\s+\S+\s*/, '')) : "Only the person can message an order's agent: type /council message at the prompt."
+  }
+  if (action === 'recall' && /^O\d+$/i.test(target)) {
+    if (!isPersonOrigin(origin)) return 'Only the person can recall an order this way: type /council recall at the prompt.'
+    const reason = trimmed.replace(/^recall\s+\S+\s*/, '').replace(/\s+/g, ' ').slice(0, 200) || 'recalled by the person'
+    return recallOrderAction($, { id: target.toUpperCase(), reason }, 'person')
+  }
   if (action === 'show' && isAlone) {
     if ((await read($, councilAtom)) === null) return 'The council has not convened. /council <topic> to summon it.'
     await openCouncilPane($)
@@ -1680,7 +1874,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|release <order>|report|members|lessons|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|release <order>|message <order> <text>|recall <order> <reason>|report|members|lessons|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)
@@ -1692,6 +1886,8 @@ export const register: Register = (on, options) => {
     })
     await $.tool.register({ name: 'withdraw_orders', description: WITHDRAW_ORDERS_DESCRIPTION, inputSchema: WITHDRAW_ORDERS_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'settle_order', description: SETTLE_ORDER_DESCRIPTION, inputSchema: SETTLE_ORDER_SCHEMA, isDeferred: false })
+    await $.tool.register({ name: 'amend_order', description: AMEND_ORDER_DESCRIPTION, inputSchema: AMEND_ORDER_SCHEMA, isDeferred: false })
+    await $.tool.register({ name: 'recall_order', description: RECALL_ORDER_DESCRIPTION, inputSchema: RECALL_ORDER_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'progress', description: PROGRESS_DESCRIPTION, inputSchema: PROGRESS_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'consult', description: CONSULT_DESCRIPTION, inputSchema: CONSULT_SCHEMA, isDeferred: false })
     return result
@@ -1712,6 +1908,8 @@ export const register: Register = (on, options) => {
   on('tool.check', { tool: 'mcp__council__withdraw_orders' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__settle_order' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__consult' }, () => ({ decision: 'allow' as const }))
+  on('tool.check', { tool: 'mcp__council__amend_order' }, () => ({ decision: 'allow' as const }))
+  on('tool.check', { tool: 'mcp__council__recall_order' }, () => ({ decision: 'allow' as const }))
 
   // Convening the council is the main session's call: a subagent can't put
   // questions or plans to it (only the person and Claude can).
@@ -1735,6 +1933,25 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__council__settle_order' }, async ($, e) =>
     e.agentId !== undefined ? { deny: 'Only the main session settles orders; report to Claude instead.' } : { result: await settleOrderTool($, e as unknown as Record<string, unknown>) },
   ).catch(() => ({ deny: 'The council could not settle the order; try again.' }))
+
+  // Amending and recalling are the main session's calls.
+  on('tool.call', { tool: 'mcp__council__amend_order' }, async ($, e) =>
+    e.agentId !== undefined ? { deny: 'Only the main session amends orders; report to Claude instead.' } : { result: await amendOrderTool($, e as unknown as Record<string, unknown>) },
+  ).catch(() => ({ deny: 'The council could not rule on the amendment; try again, or ask the person.' }))
+  on('tool.call', { tool: 'mcp__council__recall_order' }, async ($, e) => {
+    if (e.agentId !== undefined) return { deny: 'Only the main session recalls orders; report to Claude instead.' }
+    const request = readRecall(e as unknown as Record<string, unknown>)
+    return { result: 'error' in request ? request.error : await recallOrderAction($, request, 'claude') }
+  }).catch(() => ({ deny: 'The council could not recall the order; try again.' }))
+
+  // A model's message to an order's agent is refused, from the main session
+  // or a subagent, whatever the order's status: Claude amends or recalls
+  // instead, and the person has /council message. The plugins' own sends pass.
+  on('session.send', async ($, e, next) => {
+    if (e.origin.kind !== 'model') return next(e)
+    const order = await orderAddressed($, e.to)
+    return order === undefined ? next(e) : { isDelivered: false as const, reason: blockedSendReason(order, e.agentId !== undefined) }
+  }).catch(($, e, next) => next(e))
 
   // The advisor is never offered to the model: only the plugin starts it.
   on('agent.offer', { agent: 'council:advisor' }, () => ({ isOffered: false }))
@@ -1767,7 +1984,7 @@ export const register: Register = (on, options) => {
       const result = await next({ ...e, prompt: outcome.prompt, description: outcome.description, model: level.model })
       if (result.agentId !== undefined) {
         stepEfforts.set(result.agentId, level.effort)
-        await moveOrder($, outcome.order.id, 'spawn', { agentId: result.agentId, model: level.model, effort: level.effort })
+        await moveOrder($, outcome.order.id, 'spawn', { agentId: result.agentId, model: level.model, effort: level.effort, ...(e.name ? { agentName: e.name } : {}) })
       }
       return result
     } finally {
@@ -1786,7 +2003,15 @@ export const register: Register = (on, options) => {
 
   // A council agent's model requests run at its level's effort; everything
   // else passes untouched. A model that takes no effort is left alone.
+  // A recalled agent's request past its ceiling is answered here, without
+  // next: a final reply that ends its turn between steps, never mid-tool.
   on('turn.step', async function* ($, e, next) {
+    const reply = e.agentId === undefined ? undefined : await recallCeiling($, e.agentId).catch(() => undefined)
+    if (reply !== undefined) {
+      yield { kind: 'text' as const, index: 0, text: reply }
+      yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: null }
+      return { turnId: e.turnId, index: e.index, answer: reply, toolUses: [], stopReason: 'end_turn' as const, usage: null }
+    }
     const effort = e.agentId === undefined || e.effort === undefined ? undefined : await stepEffortFor($, e.agentId)
     return yield* next(effort === undefined || effort === e.effort ? e : { ...e, effort: effort as typeof e.effort })
   })
@@ -1808,12 +2033,17 @@ export const register: Register = (on, options) => {
       }
       return next(e)
     }
+    // A recalled agent may still read and report progress; nothing else.
+    const recalled = await recalledOrderOf($, e.agentId)
+    if (recalled !== undefined && !RECALL_ALLOWED_TOOLS.has(String(e.tool))) return { deny: recallDenial(recalled.recall!) }
     const outcome = await followAgentCall($, e.agentId, String(e.tool), e as unknown as Record<string, unknown>)
     if (isProgress) return { result: outcome === undefined ? 'No order of yours is in progress; nothing noted.' : 'Noted.' }
     if (outcome !== undefined && 'deny' in outcome) return { deny: outcome.deny }
     const result = await next(e)
     if (outcome !== undefined && FILE_TOOLS.has(String(e.tool)) && result.deny === undefined && result.isError !== true) {
-      await updateOrder($, order => order.id === outcome.order.id, order => ({ ...order, edits: order.edits + 1 }))
+      const input = e as unknown as { file_path?: unknown; notebook_path?: unknown }
+      const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : ''
+      await updateOrder($, order => order.id === outcome.order.id, order => withTouched({ ...order, edits: order.edits + 1 }, path))
     }
     return result
   }).catch(($, e, next) => (next.called ? next(e) : FILE_TOOLS.has(String(e.tool)) && e.agentId !== undefined ? { deny: 'The council could not check this edit against its order; try again.' } : next(e)))

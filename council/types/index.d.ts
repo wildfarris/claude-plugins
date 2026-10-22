@@ -135,9 +135,37 @@ export type OrderRole = 'scout' | 'knight'
 // (a timer, a background task); 'done' / 'stopped-early' / 'failed': settled;
 // 'lost': its agent left the engine's agent list, or the person released it;
 // 'withdrawn': retired before it was dispatched (Claude withdrew it, or it
-// expired), with `withdrawnReason`. A knight order holds its place (the folder
-// claim) while dispatched, unsettled or waiting.
-export type OrderStatus = 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn'
+// expired), with `withdrawnReason`; 'recalled': the main session or the person
+// recalled it (`recall`), and its agent's turn has ended (or it was not
+// running). A knight order holds its place (the folder claim) while
+// dispatched, unsettled or waiting.
+export type OrderStatus = 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn' | 'recalled'
+
+// A message the person sent an order's agent (/council message).
+export type OrderMessage = { text: string; at: number; isDelivered: boolean; reason?: string }
+
+// One amendment Claude asked for (mcp__council__amend_order) and the council's
+// ruling on it: 'ruling' while the council sits (it holds the slot, so two
+// calls can't both pass the cap), then 'approved' or 'refused'. Refused ones
+// count toward the cap too.
+export type OrderAmendment = {
+  change: string
+  reason: string
+  todos: string[]
+  status: 'ruling' | 'approved' | 'refused'
+  // The gravest concern, the refusal's reason, and the conditions it carries.
+  gravest?: number
+  refusal?: string
+  conditions?: string[]
+  // Whether the approved amendment reached the agent ($.session.send).
+  isDelivered?: boolean
+  at: number
+}
+
+// A recall (mcp__council__recall_order or /council recall): the agent's
+// changing tool calls are refused from `at`, and after RECALL_STEPS more
+// model requests its next one is answered with a final reply (`isEnded`).
+export type OrderRecall = { reason: string; at: number; by: 'claude' | 'person'; steps: number; isEnded?: boolean }
 
 export type ForbidOp = 'create' | 'edit' | 'delete'
 
@@ -207,6 +235,18 @@ export type Order = {
   // The main session's note when it settled the order (settle_order), or why
   // it was lost. Absent when there is none.
   note?: string
+  // The name the dispatch gave its agent (`Agent({ name })`), which
+  // SendMessage addresses it by. Absent when unnamed.
+  agentName?: string
+  // Files its agent's file tools (Edit, Write, MultiEdit, NotebookEdit)
+  // changed, absolute, once each. Shell changes are not tracked.
+  touched?: string[]
+  // The person's messages to its agent (/council message), oldest first.
+  messages?: OrderMessage[]
+  // Claude's amendments and the council's rulings on them, oldest first.
+  amendments?: OrderAmendment[]
+  // Set when it is recalled.
+  recall?: OrderRecall
 }
 
 export type OrderLevel = 1 | 2 | 3

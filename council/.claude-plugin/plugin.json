@@ -92,6 +92,12 @@
       "title": "Council summons",
       "description": "When a member's concern on a plan of orders hinges on a fact it can't see, it may ask a CHECK question; the council then sends one read-only advisor agent (the first advisor agent level) to the plan's folders and rules again on its findings. At most one per ruling. Off: CHECK questions are ignored.",
       "default": true
+    },
+    "amendmentsPerOrder": {
+      "type": "number",
+      "title": "Amendments per order",
+      "description": "How many amendments Claude may ask for on one council order under way (mcp__council__amend_order), refused ones included; each is ruled on by the council. 0 turns amendments off. Whole numbers 0 to 10.",
+      "default": 1
     }
   }
 }

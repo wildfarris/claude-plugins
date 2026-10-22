@@ -10,6 +10,7 @@ import { seatsOf } from '../council'
 import { isAdvisorFinished } from '../advisors'
 import { currentTodo, isFinished, isFolded, levelLabel, openTodos, progressOf } from '../court'
 import { callsLabel } from '../tally'
+import { touchedFiles } from '../control'
 
 export type CourtViewProps = {
   court: Court
@@ -49,6 +50,33 @@ const reportText = (order: Order) =>
     .replace(/^#+\s*/gm, '')
     .replace(/\n{3,}/g, '\n\n')
 
+const AMENDMENT_WORD = { ruling: 'before the council', approved: 'approved', refused: 'refused' } as const
+
+// What steered an order: its recall, Claude's amendments and the person's
+// messages (the last three), one line each.
+function steeringLines(el: ElementTable, order: Order) {
+  const { Text } = el
+  return [
+    ...(order.recall
+      ? [
+          <Text key={`order-recall-${order.id}`} color="warning" wrap="truncate-end">
+            {`⏏ recalled by ${order.recall.by === 'person' ? 'you' : 'Claude'}: ${order.recall.reason}`}
+          </Text>,
+        ]
+      : []),
+    ...(order.amendments ?? []).map((amendment, index) => (
+      <Text key={`order-amendment-${order.id}-${index}`} color={amendment.status === 'refused' ? 'error' : amendment.status === 'approved' ? 'success' : undefined} dimColor={amendment.status === 'ruling'} wrap="truncate-end">
+        {`✎ amendment ${AMENDMENT_WORD[amendment.status]}: ${amendment.change}${amendment.status === 'approved' && amendment.isDelivered === false ? ' · not delivered' : ''}`}
+      </Text>
+    )),
+    ...(order.messages ?? []).slice(-3).map((message, index) => (
+      <Text key={`order-message-${order.id}-${index}`} dimColor wrap="truncate-end">
+        {`✉ you: ${message.text}${message.isDelivered ? '' : ` · not delivered${message.reason ? ` (${message.reason})` : ''}`}`}
+      </Text>
+    )),
+  ]
+}
+
 // An order on the road: who and where, its progress on the right, the road,
 // then what it is doing now.
 function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown) {
@@ -56,7 +84,7 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
   const { done, total } = progressOf(order)
   const calls = callsLabel(order.steps)
   const isWaiting = order.status === 'approved'
-  const now = isWaiting ? 'approved · waiting to be dispatched' : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
+  const now = isWaiting ? 'approved · waiting to be dispatched' : order.recall ? 'recalled · winding down' : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
   return (
     <Box key={`order-${order.id}`} flexDirection="column">
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
@@ -82,6 +110,7 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
           {`rules: ${order.policy.join(' · ')}`}
         </Text>
       )}
+      {steeringLines(el, order)}
     </Box>
   )
 }
@@ -108,6 +137,7 @@ function pausedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (i
       <Text key={`order-paused-${order.id}`} dimColor italic wrap="truncate-end">
         {detail}
       </Text>
+      {steeringLines(el, order)}
       {isOpen && (
         <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor="warning">
           <Text wrap="wrap">{reportText(order)}</Text>
@@ -123,6 +153,7 @@ const ENDED: Record<string, { mark: string; color: string; word?: string }> = {
   'stopped-early': { mark: '◑', color: 'warning', word: 'stopped early' },
   failed: { mark: '✕', color: 'error' },
   lost: { mark: '?', color: 'warning', word: 'lost' },
+  recalled: { mark: '⏏', color: 'warning', word: 'recalled' },
 }
 
 // An order that is back: one line with how it ended; pressed, its whole report.
@@ -160,6 +191,16 @@ function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: 
       {order.note && (
         <Box paddingLeft={2}>
           <Text key={`order-note-${order.id}`} dimColor italic wrap="truncate-end">{order.note}</Text>
+        </Box>
+      )}
+      {(order.recall || (order.amendments ?? []).length > 0 || (order.messages ?? []).length > 0) && (
+        <Box flexDirection="column" paddingLeft={2}>
+          {steeringLines(el, order)}
+          {order.status === 'recalled' && (
+            <Text key={`order-touched-${order.id}`} dimColor wrap="truncate-end">
+              {`touched: ${touchedFiles(order).join(', ') || 'no files through its file tools'} · shell changes not tracked`}
+            </Text>
+          )}
         </Box>
       )}
       {isOpen && (

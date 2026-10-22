@@ -28,6 +28,8 @@ export type CouncilSettings = {
   advisorAgentLevels: ModelEffort[]
   // A ruling on orders may summon one advisor agent when members ask a CHECK.
   isSummonsOn: boolean
+  // How many amendments (mcp__council__amend_order) one order takes, refused ones included.
+  amendmentsPerOrder: number
 }
 
 // One level's model (an alias such as sonnet, or a full id) and effort.
@@ -59,6 +61,9 @@ const levelsOption = (value: unknown, fallback: string, count: number) => parseM
 
 const textOption = (value: unknown, fallback: string) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback)
 const effortOption = (value: unknown, fallback: Effort) => EFFORTS.find(effort => effort === value) ?? fallback
+// A whole number from `min` to `max`; the fallback for anything else.
+const countOption = (value: unknown, fallback: number, min: number, max: number) =>
+  typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max ? value : fallback
 const booleanOption = (value: unknown, fallback: boolean) => (typeof value === 'boolean' ? value : fallback)
 // A member id, read as a member file's name gives it ("Hand" or "hand.md" is
 // hand); null when unset or when nothing of an id is left.
@@ -81,5 +86,6 @@ export function readSettings(options: PluginOptions): CouncilSettings {
     knightLevels: levelsOption(options.knightLevels, DEFAULT_KNIGHT_LEVELS, 3),
     advisorAgentLevels: levelsOption(options.advisorAgentLevels, DEFAULT_ADVISOR_AGENT_LEVELS, 2),
     isSummonsOn: booleanOption(options.councilSummons, true),
+    amendmentsPerOrder: countOption(options.amendmentsPerOrder, 1, 0, 10),
   }
 }

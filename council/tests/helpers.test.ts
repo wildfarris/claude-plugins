@@ -150,6 +150,7 @@ describe('settings', () => {
         { model: 'opus', effort: 'high' },
       ],
       isSummonsOn: true,
+      amendmentsPerOrder: 1,
     })
     expect(readSettings({ advisorEffort: 'extreme', advisorModel: '  ' }).advisorEffort).toBe('low')
     expect(readSettings({ advisorModel: '  ' }).advisorModel).toBe('sonnet')
@@ -161,6 +162,12 @@ describe('settings', () => {
     expect(readSettings({ arbiter: '' }).arbiter).toBeNull()
     expect(readSettings({ arbiter: '  --  ' }).arbiter).toBeNull()
     expect(readSettings({ arbiter: 3 }).arbiter).toBeNull()
+  })
+
+  test('amendments per order is a whole number from 0 to 10, else 1', () => {
+    expect(readSettings({ amendmentsPerOrder: 0 }).amendmentsPerOrder).toBe(0)
+    expect(readSettings({ amendmentsPerOrder: 3 }).amendmentsPerOrder).toBe(3)
+    for (const bad of [-1, 11, 1.5, '2', null]) expect(readSettings({ amendmentsPerOrder: bad }).amendmentsPerOrder).toBe(1)
   })
 })
 

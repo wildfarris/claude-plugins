@@ -37,7 +37,8 @@ export function baseStandIn(
     cwd?: string
     decide?: (tool: string, input: unknown) => CheckDecision
     complete?: (request: { model: string; system: string; prompt: string }) => string | Unanswered | Promise<string | Unanswered>
-    toolResult?: () => { result: string; text: string; isError?: true }
+    // What the engine answers a tool call (it may take its time); `ok` when left out.
+    toolResult?: (tool: string) => { result: string; text: string; isError?: true } | undefined | Promise<{ result: string; text: string; isError?: true } | undefined>
   },
 ): Harness {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -59,9 +60,9 @@ export function baseStandIn(
   on('tool.register', ($, e) => ({ value: { tool: `mcp__council__${e.name}` } }))
   on('command.run', () => ({ text: '' }))
   on('tool.check', ($, e) => ({ decision: (options.decide ?? (() => 'ask'))(String(e.tool), e.input) }))
-  on('tool.call', ($, e) => {
+  on('tool.call', async ($, e) => {
     harness.tools.push(String(e.tool))
-    return options.toolResult?.() ?? { result: 'ok', text: 'ok' }
+    return (await options.toolResult?.(String(e.tool))) ?? { result: 'ok', text: 'ok' }
   })
   on('prompt.submit', ($, e) => {
     harness.prompts.push(e.text)

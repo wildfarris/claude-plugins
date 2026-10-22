@@ -378,6 +378,7 @@ export function dispatchPrompt(order: Order, folderInstructions: string | null, 
         ]
       : []),
     ...(folderInstructions ? [`${order.relFolder}/CLAUDE.md (this folder's rules):\n${folderInstructions.slice(0, 6000)}`] : []),
+    'Claude may amend this order (the amendment reaches you as a message) or recall it (your changing tool calls are then refused: report what you changed, then stop).',
     'End with a short report: what you did or found, what changed, anything left undone.',
     `From Claude:\n${claudePrompt}`,
   ].join('\n\n')
@@ -482,7 +483,7 @@ export const isOpen = (order: Pick<Order, 'status'>) => order.status === 'approv
 // finished section and fold away like the rest. Unsettled and waiting orders
 // are not: they hold their place until the main session settles them.
 export const isFinished = (order: Pick<Order, 'status'>) =>
-  order.status === 'done' || order.status === 'stopped-early' || order.status === 'failed' || order.status === 'lost' || order.status === 'withdrawn'
+  order.status === 'done' || order.status === 'stopped-early' || order.status === 'failed' || order.status === 'lost' || order.status === 'withdrawn' || order.status === 'recalled'
 
 // Finished orders fold away at the person's next prompt, not on a timer, so
 // work that ends while they're away is still there when they come back.
@@ -518,6 +519,7 @@ const NOT_OPEN: Partial<Record<Order['status'], string>> = {
   failed: 'already finished (failed)',
   lost: 'already finished (lost)',
   withdrawn: 'already withdrawn',
+  recalled: 'already finished (recalled)',
 }
 
 // Withdraws the open orders named; refuses (and reports) the rest. The
@@ -777,7 +779,10 @@ export function repoCandidates(folder: string): string[] {
 // listed: `turn-done`; answered with todos open: `turn-open`; ended any other
 // way: `turn-failed`); its agent leaving the engine's agent list (`gone`);
 // the main session's settle_order (`settle-*`); a wake (its agent resumed by
-// a timer, a background task or a message); the person's /council release.
+// a timer, a background task or a message); the person's /council release;
+// a recall (recall_order, /council recall): at once for an unsettled or
+// waiting order, at its agent's turn end (or when its agent is gone) for a
+// dispatched one.
 export type OrderEvent =
   | 'spawn'
   | 'withdraw'
@@ -792,35 +797,38 @@ export type OrderEvent =
   | 'settle-waiting'
   | 'wake'
   | 'release'
+  | 'recall'
 
 const SETTLED_WAKE = { wake: 'dispatched' } as const
 
 // Every status change an order can make, by event; anything not listed is
 // refused. A settled or lost knight order's wake is listed but guarded: it
 // goes through only while no other knight holds an overlapping place
-// (wakeVerdict); otherwise it is denied, which parks the agent.
+// (wakeVerdict); otherwise it is denied, which parks the agent. A recalled
+// order has no way out: its wakes are refused.
 export const ORDER_LIFECYCLE: { readonly [S in Order['status']]: { readonly [E in OrderEvent]?: Order['status'] } } = {
   approved: { spawn: 'dispatched', withdraw: 'withdrawn', expire: 'withdrawn' },
-  dispatched: { 'turn-done': 'done', 'turn-open': 'unsettled', 'turn-failed': 'failed', gone: 'lost' },
-  unsettled: { 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', 'settle-waiting': 'waiting', wake: 'dispatched', gone: 'lost', release: 'lost' },
-  waiting: { wake: 'dispatched', 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', gone: 'lost', release: 'lost' },
+  dispatched: { 'turn-done': 'done', 'turn-open': 'unsettled', 'turn-failed': 'failed', gone: 'lost', recall: 'recalled' },
+  unsettled: { 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', 'settle-waiting': 'waiting', wake: 'dispatched', gone: 'lost', release: 'lost', recall: 'recalled' },
+  waiting: { wake: 'dispatched', 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', gone: 'lost', release: 'lost', recall: 'recalled' },
   done: SETTLED_WAKE,
   'stopped-early': SETTLED_WAKE,
   failed: SETTLED_WAKE,
   lost: SETTLED_WAKE,
   withdrawn: {},
+  recalled: {},
 }
 
 // The status `event` moves an order in `status` to, or undefined when the table refuses it.
 export const nextStatus = (status: Order['status'], event: OrderEvent): Order['status'] | undefined => ORDER_LIFECYCLE[status]?.[event]
 
 // Statuses whose order is over until a wake: when one is reached, it ends.
-const ENDS = new Set<Order['status']>(['unsettled', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn'])
+const ENDS = new Set<Order['status']>(['unsettled', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn', 'recalled'])
 
 // The order after `event`, or undefined when the table refuses it. The one
 // way an order's status changes: it stamps the times, counts wakes and drops
 // a note left from before.
-export function moved(order: Order, event: OrderEvent, now: number, fields: Partial<Pick<Order, 'agentId' | 'report' | 'note' | 'withdrawnReason' | 'model' | 'effort'>> = {}): Order | undefined {
+export function moved(order: Order, event: OrderEvent, now: number, fields: Partial<Pick<Order, 'agentId' | 'report' | 'note' | 'withdrawnReason' | 'model' | 'effort' | 'recall' | 'agentName'>> = {}): Order | undefined {
   const status = nextStatus(order.status, event)
   if (status === undefined) return undefined
   const { note: _note, ...rest } = order
@@ -906,7 +914,8 @@ export function withLostAgents(orders: readonly Order[], live: ReadonlySet<strin
   let isChanged = false
   const next = orders.map((order): Order => {
     if (order.agentId === null || live.has(order.agentId)) return order
-    const lost = moved(order, 'gone', now, { note: LOST_NOTE })
+    // A recalled order whose agent is gone is recalled, not lost.
+    const lost = order.recall !== undefined && order.status === 'dispatched' ? moved(order, 'recall', now) : moved(order, 'gone', now, { note: LOST_NOTE })
     if (lost === undefined) return order
     isChanged = true
     return lost
@@ -914,11 +923,13 @@ export function withLostAgents(orders: readonly Order[], live: ReadonlySet<strin
   return isChanged ? next : orders
 }
 
-// An agent woke: whether its order lets it. Allowed for an order on the road,
+// An agent woke: whether its order lets it. Never for a recalled order.
+// Otherwise allowed for an order on the road,
 // unsettled or waiting (it still holds its place), for a scout's, and for a
 // settled or lost knight order whose place is free (`clash` is undefined);
 // denied when another knight holds an overlapping place.
 export function wakeVerdict(order: Order, clash: { order: Order; place: Place } | undefined, reason?: string): { allow: true } | { deny: string } {
+  if (order.status === 'recalled') return { deny: `${order.id} was recalled: the wake is refused.` }
   if (order.role === 'scout' || order.status === 'dispatched' || order.status === 'unsettled' || order.status === 'waiting' || clash === undefined) return { allow: true }
   return { deny: `${order.id} is ${order.status} and ${clash.order.id} now holds ${reason ?? 'its place'}: the wake is refused.` }
 }
