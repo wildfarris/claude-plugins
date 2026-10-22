@@ -20,7 +20,7 @@
 // succeeded, and the bar shows its stats.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderInput, RenderSurface, SessionMessage, StateRef } from 'claude-code'
+import type { EngineInterface, ModelCompleteRequest, ModelCompleteResult, ModelUsage, Register, RenderInput, RenderSurface, SessionMessage, StateRef } from 'claude-code'
 
 import type { Bar, BarItemId, Brief, BriefRepo, ContextReadout, HeadsUpNote, PendingBrief, TrimOffer, Replay, ReplayStep, ResumeWarning, RuleSuggestion, Scope } from '../types'
 import {
@@ -153,6 +153,7 @@ import { modelFailureText, stringList, textKey } from './values'
 import { barView } from './views/bar'
 import { barModel, type BarHandlers, type BarState } from './views/bar-model'
 import { MAX_VIEW_DIFF_LINES, replayView } from './views/replay'
+import { modelEntries, modelEntry, parseSince, scopeUsageReport } from './usage'
 
 const REPLAY_PANE_ID = 'sidekick-replay'
 const KNOWN_TOPICS_STORE_KEY = 'knownTopics'
@@ -356,7 +357,7 @@ async function runReview($: EngineInterface, input: ReviewInput): Promise<Review
   const [rules, declined, topLevelFolders] = wantsRule
     ? await Promise.all([readRules($, root), readDeclinedRules($, root), topLevelFolderNames($, root)])
     : [[], [], []]
-  const reply = await $.model.complete({
+  const reply = await completeModel($, { purpose: wantsSummary ? 'tldr' : wantsHeadsUp ? 'heads-up' : 'rule' }, {
     model: settings.model,
     system: REVIEW_SYSTEM_PROMPT,
     prompt: buildReviewPrompt(settings, {
@@ -630,9 +631,10 @@ async function makeBrief($: EngineInterface, span: BriefSpan, isConfirmed: boole
     const stats = spanStats(entries)
     const findings = claimsCheck(stats)
     const figures = statLines(stats)
-    const partSummaries = plan.chunks.length > 1 ? await summarizeChunks($, plan.chunks) : undefined
+    const use = { purpose: isForHandoff ? 'handoff' : 'brief' }
+    const partSummaries = plan.chunks.length > 1 ? await summarizeChunks($, plan.chunks, use) : undefined
     if (partSummaries !== undefined && 'failure' in partSummaries) return `The TL;DR failed: a part of the log could not be condensed (${partSummaries.failure}).`
-    const reply = await $.model.complete({
+    const reply = await completeModel($, use, {
       model: settings.model,
       system: BRIEF_SYSTEM_PROMPT,
       prompt: briefPrompt({ span, stats: figures, findings, ...(partSummaries ? { partSummaries: partSummaries.summaries } : { log: plan.chunks[0] ?? '' }), answer: stats.answer?.text ?? null }),
@@ -662,14 +664,14 @@ async function makeBrief($: EngineInterface, span: BriefSpan, isConfirmed: boole
 
 // One call per chunk (three at a time, cached by chunk); why one failed when
 // one did.
-async function summarizeChunks($: EngineInterface, chunks: readonly string[]): Promise<{ summaries: string[] } | { failure: string }> {
+async function summarizeChunks($: EngineInterface, chunks: readonly string[], use: ModelUse): Promise<{ summaries: string[] } | { failure: string }> {
   const summaries: Array<string | null> = chunks.map(chunk => chunkSummaries.get(textKey(chunk)) ?? null)
   const missing = chunks.map((_, index) => index).filter(index => summaries[index] === null)
   const failures: string[] = []
   for (let start = 0; start < missing.length; start += 3) {
     await Promise.all(
       missing.slice(start, start + 3).map(async index => {
-        const reply = await $.model.complete({ model: settings.model, system: BRIEF_SYSTEM_PROMPT, prompt: chunkPrompt(chunks[index]!, index, chunks.length), maxTokens: 350, timeoutMs: 60000 })
+        const reply = await completeModel($, use, { model: settings.model, system: BRIEF_SYSTEM_PROMPT, prompt: chunkPrompt(chunks[index]!, index, chunks.length), maxTokens: 350, timeoutMs: 60000 })
         if (!reply.isAnswered) return void failures.push(modelFailureText(reply))
         summaries[index] = reply.text.trim()
         if (chunkSummaries.size >= MAX_CHUNK_SUMMARIES) chunkSummaries.delete(chunkSummaries.keys().next().value!)
@@ -766,7 +768,7 @@ async function runPendingBrief($: EngineInterface, surface: RenderSurface): Prom
   const pending = await read($, pendingBriefAtom)
   if (pending === null) return
   await runBarTask($, 'tldr', async () => {
-    const notice = await makeBrief($, pending.span, true)
+    const notice = await makeBrief($, pending.span, true, pending.isForHandoff)
     return notice === undefined && pending.isForHandoff ? writeSessionHandoff($, surface) : notice
   })
 }
@@ -861,13 +863,15 @@ async function restoreScope($: EngineInterface, root: string): Promise<void> {
 
 // ── The policy judge ──────────────────────────────────────────────────────
 
-// The judge's model call, through the engine's own $.model.complete: the
-// Claude Code session's sign-in pays for it, as for every other sidekick
-// call (a subscription's usage, or the API key the session runs on).
+// The judge's model call, through the engine's own model call (completeModel,
+// which records its usage): the Claude Code session's sign-in pays for it, as
+// for every other sidekick call (a subscription's usage, or the API key the
+// session runs on).
 // 4 s: the whole tool.call hook has a 10 s budget, and the snapshot may take 1-2 s.
-function judgeHost($: EngineInterface): JudgeHost {
+function judgeHost($: EngineInterface, who: { agentId: string | undefined; order: CarriedOrder | undefined }): JudgeHost {
+  const use: ModelUse = { purpose: 'judge', ...(who.agentId !== undefined ? { agentId: who.agentId } : {}), ...(who.order !== undefined ? { orderId: who.order.id } : {}) }
   return {
-    complete: request => $.model.complete({ model: settings.model, system: request.system, prompt: request.prompt, maxTokens: request.maxTokens, timeoutMs: request.timeoutMs, effort: request.effort }) as Promise<ModelReply>,
+    complete: request => completeModel($, use, { model: settings.model, system: request.system, prompt: request.prompt, maxTokens: request.maxTokens, timeoutMs: request.timeoutMs, effort: request.effort }) as Promise<ModelReply>,
     snapshot: () => processSnapshot($),
     pausedBecause: () => judgePause($),
   }
@@ -947,15 +951,13 @@ async function reviewAgentRun($: EngineInterface, agentId: string): Promise<stri
   const context = await scopeContext($)
   // With its granted leave, so the review doesn't warn of what was granted.
   const policy = assemblePolicy(standingPolicy(await readRules($, context.root)), { id: order.id, sentences: order.policy, leave: order.leave })
-  const reply = await $.model
-    .complete({
-      model: settings.model,
-      system: reviewSystemPrompt(policy),
-      prompt: buildStopReviewPrompt({ commands, agent: agentLabelOf(agentId, order), folders: [order.folder] }, context.home),
-      maxTokens: REVIEW_MAX_TOKENS,
-      timeoutMs: REVIEW_TIMEOUT_MS,
-    })
-    .catch(() => undefined)
+  const reply = await completeModel($, { purpose: 'stop-review', agentId, orderId: order.id }, {
+    model: settings.model,
+    system: reviewSystemPrompt(policy),
+    prompt: buildStopReviewPrompt({ commands, agent: agentLabelOf(agentId, order), folders: [order.folder] }, context.home),
+    maxTokens: REVIEW_MAX_TOKENS,
+    timeoutMs: REVIEW_TIMEOUT_MS,
+  }).catch(() => undefined)
   guardMetrics.reviews++
   metricsChanges++
   if (reply === undefined || !reply.isAnswered) return reviewNote(order.id, { kind: 'failed', why: reply === undefined ? 'the review call failed' : `the review gave no answer: ${modelFailureText(reply)}` })
@@ -1037,7 +1039,7 @@ async function judgeShellCall(
     judge: { isEnabled: isJudging(who.agentId), maxSegments: settings.judgeMaxSegments, budget: who.agentId !== undefined ? settings.judgeBudgetAgent : settings.judgeBudgetSession },
   }
   const event: JudgeEvent = { judged: false }
-  const decision = await decideCall(call, options, judgeState, judgeHost($), event)
+  const decision = await decideCall(call, options, judgeState, judgeHost($, who), event)
   countGuardDecision($, decision, event, budgetKey)
   return decision
 }
@@ -1473,9 +1475,69 @@ async function scopeCommand($: EngineInterface, args: string): Promise<string> {
     case 'clear':
       await saveScope($, { folders: [] }, root)
       return 'Scope cleared; the guard is idle until /scope set or add.'
+    case 'usage':
+      return scopeUsage($, rest)
     default:
-      return 'Usage: /scope [show | set <folder> | add <folder> | remove <folder> | clear | judge on|off]'
+      return 'Usage: /scope [show | set <folder> | add <folder> | remove <folder> | clear | judge on|off | usage [since YYYY-MM-DD]]'
   }
+}
+
+// ── Usage ─────────────────────────────────────────────────────────────────
+//
+// Every model call sidekick makes goes through completeModel, which records
+// its purpose, model and tokens in the session's ledger (a `model` entry),
+// after the call and without holding it up. Recording never fails the call:
+// a failure is toasted once a session.
+
+// What a call is for: judge, stop-review, tldr, heads-up, rule, brief or handoff.
+type ModelUse = { purpose: string; agentId?: string; orderId?: string }
+
+let usageSession: string | undefined
+let isUsageFailureToasted = false
+
+async function completeModel($: EngineInterface, use: ModelUse, request: ModelCompleteRequest): Promise<ModelCompleteResult> {
+  const reply = await $.model.complete(request)
+  void noteModelCall($, use, request.model, request.effort, reply.usage)
+  return reply
+}
+
+async function noteModelCall($: EngineInterface, use: ModelUse, model: string, effort: string | number | undefined, usage: ModelUsage | undefined): Promise<void> {
+  try {
+    const [at, session] = await Promise.all([ledgerNow($), usageSession ?? $.session.id()])
+    usageSession = session
+    recordEntry($, modelEntry({ at, purpose: use.purpose, model, effort, session, usage, agentId: use.agentId, orderId: use.orderId }))
+  } catch (error) {
+    if (isUsageFailureToasted) return
+    isUsageFailureToasted = true
+    try {
+      $.ui.toast(`Sidekick: a model call's usage could not be recorded (${error instanceof Error ? error.message : String(error)}); nothing else is affected.`)
+    } catch {
+      // Nothing more to do.
+    }
+  }
+}
+
+// /scope usage [since YYYY-MM-DD]: sidekick's own calls by purpose, read
+// from every session's ledger on this machine (this session's written first).
+async function scopeUsage($: EngineInterface, words: readonly string[]): Promise<string> {
+  const now = await $.clock.now()
+  const since = parseSince(words, now)
+  if ('error' in since) return since.error
+  const home = await readHome($)
+  if (!home) return `Sidekick's usage is not recorded: ${NO_HOME}.`
+  if (!settings.isSummaryEnabled) return "Sidekick's usage is not recorded: it is kept in the TL;DR record (the ledger), which is off. For the whole split, run /council usage."
+  await flushLedger($)
+  const base = `${home}/${LEDGER_FOLDER}`
+  // Every session's folder (a folder's own time moves only when a file is added): its recent segments.
+  const sessions = (await $.fs.list(base).catch(() => [])).filter(entry => entry.kind === 'dir' && !entry.isLink)
+  const texts = await Promise.all(
+    sessions.map(async session => {
+      const folder = `${base}/${session.name}`
+      const files = (await $.fs.list(folder).catch(() => [])).filter(file => file.kind === 'file' && !file.isLink && file.mtimeMs >= since.since && segmentIndex(file.name) !== undefined)
+      return Promise.all(files.map(file => $.fs.read(`${folder}/${file.name}`).catch(() => '')))
+    }),
+  )
+  return scopeUsageReport(texts.flat(2).flatMap(modelEntries), since, now)
 }
 
 // ── Trim instead of summary compaction ────────────────────────────────────
@@ -1712,7 +1774,7 @@ export const register: Register = (on, options) => {
     if (settings.isReplayEnabled) await $.command.register({ name: 'replay', description: "Step through the last turn's file edits" })
     if (settings.isSummaryEnabled) await $.command.register({ name: 'tldr', description: 'Brief what happened: the last turn, since the last brief, or the whole session', argumentHint: '[last|since|full]' })
     await $.command.register({ name: 'heads-up', description: 'Review the last answer for something you should know, or list/forget topics marked known', argumentHint: '[now|known|forget]' })
-    await $.command.register({ name: 'scope', description: "Show or change this session's target folders and its policy judge", argumentHint: '[show|set <folder>|add <folder>|remove <folder>|clear|judge on|off]' })
+    await $.command.register({ name: 'scope', description: "Show or change this session's target folders and its policy judge", argumentHint: '[show|set <folder>|add <folder>|remove <folder>|clear|judge on|off|usage [since YYYY-MM-DD]]' })
     // Looked for afresh each start (the council mod may have been turned off).
     await update($, hasCouncilAtom, () => false)
     void detectCouncil($)

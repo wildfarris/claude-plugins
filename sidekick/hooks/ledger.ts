@@ -33,6 +33,27 @@ export type LedgerEntry =
   | { kind: 'answer'; at: number; turnId: string; text: string; durationMs: number; isAborted?: true }
   // A brief was made: "since the last brief" starts after the newest one.
   | { kind: 'brief'; at: number }
+  // One of sidekick's own model calls and what it cost (usage.ts), for
+  // /scope usage and the council's /council usage; never part of a brief.
+  | ModelEntry
+
+export type ModelEntry = {
+  kind: 'model'
+  v: 1
+  at: number
+  plugin: 'sidekick'
+  // judge, stop-review, tldr, heads-up, rule, brief or handoff.
+  purpose: string
+  model: string
+  effort?: string
+  input: number
+  cacheRead: number
+  cacheWrite: number
+  output: number
+  session: string
+  agentId?: string
+  orderId?: string
+}
 
 export type BriefSpan = 'last' | 'since' | 'full'
 
@@ -179,7 +200,7 @@ export const segmentIndex = (name: string) => (/^(\d{6})\.jsonl$/.test(name) ? N
 
 export const serializeSegment = (entries: readonly LedgerEntry[]) => (entries.length === 0 ? '' : `${entries.map(entry => JSON.stringify(entry)).join('\n')}\n`)
 
-const ENTRY_KINDS = new Set(['prompt', 'say', 'call', 'answer', 'brief'])
+const ENTRY_KINDS = new Set(['prompt', 'say', 'call', 'answer', 'brief', 'model'])
 
 // A segment's entries; a line that isn't one (a torn write) is skipped.
 export function parseSegment(text: string): LedgerEntry[] {
@@ -214,7 +235,9 @@ export const SPAN_LABELS: Record<BriefSpan, string> = { last: 'last turn', since
 
 // The entries a span covers, oldest first. `last`: from the newest main
 // prompt. `since`: after the newest brief marker (all, when none). `full`: all.
-export function spanEntries(entries: readonly LedgerEntry[], span: BriefSpan): LedgerEntry[] {
+// Usage records (`model`) are never part of one.
+export function spanEntries(all: readonly LedgerEntry[], span: BriefSpan): LedgerEntry[] {
+  const entries = all.filter(entry => entry.kind !== 'model')
   const kept = entries.filter(entry => entry.kind !== 'brief')
   if (span === 'full') return kept
   const isStart = span === 'last' ? (entry: LedgerEntry) => entry.kind === 'prompt' : (entry: LedgerEntry) => entry.kind === 'brief'
