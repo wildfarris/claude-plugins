@@ -365,7 +365,7 @@ export function dispatchPrompt(order: Order, folderInstructions: string | null, 
   return [
     `You carry order ${order.id} from the council: ${order.task}`,
     `Work only in ${order.folder}/. ${order.role === 'scout' ? 'You are a scout: read and report; change nothing.' : 'You are a knight: you may change files and run commands inside that folder only; anything outside it is refused.'}`,
-    `Report your progress with the ${PROGRESS_TOOL} tool: call it first with this whole list, then again each time you start or finish an item, marking it in_progress then completed (add an item if the work needs one). The council follows your progress by it:\n${order.todos.map(todo => `- ${todo.content}`).join('\n')}`,
+    `Report your progress with the ${PROGRESS_TOOL} tool: call it first with this whole list, then again each time you start or finish an item, marking it in_progress then completed (add an item if the work needs one). The council follows your progress by it, and an item still open when you end your turn tells Claude the order is unfinished:\n${order.todos.map(todo => `- ${todo.content}`).join('\n')}`,
     ...(order.conditions.length > 0 ? [`The council's conditions:\n${order.conditions.map(condition => `- ${condition}`).join('\n')}`] : []),
     ...(order.forbid && order.forbid.length > 0
       ? [
@@ -401,6 +401,9 @@ export const progressOf = (order: Order) => {
   const done = order.todos.filter(todo => todo.status === 'completed').length
   return { done, total: order.todos.length, fraction: order.status === 'done' ? 1 : order.todos.length === 0 ? 0 : done / order.todos.length }
 }
+
+// The todos its agent has not checked off.
+export const openTodos = (order: Pick<Order, 'todos'>) => order.todos.filter(todo => todo.status !== 'completed')
 
 export const currentTodo = (order: Order) => order.todos.find(todo => todo.status === 'in_progress')?.activeForm ?? null
 
@@ -475,8 +478,11 @@ export function parseTriage(answer: string | undefined, seatIds: readonly string
 // withdraw, or see expire.
 export const isOpen = (order: Pick<Order, 'status'>) => order.status === 'approved'
 
-// Withdrawn orders count as finished: they show in the finished section and fold away like the rest.
-export const isFinished = (order: Pick<Order, 'status'>) => order.status === 'done' || order.status === 'failed' || order.status === 'withdrawn'
+// Settled, lost and withdrawn orders count as finished: they show in the
+// finished section and fold away like the rest. Unsettled and waiting orders
+// are not: they hold their place until the main session settles them.
+export const isFinished = (order: Pick<Order, 'status'>) =>
+  order.status === 'done' || order.status === 'stopped-early' || order.status === 'failed' || order.status === 'lost' || order.status === 'withdrawn'
 
 // Finished orders fold away at the person's next prompt, not on a timer, so
 // work that ends while they're away is still there when they come back.
@@ -505,8 +511,12 @@ export type WithdrawalRefusal = { id: string; why: string }
 
 const NOT_OPEN: Partial<Record<Order['status'], string>> = {
   dispatched: 'already dispatched (an agent is carrying it)',
+  unsettled: 'already dispatched (its agent ended with todos open)',
+  waiting: 'already dispatched (waiting for its agent to wake)',
   done: 'already done',
+  'stopped-early': 'already finished (stopped early)',
   failed: 'already finished (failed)',
+  lost: 'already finished (lost)',
   withdrawn: 'already withdrawn',
 }
 
@@ -518,11 +528,11 @@ export function withdrawOrders(orders: readonly Order[], ids: readonly string[],
   for (const id of ids) {
     const order = orders.find(candidate => candidate.id === id)
     if (order === undefined) refused.push({ id, why: 'no such order' })
-    else if (isOpen(order)) withdrawn.push(id)
+    else if (nextStatus(order.status, 'withdraw') !== undefined) withdrawn.push(id)
     else refused.push({ id, why: NOT_OPEN[order.status] ?? `not open (${order.status})` })
   }
   return {
-    orders: orders.map((order): Order => (withdrawn.includes(order.id) ? { ...order, status: 'withdrawn', withdrawnReason: reason, endedAt: now } : order)),
+    orders: orders.map((order): Order => (withdrawn.includes(order.id) ? (moved(order, 'withdraw', now, { withdrawnReason: reason }) ?? order) : order)),
     withdrawn,
     refused,
   }
@@ -549,8 +559,10 @@ export function withExpired(orders: readonly Order[], now: number): readonly Ord
       return { ...order, approvedAt: now }
     }
     if (now - order.approvedAt < ORDER_EXPIRY_MS) return order
+    const expired = moved(order, 'expire', now, { withdrawnReason: EXPIRED_REASON })
+    if (expired === undefined) return order
     isChanged = true
-    return { ...order, status: 'withdrawn', withdrawnReason: EXPIRED_REASON, endedAt: now }
+    return expired
   })
   return isChanged ? next : orders
 }
@@ -726,9 +738,21 @@ function sameFolder(left: string, right: string): boolean {
 // repo down to one agent, so two knights in one repo can't be told apart).
 export const placesOverlap = (a: Place, b: Place) => isNested(a.folder, b.folder) || (a.repo !== null && b.repo !== null && sameFolder(a.repo, b.repo))
 
-// The dispatched knight order whose place overlaps `place`, if any (`except`: the order itself).
+// A knight order holds its place (the folder claim) while its agent is on it,
+// ended with todos open, or waits to wake: no other knight works there until
+// it is settled, released or lost. Scouts hold no claim.
+export const holdsClaim = (order: Pick<Order, 'role' | 'status'>) => order.role === 'knight' && (order.status === 'dispatched' || order.status === 'unsettled' || order.status === 'waiting')
+
+// The claim-holding knight order whose place overlaps `place`, if any (`except`: the order itself).
 export function knightClash(place: Place, others: ReadonlyArray<{ order: Order; place: Place }>, except?: string): { order: Order; place: Place } | undefined {
-  return others.find(other => other.order.id !== except && other.order.role === 'knight' && other.order.status === 'dispatched' && placesOverlap(place, other.place))
+  return others.find(other => other.order.id !== except && holdsClaim(other.order) && placesOverlap(place, other.place))
+}
+
+// How the knight holding a place is doing, for a refusal: "still at work in api/".
+export function claimHolderText(order: Order): string {
+  if (order.status === 'unsettled') return `a knight in ${order.relFolder}/ that ended with todos open (settle it with mcp__council__settle_order)`
+  if (order.status === 'waiting') return `a knight in ${order.relFolder}/ waiting to wake`
+  return `a knight still at work in ${order.relFolder}/`
 }
 
 // Why two places overlap: the same folder, one inside the other, or one repository.
@@ -746,23 +770,157 @@ export function repoCandidates(folder: string): string[] {
   return parsed.segments.map((_, index) => nativePath({ prefix: parsed.prefix, segments: parsed.segments.slice(0, parsed.segments.length - index) }))
 }
 
-// ── Releasing orders whose agent is gone ──────────────────────────────────
+// ── The order lifecycle ───────────────────────────────────────────────────
 
-export const STALE_REPORT = 'agent ended without reporting'
+// What moves an order: its dispatch (`spawn`); withdrawing it or its expiry;
+// the end of its agent's turn (answered with every todo completed or none
+// listed: `turn-done`; answered with todos open: `turn-open`; ended any other
+// way: `turn-failed`); its agent leaving the engine's agent list (`gone`);
+// the main session's settle_order (`settle-*`); a wake (its agent resumed by
+// a timer, a background task or a message); the person's /council release.
+export type OrderEvent =
+  | 'spawn'
+  | 'withdraw'
+  | 'expire'
+  | 'turn-done'
+  | 'turn-open'
+  | 'turn-failed'
+  | 'gone'
+  | 'settle-done'
+  | 'settle-stopped-early'
+  | 'settle-failed'
+  | 'settle-waiting'
+  | 'wake'
+  | 'release'
 
-// A dispatched order whose agent the engine no longer lists at all becomes
-// failed, so it never holds its place forever. An agent that is listed in any
-// status (running, waiting on a timer or a background task, idle, even ended,
-// which a message may yet resume) is not gone. `live`: every listed agent id.
-// The same array when nothing changes.
-export function withStaleReleased(orders: readonly Order[], live: ReadonlySet<string>, now: number): readonly Order[] {
+const SETTLED_WAKE = { wake: 'dispatched' } as const
+
+// Every status change an order can make, by event; anything not listed is
+// refused. A settled or lost knight order's wake is listed but guarded: it
+// goes through only while no other knight holds an overlapping place
+// (wakeVerdict); otherwise it is denied, which parks the agent.
+export const ORDER_LIFECYCLE: { readonly [S in Order['status']]: { readonly [E in OrderEvent]?: Order['status'] } } = {
+  approved: { spawn: 'dispatched', withdraw: 'withdrawn', expire: 'withdrawn' },
+  dispatched: { 'turn-done': 'done', 'turn-open': 'unsettled', 'turn-failed': 'failed', gone: 'lost' },
+  unsettled: { 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', 'settle-waiting': 'waiting', wake: 'dispatched', gone: 'lost', release: 'lost' },
+  waiting: { wake: 'dispatched', 'settle-done': 'done', 'settle-stopped-early': 'stopped-early', 'settle-failed': 'failed', gone: 'lost', release: 'lost' },
+  done: SETTLED_WAKE,
+  'stopped-early': SETTLED_WAKE,
+  failed: SETTLED_WAKE,
+  lost: SETTLED_WAKE,
+  withdrawn: {},
+}
+
+// The status `event` moves an order in `status` to, or undefined when the table refuses it.
+export const nextStatus = (status: Order['status'], event: OrderEvent): Order['status'] | undefined => ORDER_LIFECYCLE[status]?.[event]
+
+// Statuses whose order is over until a wake: when one is reached, it ends.
+const ENDS = new Set<Order['status']>(['unsettled', 'done', 'stopped-early', 'failed', 'lost', 'withdrawn'])
+
+// The order after `event`, or undefined when the table refuses it. The one
+// way an order's status changes: it stamps the times, counts wakes and drops
+// a note left from before.
+export function moved(order: Order, event: OrderEvent, now: number, fields: Partial<Pick<Order, 'agentId' | 'report' | 'note' | 'withdrawnReason' | 'model' | 'effort'>> = {}): Order | undefined {
+  const status = nextStatus(order.status, event)
+  if (status === undefined) return undefined
+  const { note: _note, ...rest } = order
+  const next: Order = { ...rest, ...fields, status }
+  if (event === 'spawn') return { ...next, startedAt: now, endedAt: null }
+  if (event === 'wake') return { ...next, wakes: (order.wakes ?? 0) + 1, endedAt: null, isFolded: false }
+  // Settling as waiting keeps the time its turn ended.
+  return ENDS.has(status) ? { ...next, endedAt: now } : next
+}
+
+// How an agent's turn ended for its order: `answer` with todos open leaves it unsettled.
+export function turnEvent(order: Pick<Order, 'todos'>, reason: string): OrderEvent {
+  if (reason !== 'answer') return 'turn-failed'
+  return openTodos(order).length > 0 ? 'turn-open' : 'turn-done'
+}
+
+const shortTodo = (text: string) => {
+  const line = text.replace(/\s+/g, ' ').trim()
+  return line.length > 40 ? `${line.slice(0, 39)}…` : line
+}
+
+// The line the main session gets when an order is left unsettled: which
+// todos are open (three at most) and what to do about it.
+export function unsettledLine(order: Order): string {
+  const open = openTodos(order)
+  const named = open.slice(0, 3).map(todo => shortTodo(todo.content))
+  const more = open.length > 3 ? `; +${open.length - 3} more` : ''
+  return `Council: ${order.id} ended with ${open.length} of ${order.todos.length} todos open (${named.join('; ')}${more}). Settle it with mcp__council__settle_order.`
+}
+
+// ── Settling, releasing, losing ───────────────────────────────────────────
+
+export const SETTLE_OUTCOMES = ['done', 'stopped-early', 'failed', 'waiting'] as const
+export type SettleOutcome = (typeof SETTLE_OUTCOMES)[number]
+export type Settlement = { id: string; outcome: SettleOutcome; note?: string }
+
+// The settle_order tool's input, checked.
+export function readSettlement(input: Record<string, unknown>): Settlement | { error: string } {
+  if (!isText(input.id)) return { error: 'Name the order to settle (e.g. "O3").' }
+  const outcome = SETTLE_OUTCOMES.find(candidate => candidate === input.outcome)
+  if (outcome === undefined) return { error: 'outcome is one of done, stopped-early, failed, waiting.' }
+  const note = isText(input.note) ? oneLine(input.note) : undefined
+  return { id: input.id.trim().toUpperCase(), outcome, ...(note ? { note } : {}) }
+}
+
+const SETTLED_TEXT: Record<SettleOutcome, string> = {
+  done: 'done',
+  'stopped-early': 'stopped early',
+  failed: 'failed',
+  waiting: 'waiting: a wake puts it back on the road, and it keeps its place',
+}
+
+// The main session settles an unsettled or waiting order; any other is refused, naming its status.
+export function settleOrder(orders: readonly Order[], settlement: Settlement, now: number): { orders: Order[]; message: string } | { error: string } {
+  const order = orders.find(candidate => candidate.id === settlement.id)
+  if (order === undefined) return { error: `No order ${settlement.id}.` }
+  const settled = moved(order, `settle-${settlement.outcome}`, now, settlement.note ? { note: settlement.note } : {})
+  if (settled === undefined) return { error: `${order.id} is ${order.status}; only an unsettled or waiting order can be settled.` }
+  const freed = holdsClaim(order) && !holdsClaim(settled) ? ` ${order.relFolder}/ is free.` : ''
+  return { orders: orders.map(candidate => (candidate.id === order.id ? settled : candidate)), message: `${order.id} settled as ${SETTLED_TEXT[settlement.outcome]}.${freed}` }
+}
+
+export const RELEASED_NOTE = 'released by the person'
+export const LOST_NOTE = 'its agent is gone'
+
+// `/council release <id>`: the person marks an unsettled or waiting order
+// lost, which frees its place. Its agent is left as it is.
+export function releaseOrder(orders: readonly Order[], id: string, now: number): { orders: Order[]; message: string } | { error: string } {
+  const wanted = id.trim().toUpperCase()
+  const order = orders.find(candidate => candidate.id === wanted)
+  if (order === undefined) return { error: wanted === '' ? 'Usage: /council release <order id>, e.g. /council release O3' : `No order ${wanted}.` }
+  const released = moved(order, 'release', now, { note: RELEASED_NOTE })
+  if (released === undefined) return { error: `${order.id} is ${order.status}; only an unsettled or waiting order can be released.` }
+  return { orders: orders.map(candidate => (candidate.id === order.id ? released : candidate)), message: `${order.id} is released as lost; ${order.relFolder}/ is free.` }
+}
+
+// An order whose agent the engine no longer lists at all (dispatched,
+// unsettled or waiting) becomes lost, so it never holds its place forever. An
+// agent listed in any status (running, waiting on a timer or a background
+// task, idle, even ended, which a message may yet resume) is not gone.
+// `live`: every listed agent id. The same array when nothing changes.
+export function withLostAgents(orders: readonly Order[], live: ReadonlySet<string>, now: number): readonly Order[] {
   let isChanged = false
   const next = orders.map((order): Order => {
-    if (order.status !== 'dispatched' || order.agentId === null || live.has(order.agentId)) return order
+    if (order.agentId === null || live.has(order.agentId)) return order
+    const lost = moved(order, 'gone', now, { note: LOST_NOTE })
+    if (lost === undefined) return order
     isChanged = true
-    return { ...order, status: 'failed', report: STALE_REPORT, endedAt: now }
+    return lost
   })
   return isChanged ? next : orders
+}
+
+// An agent woke: whether its order lets it. Allowed for an order on the road,
+// unsettled or waiting (it still holds its place), for a scout's, and for a
+// settled or lost knight order whose place is free (`clash` is undefined);
+// denied when another knight holds an overlapping place.
+export function wakeVerdict(order: Order, clash: { order: Order; place: Place } | undefined, reason?: string): { allow: true } | { deny: string } {
+  if (order.role === 'scout' || order.status === 'dispatched' || order.status === 'unsettled' || order.status === 'waiting' || clash === undefined) return { allow: true }
+  return { deny: `${order.id} is ${order.status} and ${clash.order.id} now holds ${reason ?? 'its place'}: the wake is refused.` }
 }
 
 // What the ruling tells Claude of its summons.
@@ -778,14 +936,22 @@ function summonsLines(summons: Ruling['summons']): string[] {
 
 export const WAKE_MARK = '[woke and went on]'
 
-// An order whose agent woke (a timer, a background task, a message): back on
-// the road, its earlier report kept for the next one to follow.
-export const withWoken = (order: Order): Order =>
-  order.status === 'dispatched' ? order : { ...order, status: 'dispatched', wakes: (order.wakes ?? 0) + 1, endedAt: null, isFolded: false }
-
 // The report after a wake: the earlier one, then the new; the tail kept when long.
 export function joinedReport(earlier: string, answer: string): string {
-  const before = earlier === STALE_REPORT ? '' : earlier.trim()
+  const before = earlier.trim()
   const joined = before === '' ? answer : answer === '' ? before : `${before}\n\n${WAKE_MARK}\n${answer}`
   return joined.length > 6000 ? `…${joined.slice(joined.length - 5999)}` : joined
+}
+
+export const SETTLE_ORDER_DESCRIPTION =
+  "Settle a council order whose agent ended its turn with todos open (unsettled), or one you settled as waiting: done (the work is complete), stopped-early (it stopped short; its place is freed), failed, or waiting (it ended its turn to wait for a timer or a background task and will wake; it keeps its place). A knight's place stays claimed until its order is settled as done, stopped-early or failed. Main session only."
+
+export const SETTLE_ORDER_SCHEMA = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: 'The order id, e.g. "O3".' },
+    outcome: { type: 'string', enum: [...SETTLE_OUTCOMES], description: 'How it ended.' },
+    note: { type: 'string', description: 'Optional: a short phrase on why, shown in the court.' },
+  },
+  required: ['id', 'outcome'],
 }

@@ -8,7 +8,7 @@ import type { ElementTable } from 'claude-code'
 import type { AdvisorReport, AdvisorRun, Council, Court, Order, Seat } from '../../types'
 import { seatsOf } from '../council'
 import { isAdvisorFinished } from '../advisors'
-import { currentTodo, isFinished, isFolded, levelLabel, progressOf } from '../court'
+import { currentTodo, isFinished, isFolded, levelLabel, openTodos, progressOf } from '../court'
 import { callsLabel } from '../tally'
 
 export type CourtViewProps = {
@@ -44,7 +44,7 @@ const newestFirst = (left: Order, right: Order) => orderNumber(right) - orderNum
 
 // The agent's report as plain text: markdown marks dropped, paragraphs kept.
 const reportText = (order: Order) =>
-  (order.report.trim() || (order.status === 'done' ? 'Back with no report.' : 'The agent stopped.'))
+  (order.report.trim() || (order.status === 'done' ? 'Back with no report.' : order.status === 'lost' ? 'Its agent is gone; no report.' : 'The agent stopped.'))
     .replace(/\*\*|__|`/g, '')
     .replace(/^#+\s*/gm, '')
     .replace(/\n{3,}/g, '\n\n')
@@ -77,11 +77,6 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
           {`forbids ${order.forbid.map(rule => (rule.ops.length === 3 ? rule.glob : `${rule.glob} (${rule.ops.join(', ')})`)).join(' · ')}`}
         </Text>
       )}
-      {order.warning && (
-        <Text key={`order-warning-${order.id}`} color="warning" wrap="wrap">
-          {`⚠ ${order.warning}`}
-        </Text>
-      )}
       {order.policy && order.policy.length > 0 && (
         <Text key={`order-policy-${order.id}`} dimColor wrap="truncate-end">
           {`rules: ${order.policy.join(' · ')}`}
@@ -89,6 +84,45 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
       )}
     </Box>
   )
+}
+
+// An order its agent left with todos open (unsettled), or one settled as
+// waiting for a wake: one line, then the open todos or the note; pressed, its
+// report so far. It still holds its place.
+function pausedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (id: string) => unknown) {
+  const { Box, Text, Button } = el
+  const open = openTodos(order)
+  const isUnsettled = order.status === 'unsettled'
+  const detail = isUnsettled ? `open: ${open.map(todo => todo.content).join(' · ')}` : (order.note ?? 'waiting for its agent to wake')
+  return (
+    <Box key={`order-${order.id}`} flexDirection="column">
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Box flexDirection="row" gap={1} flexShrink={1}>
+          <Text color="warning">{isUnsettled ? '◐' : '◷'}</Text>
+          <Button key={`order-toggle-${order.id}`} label={`${isOpen ? '▾' : '▸'} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`} plain onPress={() => onToggle(order.id)} />
+          <Text dimColor>{order.id}</Text>
+          <Text key={`order-level-${order.id}`} dimColor>{levelLabel(order)}</Text>
+        </Box>
+        <Text color="warning">{isUnsettled ? `unsettled · ${open.length} of ${order.todos.length} open` : 'waiting'}</Text>
+      </Box>
+      <Text key={`order-paused-${order.id}`} dimColor italic wrap="truncate-end">
+        {detail}
+      </Text>
+      {isOpen && (
+        <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor="warning">
+          <Text wrap="wrap">{reportText(order)}</Text>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+// How a finished order ended: its mark, color and, beside done and failed, a word.
+const ENDED: Record<string, { mark: string; color: string; word?: string }> = {
+  done: { mark: '✓', color: 'success' },
+  'stopped-early': { mark: '◑', color: 'warning', word: 'stopped early' },
+  failed: { mark: '✕', color: 'error' },
+  lost: { mark: '?', color: 'warning', word: 'lost' },
 }
 
 // An order that is back: one line with how it ended; pressed, its whole report.
@@ -110,20 +144,26 @@ function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: 
       </Box>
     )
   }
-  const isDone = order.status === 'done'
+  const ended = ENDED[order.status] ?? ENDED.failed!
   const calls = callsLabel(order.steps)
   return (
     <Box key={`order-${order.id}`} flexDirection="column">
       <Box flexDirection="row" gap={1}>
-        <Text color={isDone ? 'success' : 'error'}>{isDone ? '✓' : '✕'}</Text>
+        <Text color={ended.color}>{ended.mark}</Text>
         <Button key={`order-toggle-${order.id}`} label={`${isOpen ? '▾' : '▸'} ${ROLE_TITLE[order.role]} · ${order.relFolder}/`} plain onPress={() => onToggle(order.id)} />
         <Text dimColor>{order.id}</Text>
         <Text key={`order-level-${order.id}`} dimColor>{levelLabel(order)}</Text>
+        {ended.word && <Text key={`order-ended-${order.id}`} color={ended.color}>{ended.word}</Text>}
         {order.wakes !== undefined && <Text key={`order-woke-${order.id}`} color="warning">woke</Text>}
         {calls !== '' && <Text dimColor>{calls}</Text>}
       </Box>
+      {order.note && (
+        <Box paddingLeft={2}>
+          <Text key={`order-note-${order.id}`} dimColor italic wrap="truncate-end">{order.note}</Text>
+        </Box>
+      )}
       {isOpen && (
-        <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={isDone ? 'success' : 'error'}>
+        <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor={ended.color}>
           <Text wrap="wrap">{reportText(order)}</Text>
         </Box>
       )}
@@ -188,8 +228,11 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
   const { Box, Text, Button } = el
   const { court, council } = props
   const lastRuling = court.rulings[court.rulings.length - 1]
-  // On the road (working, then waiting), back home, and the archive: each newest first.
-  const active = court.orders.filter(order => !isFinished(order)).sort((left, right) => (left.status === right.status ? newestFirst(left, right) : left.status === 'dispatched' ? -1 : 1))
+  // On the road (working, then waiting), paused (unsettled or waiting to
+  // wake), back home, and the archive: each newest first.
+  const isPaused = (order: Order) => order.status === 'unsettled' || order.status === 'waiting'
+  const active = court.orders.filter(order => !isFinished(order) && !isPaused(order)).sort((left, right) => (left.status === right.status ? newestFirst(left, right) : left.status === 'dispatched' ? -1 : 1))
+  const paused = court.orders.filter(isPaused).sort((left, right) => (left.status === right.status ? newestFirst(left, right) : left.status === 'unsettled' ? -1 : 1))
   const home = court.orders.filter(order => isFinished(order) && !isFolded(order)).sort(newestFirst)
   const archived = court.orders.filter(order => isFolded(order)).sort(newestFirst)
   // Advisors not yet folded away, newest first.
@@ -269,6 +312,7 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
       )}
       {advisors.length > 0 && section(el, 'section-advisors', `Advisors · ${advisors.length}`, advisors.map(run => advisorRow(el, run, props.openOrderId === run.id, props.onToggleOrder)))}
       {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road)))}
+      {paused.length > 0 && section(el, 'section-paused', `Paused · ${paused.length}`, paused.map(order => pausedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
       {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
       {archived.length > 0 && (
         <Box flexDirection="column" rowGap={1} marginTop={1}>

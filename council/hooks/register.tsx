@@ -112,18 +112,29 @@ import {
   withArbiterReview,
   CONDITION_AT,
   REFUSE_AT,
-  STALE_REPORT,
+  SETTLE_ORDER_DESCRIPTION,
+  SETTLE_ORDER_SCHEMA,
+  claimHolderText,
   clashReason,
+  holdsClaim,
   knightClash,
+  moved,
+  readSettlement,
+  releaseOrder,
+  settleOrder,
+  turnEvent,
+  unsettledLine,
+  wakeVerdict,
+  nextStatus,
   levelOf,
   orderAsk,
   orderLevels,
   relativeFolder,
   repoCandidates,
   setOrderLevel,
-  withStaleReleased,
-  withWoken,
+  withLostAgents,
   joinedReport,
+  type OrderEvent,
   type ArbiterDecision,
   type Place,
   type Proposal,
@@ -1117,12 +1128,12 @@ async function placeOf($: EngineInterface, folder: string): Promise<Place> {
   return { folder, repo: await repoOf($, folder) }
 }
 
-// The knights at work now, each with its place.
+// The knights holding a place now (dispatched, unsettled or waiting), each with its place.
 async function workingKnights($: EngineInterface, orders: readonly Order[]): Promise<Array<{ order: Order; place: Place }>> {
-  return Promise.all(orders.filter(order => order.role === 'knight' && order.status === 'dispatched').map(async order => ({ order, place: await placeOf($, order.folder) })))
+  return Promise.all(orders.filter(holdsClaim).map(async order => ({ order, place: await placeOf($, order.folder) })))
 }
 
-// A proposal's knight that would work where a dispatched knight works now:
+// A proposal's knight that would work where a knight holds its place now:
 // refused before the council sits. Knights within one proposal, or beside
 // orders only approved, are not refused here: the dispatch check holds them
 // to one at a time.
@@ -1136,7 +1147,7 @@ async function proposalClash($: EngineInterface, proposal: Proposal, root: strin
     const place = await placeOf($, joinUnder(root, dispatch.folder))
     const clash = knightClash(place, working)
     if (clash !== undefined) {
-      return `Dispatch ${index + 1} (a knight in ${dispatch.folder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, a knight still at work in ${clash.order.relFolder}/. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then propose again (knights one after another in one repository are fine).`
+      return `Dispatch ${index + 1} (a knight in ${dispatch.folder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, ${claimHolderText(clash.order)}. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then propose again (knights one after another in one repository are fine).`
     }
   }
   return undefined
@@ -1163,19 +1174,20 @@ async function listedAgents($: EngineInterface): Promise<Set<string> | undefined
 }
 
 // Orders approved long ago and never dispatched expire: withdrawn as
-// "expired" (court.ts withExpired). A dispatched order (or a running advisor)
-// whose agent the engine no longer lists is released as failed. Run wherever
-// the court is looked at or acted on, so no timer is needed (the agent list
-// is read only while an agent is out).
+// "expired" (court.ts withExpired). A dispatched, unsettled or waiting order
+// whose agent the engine no longer lists becomes lost (court.ts
+// withLostAgents), and a running advisor whose agent is gone fails. Run
+// wherever the court is looked at or acted on, so no timer is needed (the
+// agent list is read only while an agent is out).
 async function expireOrders($: EngineInterface): Promise<void> {
   const [now, court] = await Promise.all([$.clock.now(), read($, courtAtom)])
-  const hasAgents = court.orders.some(order => order.status === 'dispatched' && order.agentId !== null) || (court.advisors ?? []).some(run => run.status === 'running' && run.agentId !== null)
+  const hasAgents = court.orders.some(order => order.agentId !== null && nextStatus(order.status, 'gone') !== undefined) || (court.advisors ?? []).some(run => run.status === 'running' && run.agentId !== null)
   let listed: Set<string> | undefined
   if (hasAgents) listed = await listedAgents($)
-  // A knight whose spawn is under way has no agent id yet, and is never released.
+  // A knight whose spawn is under way has no agent id yet, and is never lost.
   const release = (current: Court): Court => {
     const orders = withExpired(current.orders, now)
-    const released = listed === undefined ? orders : withStaleReleased(orders, listed, now)
+    const released = listed === undefined ? orders : withLostAgents(orders, listed, now)
     const advisors = listed === undefined || current.advisors === undefined ? current.advisors : withStaleAdvisors(current.advisors, listed, now)
     return released === current.orders && advisors === current.advisors ? current : { ...current, orders: [...released], ...(advisors ? { advisors: [...advisors] } : {}) }
   }
@@ -1258,7 +1270,7 @@ async function dispatchOrder($: EngineInterface, e: { subagentType: string; desc
       const place = await placeOf($, order.folder)
       const clash = knightClash(place, working, order.id)
       if (clash !== undefined) {
-        return `${order.id} (a knight in ${order.relFolder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, a knight still at work in ${clash.order.relFolder}/. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then dispatch ${order.id}.`
+        return `${order.id} (a knight in ${order.relFolder}/) would work in ${clashReason(place, clash.place)} as ${clash.order.id}, ${claimHolderText(clash.order)}. Two knights never work in overlapping places at once: wait for ${clash.order.id} to finish, then dispatch ${order.id}.`
       }
       startingKnights.set(order.id, order)
       return undefined
@@ -1300,24 +1312,65 @@ async function followAgentCall($: EngineInterface, agentId: string, tool: string
   return { order }
 }
 
-// The order an agent's last answer belongs to: the one it carries, or one
-// released as gone that turns out not to be.
-const isReportedBy = (order: Order, agentId: string) => order.agentId === agentId && (order.status === 'dispatched' || (order.status === 'failed' && order.report === STALE_REPORT))
-
-async function finishOrder($: EngineInterface, agentId: string, answer: string, isFailed: boolean): Promise<void> {
-  const court = await read($, courtAtom)
-  const order = court.orders.find(candidate => isReportedBy(candidate, agentId))
-  if (order === undefined) return
+// Moves one order through the lifecycle (court.ts moved), inside the update;
+// the order as moved, or undefined when the table refused the event (its
+// status changed meanwhile) or there is no such order.
+async function moveOrder($: EngineInterface, id: string, event: OrderEvent, fields: Parameters<typeof moved>[3] = {}): Promise<Order | undefined> {
   const now = await $.clock.now()
+  let result: Order | undefined
+  await update($, courtAtom, current => {
+    result = undefined
+    const order = current.orders.find(candidate => candidate.id === id)
+    const next = order === undefined ? undefined : moved(order, event, now, fields)
+    if (next === undefined) return current
+    result = next
+    return { ...current, orders: current.orders.map(candidate => (candidate.id === id ? next : candidate)) }
+  })
+  return result
+}
+
+// A line for the main session: appended to its conversation as a row the
+// model reads on its loop's next request (hidden from the person), or, when
+// that is refused, kept for the person's next prompt.
+async function tellMain($: EngineInterface, line: string): Promise<void> {
+  const appended = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: line }] } }).catch(() => undefined)
+  if (appended !== undefined && appended.deny === undefined) return
+  await update($, courtAtom, current => ({ ...current, notices: [...(current.notices ?? []).slice(-9), line] }))
+}
+
+// The lines kept for the person's next prompt, taken once.
+async function takeNotices($: EngineInterface): Promise<string[]> {
+  const notices = (await read($, courtAtom)).notices ?? []
+  if (notices.length === 0) return []
+  await update($, courtAtom, current => {
+    const { notices: _taken, ...rest } = current
+    return rest
+  })
+  return notices
+}
+
+const ENDINGS: Partial<Record<Order['status'], string>> = { done: 'is back from', unsettled: 'paused with todos open in', failed: 'fell in' }
+
+// An agent's turn ended: its order is done (every todo checked off, or none
+// listed), unsettled (todos open: the main session is told, and settles it),
+// or failed (the turn ended other than by answering). A lost order's late
+// answer is kept as its report; its status stays.
+async function finishOrder($: EngineInterface, agentId: string, answer: string, reason: string): Promise<void> {
+  const court = await read($, courtAtom)
+  const order = court.orders.find(candidate => candidate.agentId === agentId && (candidate.status === 'dispatched' || candidate.status === 'lost'))
+  if (order === undefined) return
   // The whole report (it opens in full in the court), line breaks kept; after a
   // wake, the earlier report comes first.
   const answered = answer.replace(/\n{3,}/g, '\n\n').trim().slice(0, 6000)
-  await updateOrder(
-    $,
-    candidate => candidate.id === order.id,
-    current => ({ ...current, status: isFailed ? 'failed' : 'done', report: joinedReport(current.wakes !== undefined || current.report === STALE_REPORT ? current.report : '', answered), endedAt: now }),
-  )
-  $.ui.toast(`${order.id}: the ${order.role} (L${levelOf(order)}) ${isFailed ? 'fell in' : 'is back from'} ${order.relFolder}/.`)
+  const report = joinedReport(order.wakes !== undefined || order.status === 'lost' ? order.report : '', answered)
+  if (order.status === 'lost') {
+    await updateOrder($, candidate => candidate.id === order.id, current => ({ ...current, report }))
+    return
+  }
+  const finished = await moveOrder($, order.id, turnEvent(order, reason), { report })
+  if (finished === undefined) return
+  $.ui.toast(`${order.id}: the ${order.role} (L${levelOf(order)}) ${ENDINGS[finished.status] ?? 'is back from'} ${order.relFolder}/.`)
+  if (finished.status === 'unsettled') await tellMain($, unsettledLine(finished))
 }
 
 // The effort a council agent's request runs at, or undefined for any other
@@ -1346,34 +1399,67 @@ async function levelCommand($: EngineInterface, id: string, value: string): Prom
 // What an order's level runs on (settings scoutLevels, knightLevels).
 const levelSetting = (order: Order): ModelEffort => (order.role === 'knight' ? settings.knightLevels : settings.scoutLevels)[levelOf(order) - 1]!
 
-// An agent woke (a timer, a background task, a message): its order, done or
-// failed when it ended its turn to wait, goes back on the road. Never refused:
-// a denied wake leaves its agent parked for good. A knight that wakes while
-// another knight works in an overlapping place goes on too, with a warning on
-// both orders.
-async function wakeOrder($: EngineInterface, agentId: string): Promise<void> {
-  const court = await read($, courtAtom)
-  const order = court.orders.find(candidate => candidate.agentId === agentId)
-  if (order === undefined) return
-  if (order.effort !== undefined) stepEfforts.set(agentId, order.effort)
-  if (order.status === 'dispatched') return
-  let warning: string | undefined
-  let clashId: string | undefined
-  if (order.role === 'knight') {
-    const place = await placeOf($, order.folder)
-    const clash = knightClash(place, await workingKnights($, court.orders), order.id)
-    if (clash !== undefined) {
-      clashId = clash.order.id
-      warning = `${order.id} woke while ${clash.order.id} works in ${clashReason(place, clash.place)}`
-    }
+// An agent woke (a timer, a background task, a message). With no order behind
+// it, or an order on the road, nothing changes. An unsettled or waiting order
+// still holds its place, so it goes back on the road; so does a scout's. A
+// settled or lost knight order goes back only while its place is free:
+// otherwise the wake is denied (which parks the agent) and the person is told
+// why. Knight wakes are checked in the dispatch queue, so a wake and a
+// dispatch can't both take one place.
+async function wakeOrder($: EngineInterface, agentId: string): Promise<{ deny: string } | undefined> {
+  const found = (await read($, courtAtom)).orders.find(candidate => candidate.agentId === agentId)
+  if (found === undefined) return undefined
+  if (found.effort !== undefined) stepEfforts.set(agentId, found.effort)
+  if (found.status === 'dispatched') return undefined
+  const needsClaim = found.role === 'knight' && !holdsClaim(found)
+  if (!needsClaim) {
+    await moveOrder($, found.id, 'wake')
+    return undefined
   }
-  await update($, courtAtom, current => ({
-    ...current,
-    orders: current.orders.map(candidate =>
-      candidate.id === order.id ? { ...withWoken(candidate), ...(warning ? { warning } : {}) } : candidate.id === clashId && warning ? { ...candidate, warning } : candidate,
-    ),
-  }))
-  if (warning) $.ui.toast(`Council: ${warning}; both go on.`)
+  // Holders whose agent is gone are lost first, so a stale claim never parks this one.
+  await expireOrders($)
+  return oneAtATime(async () => {
+    const orders = (await read($, courtAtom)).orders
+    const order = orders.find(candidate => candidate.id === found.id) ?? found
+    const place = await placeOf($, order.folder)
+    const starting = await Promise.all([...startingKnights.values()].map(async other => ({ order: { ...other, status: 'dispatched' as const }, place: await placeOf($, other.folder) })))
+    const clash = knightClash(place, [...(await workingKnights($, orders)), ...starting], order.id)
+    const verdict = wakeVerdict(order, clash, clash === undefined ? undefined : clashReason(place, clash.place))
+    if ('deny' in verdict) {
+      $.ui.toast(`Council: ${verdict.deny} Its agent stays parked.`)
+      return verdict
+    }
+    await moveOrder($, order.id, 'wake')
+    return undefined
+  })
+}
+
+// The settle_order tool: the main session says how an unsettled or waiting order ended.
+async function settleOrderTool($: EngineInterface, input: Record<string, unknown>): Promise<string> {
+  const settlement = readSettlement(input)
+  if ('error' in settlement) return settlement.error
+  await expireOrders($)
+  const now = await $.clock.now()
+  const outcome = settleOrder((await read($, courtAtom)).orders, settlement, now)
+  if ('error' in outcome) return outcome.error
+  await update($, courtAtom, current => {
+    const again = settleOrder(current.orders, settlement, now)
+    return 'error' in again ? current : { ...current, orders: again.orders }
+  })
+  return outcome.message
+}
+
+// `/council release <order>`: the person marks an unsettled or waiting order lost, freeing its place.
+async function releaseCommand($: EngineInterface, id: string): Promise<string> {
+  await expireOrders($)
+  const now = await $.clock.now()
+  const outcome = releaseOrder((await read($, courtAtom)).orders, id, now)
+  if ('error' in outcome) return outcome.error
+  await update($, courtAtom, current => {
+    const again = releaseOrder(current.orders, id, now)
+    return 'error' in again ? current : { ...current, orders: again.orders }
+  })
+  return outcome.message
 }
 
 async function setCourtSession($: EngineInterface, isInSession: boolean): Promise<void> {
@@ -1421,7 +1507,7 @@ async function courtCommand($: EngineInterface, action: string): Promise<string>
     return action === 'on' ? 'Court mode is on: your prompts go to the council before Claude, and work is dispatched through approved orders.' : 'Court mode is off.'
   }
   if (action === 'clear') {
-    await update($, courtAtom, court => ({ ...court, orders: court.orders.filter(order => order.status === 'approved' || order.status === 'dispatched'), advisors: (court.advisors ?? []).filter(run => !isAdvisorFinished(run)) }))
+    await update($, courtAtom, court => ({ ...court, orders: court.orders.filter(order => !isFinished(order)), advisors: (court.advisors ?? []).filter(run => !isAdvisorFinished(run)) }))
     return 'Finished orders cleared.'
   }
   await update($, isChamberShownAtom, () => false)
@@ -1559,6 +1645,7 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   // The advisor agent and order levels are the person's alone.
   if (action === 'advise') return isPersonOrigin(origin) ? adviseCommand($, trimmed.replace(/^advise\b/, '')) : "Only the person can send the council's advisor: type /council advise at the prompt."
   if (action === 'level' && /^O\d+$/i.test(target) && words.length === 1) return isPersonOrigin(origin) ? levelCommand($, target, words[0]!) : "Only the person can change an order's level: type /council level at the prompt."
+  if (action === 'release' && (target === '' || /^O\d+$/i.test(target)) && words.length === 0) return isPersonOrigin(origin) ? releaseCommand($, target) : 'Only the person can release an order: type /council release at the prompt.'
   if (action === 'show' && isAlone) {
     if ((await read($, councilAtom)) === null) return 'The council has not convened. /council <topic> to summon it.'
     await openCouncilPane($)
@@ -1593,7 +1680,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|report|members|lessons|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|release <order>|report|members|lessons|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)
@@ -1604,6 +1691,7 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     await $.tool.register({ name: 'withdraw_orders', description: WITHDRAW_ORDERS_DESCRIPTION, inputSchema: WITHDRAW_ORDERS_SCHEMA, isDeferred: false })
+    await $.tool.register({ name: 'settle_order', description: SETTLE_ORDER_DESCRIPTION, inputSchema: SETTLE_ORDER_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'progress', description: PROGRESS_DESCRIPTION, inputSchema: PROGRESS_SCHEMA, isDeferred: false })
     await $.tool.register({ name: 'consult', description: CONSULT_DESCRIPTION, inputSchema: CONSULT_SCHEMA, isDeferred: false })
     return result
@@ -1622,6 +1710,7 @@ export const register: Register = (on, options) => {
   on('tool.check', { tool: 'mcp__council__propose_orders' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__progress' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__withdraw_orders' }, () => ({ decision: 'allow' as const }))
+  on('tool.check', { tool: 'mcp__council__settle_order' }, () => ({ decision: 'allow' as const }))
   on('tool.check', { tool: 'mcp__council__consult' }, () => ({ decision: 'allow' as const }))
 
   // Convening the council is the main session's call: a subagent can't put
@@ -1642,18 +1731,24 @@ export const register: Register = (on, options) => {
     e.agentId !== undefined ? { deny: 'Council scouts and knights cannot withdraw orders; report to Claude instead.' } : { result: await withdrawOrdersTool($, e as unknown as Record<string, unknown>) },
   ).catch(() => ({ deny: 'The council could not withdraw the orders; try again.' }))
 
+  // Settling is the main session's call: an agent can't settle its own order.
+  on('tool.call', { tool: 'mcp__council__settle_order' }, async ($, e) =>
+    e.agentId !== undefined ? { deny: 'Only the main session settles orders; report to Claude instead.' } : { result: await settleOrderTool($, e as unknown as Record<string, unknown>) },
+  ).catch(() => ({ deny: 'The council could not settle the order; try again.' }))
+
   // The advisor is never offered to the model: only the plugin starts it.
   on('agent.offer', { agent: 'council:advisor' }, () => ({ isOffered: false }))
 
   // Every dispatch: council agents carry an approved order, on their level's
   // model; the advisor only when the plugin started it; in court mode,
-  // nothing else is dispatched. A wake is never refused.
+  // nothing else is dispatched. A wake is refused only for a settled knight
+  // order whose place another knight now holds.
   on('agent.spawn', async ($, e, next) => {
     // An agent waking (a timer, a background task, a message) continues under
-    // its own id; the engine ignores a rewrite, and a deny would park it for good.
+    // its own id; the engine ignores a rewrite, and a deny parks it.
     if (e.resume !== undefined) {
-      await wakeOrder($, e.resume.agentId).catch(() => undefined)
-      return next(e)
+      const refusal = await wakeOrder($, e.resume.agentId)
+      return refusal ?? next(e)
     }
     if (spawnTypeOf(e) === ADVISOR_TYPE) {
       const token = TOKEN_LINE.exec(e.prompt)?.[1]
@@ -1672,14 +1767,14 @@ export const register: Register = (on, options) => {
       const result = await next({ ...e, prompt: outcome.prompt, description: outcome.description, model: level.model })
       if (result.agentId !== undefined) {
         stepEfforts.set(result.agentId, level.effort)
-        const now = await $.clock.now()
-        await updateOrder($, order => order.id === outcome.order.id, order => ({ ...order, status: 'dispatched', agentId: result.agentId ?? null, startedAt: now, effort: level.effort }))
+        await moveOrder($, outcome.order.id, 'spawn', { agentId: result.agentId, model: level.model, effort: level.effort })
       }
       return result
     } finally {
       startingKnights.delete(outcome.order.id)
     }
   }).catch(($, e, next) =>
+    // A wake whose check failed goes on: a deny would park it on a fault of ours.
     next.called || e.resume !== undefined
       ? next(e)
       : spawnTypeOf(e) === ADVISOR_TYPE
@@ -1727,10 +1822,9 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined) {
-      const isFailed = e.reason !== 'answer'
       const answer = 'answer' in e ? e.answer : ''
-      await finishOrder($, e.agentId, answer, isFailed).catch(() => undefined)
-      await finishAdvisorAgent($, e.agentId, answer, isFailed).catch(() => undefined)
+      await finishOrder($, e.agentId, answer, e.reason).catch(() => undefined)
+      await finishAdvisorAgent($, e.agentId, answer, e.reason !== 'answer').catch(() => undefined)
     }
     return result
   })
@@ -1749,7 +1843,7 @@ export const register: Register = (on, options) => {
       await update($, courtAtom, current => ({ ...current, orders: withFinishedFolded(current.orders), ...(current.advisors ? { advisors: current.advisors.map(run => (isFoldable(run) ? { ...run, isFolded: true } : run)) } : {}) }))
     }
     if (e.text.trim().startsWith('/')) return next(e)
-    const reports = await takeAdvisorReports($).catch(() => [])
+    const reports = [...(await takeNotices($).catch(() => [])), ...(await takeAdvisorReports($).catch(() => []))]
     const withReports = reports.length > 0 ? { ...e, context: [...(e.context ?? []), ...reports] } : e
     const court = await read($, courtAtom)
     if (!court.isInSession) return next(withReports)

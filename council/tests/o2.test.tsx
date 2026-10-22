@@ -1,7 +1,8 @@
-// Knight overlap, releasing gone agents, levels, the advisor agent, council
-// summons, and wakes (resumed agents), through the hooks.
+// Knight overlap, lost agents, levels, the advisor agent, council summons,
+// and the order lifecycle (unsettled orders, settling, releasing, wakes),
+// through the hooks.
 
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -55,6 +56,12 @@ const cmdText = (result: { text?: unknown }) => String(result.text)
 const text = (result: unknown) => String((result as { result?: unknown }).result ?? (result as { deny?: unknown }).deny)
 const spawn = ($: Engine, subagentType: string, description: string, extra: Record<string, unknown> = {}) => $.agent.spawn({ subagentType, description, prompt: 'Do the work.', ...extra } as never) as Promise<{ deny?: string; agentId?: string }>
 const finish = ($: Engine, agentId: string, answer: string) => $.turn.complete({ answer, durationMs: 1, isAborted: false, turnId: 't', agentId, reason: 'answer' } as never)
+// The agent checks off its one todo ("Do it"), then answers: its order is done.
+const finishAll = async ($: Engine, agentId: string, answer: string) => {
+  await $.tool.call({ tool: 'mcp__council__progress', agentId, todos: [{ content: 'Do it', status: 'completed', activeForm: 'Doing it' }] } as never)
+  return finish($, agentId, answer)
+}
+const settleOrder = ($: Engine, input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__council__settle_order', ...input } as never)
 const mountPane = ($: Engine, surface: 'desktop' | 'terminal' = 'terminal') => $.ui.mount({ plugin: 'council', surface, component: 'Pane', requestId: 'council-chamber', props: PANE })
 const step = async ($: Engine, agentId: string | undefined, effort?: string) => {
   const stream = $.turn.step({ turnId: 't', index: 0, model: 'sonnet', messageCount: 1, ...(effort ? { effort } : {}), ...(agentId ? { agentId } : {}) } as never)
@@ -91,7 +98,7 @@ test('knights in one repository go one after another: the second waits, scouts a
   expect((await spawn($, 'council:scout', 'O3 repo1 b')).agentId).toBeDefined()
   expect((await spawn($, 'council:knight', 'O4 repo2')).agentId).toBeDefined()
   // Once O1 is back, O2 may go.
-  await finish($, 'agent-1', 'Done in a.')
+  await finishAll($, 'agent-1', 'Done in a.')
   expect((await spawn($, 'council:knight', 'O2 repo1 b')).agentId).toBeDefined()
   expect(harness.spawned.filter(entry => entry.subagentType === 'council:knight').length).toBe(3)
 })
@@ -127,7 +134,7 @@ test('a proposal whose knight would clash with one at work is refused before the
 
 // ── Releasing orders whose agent is gone ──────────────────────────────────
 
-test('a dispatched order whose agent is gone is released as failed; a waiting or idle one is not', async ($, on) => {
+test('a dispatched order whose agent is gone is lost; a waiting or idle one is not', async ($, on) => {
   const harness = standIn(on)
   await start($)
   await propose($, 'Two knights.', [{ folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }, { folder: 'web', role: 'knight' }])
@@ -145,14 +152,15 @@ test('a dispatched order whose agent is gone is released as failed; a waiting or
   expect((await spawn($, 'council:knight', 'O2 api')).agentId).toBeDefined()
   const pane = await mountPane($)
   expect(await pane.find({ text: /On the road · 2/ })).toBeDefined()
-  await pane.press({ key: 'order-toggle-O1' })
-  expect(await pane.find({ text: /^agent ended without reporting$/ })).toBeDefined()
+  expect(await pane.find({ text: /^lost$/ })).toBeDefined()
+  expect(await pane.find({ text: /^its agent is gone$/ })).toBeDefined()
   await pane.unmount()
-  // Its last answer, should it still come, replaces the note.
+  // Its last answer, should it still come, is kept as its report; it stays lost.
   await finish($, 'agent-1', 'Finished after all.')
-  // (Its report is still open from before.)
   const again = await mountPane($)
+  await again.press({ key: 'order-toggle-O1' })
   expect(await again.find({ text: /^Finished after all\.$/ })).toBeDefined()
+  expect(await again.find({ text: /^lost$/ })).toBeDefined()
   await again.unmount()
 })
 
@@ -349,28 +357,110 @@ test('an advisor that does not report in time leaves the council to rule on its 
   await pane.unmount()
 })
 
-// ── Wakes: a resumed agent is never refused ───────────────────────────────
+// ── The order lifecycle: unsettled orders, settling, releasing, wakes ─────
 
-test('an agent that wakes after reporting reopens its order and goes on; its reports are joined', async ($, on) => {
+// The lines the plugin added to the main conversation.
+const mainLines = (session: { appended: () => ReadonlyArray<{ agentId?: string; door: string; message: { content: unknown[] } }> }) =>
+  session.appended().filter(row => row.agentId === undefined && row.door === 'note').map(row => String((row.message.content[0] as { text?: unknown }).text))
+
+test('an agent that ends with todos open leaves its order unsettled: it keeps its place and Claude is told', async ($, on) => {
   const harness = standIn(on)
+  const session = mock.session(on)
   await start($)
-  await propose($, 'Run the long tests.', [{ folder: 'api', role: 'knight' }])
+  await propose($, 'Two in api.', [{ folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }])
   await spawn($, 'council:knight', 'O1 api')
   await finish($, 'agent-1', 'Started the hour-long tests; waiting.')
+  expect(mainLines(session)).toEqual(['Council: O1 ended with 1 of 1 todos open (Do it). Settle it with mcp__council__settle_order.'])
+  expect(harness.toasts.some(toast => toast.includes('O1: the knight (L2) paused with todos open in api/'))).toBe(true)
+  let pane = await mountPane($)
+  expect(await pane.find({ text: /Paused · 1/ })).toBeDefined()
+  expect(await pane.find({ text: /^unsettled · 1 of 1 open$/ })).toBeDefined()
+  expect(await pane.find({ text: /^open: Do it$/ })).toBeDefined()
+  await pane.unmount()
+  // It still holds api/.
+  expect((await spawn($, 'council:knight', 'O2 api')).deny).toContain('ended with todos open (settle it with mcp__council__settle_order)')
+  // Only the main session settles, and only an unsettled or waiting order.
+  expect(text(await settleOrder($, { id: 'O1', outcome: 'done', agentId: 'agent-1' }))).toContain('Only the main session settles orders')
+  expect(text(await settleOrder($, { id: 'O2', outcome: 'done' }))).toBe('O2 is approved; only an unsettled or waiting order can be settled.')
+  expect(text(await settleOrder($, { id: 'O1', outcome: 'waiting', note: 'tests run for an hour' }))).toContain('O1 settled as waiting')
+  pane = await mountPane($)
+  expect(await pane.find({ text: /^waiting$/ })).toBeDefined()
+  expect(await pane.find({ text: /^tests run for an hour$/ })).toBeDefined()
+  await pane.unmount()
+  expect((await spawn($, 'council:knight', 'O2 api')).deny).toContain('waiting to wake')
+  // Its wake always goes through: it goes back on the road, and its report follows the earlier one.
   const woke = await spawn($, 'council:knight', 'wake', { prompt: '', resume: { agentId: 'agent-1' } })
   expect(woke.deny).toBeUndefined()
   expect(woke.agentId).toBe('agent-1')
-  let pane = await mountPane($)
-  expect(await pane.find({ text: /On the road · 1/ })).toBeDefined()
+  pane = await mountPane($)
+  expect(await pane.find({ text: /On the road · 2/ })).toBeDefined()
   expect(await pane.find({ text: /^woke$/ })).toBeDefined()
   await pane.unmount()
-  // Its effort applies after the wake too.
   await step($, 'agent-1', 'low')
   expect(harness.steps[0]!.effort).toBe('low')
-  await finish($, 'agent-1', 'All 40 tests pass.')
+  await finishAll($, 'agent-1', 'All 40 tests pass.')
+  // Every todo done: done at once, nothing to settle, and the place is free.
+  expect(mainLines(session).length).toBe(1)
   pane = await mountPane($)
   await pane.press({ key: 'order-toggle-O1' })
   expect(await pane.find({ text: /Started the hour-long tests; waiting\.\n\n\[woke and went on\]\nAll 40 tests pass\./ })).toBeDefined()
+  await pane.unmount()
+  expect((await spawn($, 'council:knight', 'O2 api')).agentId).toBeDefined()
+})
+
+test('settling as done, stopped early or failed frees the place; a turn that fails is failed', async ($, on) => {
+  standIn(on)
+  await start($)
+  await propose($, 'Three in api.', [{ folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }])
+  await spawn($, 'council:knight', 'O1 api')
+  await finish($, 'agent-1', 'Ran out of room.')
+  expect(text(await settleOrder($, { id: 'o1', outcome: 'stopped-early', note: 'context full' }))).toBe('O1 settled as stopped early. api/ is free.')
+  expect(text(await settleOrder($, { id: 'O1', outcome: 'done' }))).toBe('O1 is stopped-early; only an unsettled or waiting order can be settled.')
+  await spawn($, 'council:knight', 'O2 api')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't', agentId: 'agent-2', reason: 'aborted' } as never)
+  expect((await spawn($, 'council:knight', 'O3 api')).agentId).toBeDefined()
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /^stopped early$/ })).toBeDefined()
+  expect(await pane.find({ text: /^context full$/ })).toBeDefined()
+  expect(await pane.find({ text: /✕/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('/council release marks an unsettled order lost and frees its place; only the person can', async ($, on) => {
+  standIn(on)
+  await start($)
+  await propose($, 'Two in api.', [{ folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }])
+  await spawn($, 'council:knight', 'O1 api')
+  await finish($, 'agent-1', 'Stuck.')
+  expect(cmdText(await $.command.run(notPerson('release O1')))).toContain('Only the person can release an order')
+  expect(cmdText(await $.command.run(person('release O2')))).toBe('O2 is approved; only an unsettled or waiting order can be released.')
+  expect(cmdText(await $.command.run(person('release O1')))).toBe('O1 is released as lost; api/ is free.')
+  expect((await spawn($, 'council:knight', 'O2 api')).agentId).toBe('agent-2')
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /^released by the person$/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('a settled knight wakes only while its place is free; otherwise the wake is refused and you are told why', async ($, on) => {
+  const harness = standIn(on)
+  await start($)
+  await propose($, 'Two in api, a look in web.', [{ folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }, { folder: 'web', role: 'scout' }])
+  await spawn($, 'council:knight', 'O1 api')
+  await finishAll($, 'agent-1', 'Done.')
+  // Its place is free: the wake goes through.
+  expect((await spawn($, 'council:knight', 'wake', { prompt: '', resume: { agentId: 'agent-1' } })).agentId).toBe('agent-1')
+  await finishAll($, 'agent-1', 'Still done.')
+  await spawn($, 'council:knight', 'O2 api')
+  // Now O2 holds api/: O1's wake is refused, which parks its agent.
+  const refused = await spawn($, 'council:knight', 'wake', { prompt: '', resume: { agentId: 'agent-1' } })
+  expect(refused.deny).toBe('O1 is done and O2 now holds the same folder: the wake is refused.')
+  expect(harness.toasts.some(toast => toast.includes('O1 is done and O2 now holds the same folder') && toast.includes('stays parked'))).toBe(true)
+  // A scout holds no place: its wake always goes through.
+  await spawn($, 'council:scout', 'O3 web')
+  await finishAll($, 'agent-3', 'Looked.')
+  expect((await spawn($, 'council:scout', 'wake', { prompt: '', resume: { agentId: 'agent-3' } })).agentId).toBe('agent-3')
+  const pane = await mountPane($)
+  expect(await pane.find({ text: /⚠/ })).toBeUndefined()
   await pane.unmount()
 })
 
@@ -383,18 +473,72 @@ test('a wake with no order behind it is allowed, and court mode never refuses a 
   expect((await spawn($, 'general-purpose', 'wake', { prompt: '', resume: { agentId: 'helper-1' } })).agentId).toBe('helper-1')
 })
 
-test('a knight that wakes while another works in its place goes on, with a warning on both', async ($, on) => {
-  const harness = standIn(on)
+test('when the line cannot be added to the conversation, it goes beside your next message', async ($, on) => {
+  standIn(on)
+  on('session.append', () => ({ deny: 'not here' }) as never)
   await start($)
-  await propose($, 'Two in api.', [{ folder: 'api', role: 'knight' }, { folder: 'api', role: 'knight' }])
+  await propose($, 'Work in api.', [{ folder: 'api', role: 'knight' }])
   await spawn($, 'council:knight', 'O1 api')
-  await finish($, 'agent-1', 'Waiting on CI.')
-  await spawn($, 'council:knight', 'O2 api')
+  await finish($, 'agent-1', 'Paused.')
+  const first = (await $.prompt.submit({ text: 'Go on.', origin: { kind: 'composer' } } as never)) as { context?: string[] }
+  expect(first.context ?? []).toContain('Council: O1 ended with 1 of 1 todos open (Do it). Settle it with mcp__council__settle_order.')
+  const second = (await $.prompt.submit({ text: 'And?', origin: { kind: 'composer' } } as never)) as { context?: string[] }
+  expect((second.context ?? []).join('\n')).not.toContain('Council: O1')
+})
+
+// ── A reload: the module starts over, the court in $.state stays ──────────
+
+// Each test loads the plugin afresh (its module variables start empty), so a
+// reload is two tests: the first saves the court as the plugin wrote it, the
+// second loads the plugin over that saved court.
+let savedCourt: unknown
+
+// Records the court as the plugin writes it; given `saved`, a fresh module
+// reads that court (saved before) until the plugin writes its own.
+function courtStore(on: On, record: (court: unknown) => void, saved?: unknown) {
+  let isWritten = false
+  if (saved !== undefined) {
+    on('state.get', async ($, e, next) => {
+      const result = (await next(e)) as { value?: { value?: unknown; version: number } }
+      if (isWritten || (e as { key?: string }).key !== 'court' || result.value?.value !== undefined) return result as never
+      return { value: { value: saved, version: result.value?.version ?? 0 } } as never
+    })
+  }
+  on('state.set', ($, e, next) => {
+    if ((e as { key?: string }).key === 'court') {
+      isWritten = true
+      record((e as { value?: unknown }).value)
+    }
+    return next(e)
+  })
+}
+
+test('before a reload: a level 3 knight ends with its todo open', async ($, on) => {
+  const harness = standIn(on, { verdict: levelVerdicts })
+  courtStore(on, court => (savedCourt = court))
+  await start($)
+  await propose($, 'Rate-limit.', [{ folder: 'api', role: 'knight' }])
+  await $.command.run(person('level O1 3'))
+  await spawn($, 'council:knight', 'O1 api')
+  expect(harness.spawned[0]!.model).toBe('opus')
+  await finish($, 'agent-1', 'Waiting on the tests.')
+  expect((savedCourt as { orders: Array<{ status: string }> }).orders[0]!.status).toBe('unsettled')
+})
+
+test("after a reload: the unsettled order still holds its place, and its wake runs at its level's effort", async ($, on) => {
+  expect(savedCourt).toBeDefined()
+  const harness = standIn(on)
+  let latest: unknown
+  courtStore(on, court => (latest = court), savedCourt)
+  // The agent is still listed (it waits to wake), so it is not lost.
+  harness.listed.set('agent-1', 'idle')
+  await start($)
+  expect(text(await propose($, 'A knight in api.', [{ folder: 'api', role: 'knight' }]))).toContain('ended with todos open')
   const woke = await spawn($, 'council:knight', 'wake', { prompt: '', resume: { agentId: 'agent-1' } })
   expect(woke.agentId).toBe('agent-1')
-  expect(harness.toasts.some(toast => toast.includes('O1 woke while O2 works in the same folder'))).toBe(true)
-  const pane = await mountPane($)
-  const warnings = (await pane.findAll({ type: 'Text' })).filter(node => /^⚠ O1 woke while O2 works in the same folder$/.test(String((node as { text?: unknown }).text ?? (node as { props?: { children?: unknown } }).props?.children)))
-  expect(warnings.length).toBe(2)
-  await pane.unmount()
+  // A woken agent keeps the model it was started on; the order still names it.
+  expect((latest as { orders: Array<Record<string, unknown>> }).orders[0]).toMatchObject({ id: 'O1', status: 'dispatched', wakes: 1, model: 'opus', effort: 'high', level: 3 })
+  await step($, 'agent-1', 'low')
+  expect(harness.steps.map(entry => entry.effort)).toEqual(['high'])
 })
+

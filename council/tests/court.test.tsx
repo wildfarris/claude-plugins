@@ -48,6 +48,8 @@ const text = (result: unknown) => String((result as { result?: unknown }).result
 const spawn = ($: Engine, subagentType: string, description: string, prompt = 'Do the work.') =>
   $.agent.spawn({ subagentType, description, prompt } as never)
 const mountPane = ($: Engine, surface: 'desktop' | 'terminal' = 'desktop') => $.ui.mount({ plugin: 'council', surface, component: 'Pane', requestId: 'council-chamber', props: PANE })
+// The agent checks off its work (one item, completed) before it answers, so its order is done.
+const checkOff = ($: Engine, agentId: string) => $.tool.call({ tool: 'mcp__council__progress', agentId, todos: [{ content: 'All of it', status: 'completed', activeForm: 'Doing all of it' }] } as never)
 
 test('a plan the council approves becomes orders; a bad one is explained', async ($, on) => {
   courtStandIn(on)
@@ -109,6 +111,7 @@ test('a dispatch carries its order: scoped, with todos and the folder rules; any
   await pane.unmount()
 
   // Its last answer is its report.
+  await checkOff($, 'agent-1')
   await $.turn.complete({ answer: 'Added a limiter to /charge; tests pass.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-1', reason: 'answer' } as never)
   pane = await mountPane($, 'terminal')
   expect(await pane.find({ text: /Back home · 1/ })).toBeDefined()
@@ -161,6 +164,7 @@ test('the court strip opens a verdict, and finished orders fold away at your nex
   await start($)
   await propose($, PLAN)
   await spawn($, 'council:scout', 'O2 web retries')
+  await checkOff($, 'agent-1')
   await $.turn.complete({ answer: 'Found two retry loops.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-1', reason: 'answer' } as never)
   let pane = await mountPane($)
   await pane.press({ key: 'verdict-castellan' })
@@ -223,6 +227,7 @@ test('orders: on the road newest first, then back home, then the archive', async
   await spawn($, 'council:knight', 'O1 api limits')
   await spawn($, 'council:scout', 'O2 web retries')
   await spawn($, 'council:scout', 'O3 infra look')
+  await checkOff($, 'agent-2')
   await $.turn.complete({ answer: 'Two retry loops.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-2', reason: 'answer' } as never)
   const pane = await mountPane($)
   // Rows in drawing order: the newer scout before the older knight, the finished scout after both.
@@ -454,6 +459,7 @@ test('withdraw_orders retires approved orders, refuses the rest by name, and a w
   expect(((await spawn($, 'council:scout', 'O4 web retries')) as { agentId?: string }).agentId).toBeDefined()
 
   // The finished ones are refused too.
+  await checkOff($, 'agent-1')
   await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-1', reason: 'answer' } as never)
   expect(text(await withdraw($, ['O1']))).toContain('Refused O1: already done')
   expect(text(await withdraw($, ['O4']))).toContain('Refused O4: already dispatched')
@@ -514,6 +520,7 @@ test('an order nobody dispatches expires after a day; a dispatched one does not'
   // The expired order is no longer open; the dispatched one is still on its road and still reports.
   expect((await spawn($, 'council:scout', 'O2 web retries')) as { deny?: string }).toMatchObject({ deny: expect.stringContaining('No approved order') })
   expect(text(await withdraw($, ['O2']))).toContain('Refused O2: already withdrawn')
+  await checkOff($, 'agent-1')
   await $.turn.complete({ answer: 'Done.', durationMs: 1, isAborted: false, turnId: 't', agentId: 'agent-1', reason: 'answer' } as never)
   pane = await mountPane($)
   expect(await pane.find({ text: /Back home · 2/ })).toBeDefined()

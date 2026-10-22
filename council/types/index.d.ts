@@ -128,10 +128,16 @@ export type Roster = {
 
 export type OrderRole = 'scout' | 'knight'
 
+// The order lifecycle (court.ts ORDER_LIFECYCLE holds every transition):
 // 'approved': waiting for Claude to dispatch it; 'dispatched': an agent is on
-// it; 'done' / 'failed': the agent came back; 'withdrawn': retired before it
-// was dispatched (Claude withdrew it, or it expired), with `withdrawnReason`.
-export type OrderStatus = 'approved' | 'dispatched' | 'done' | 'failed' | 'withdrawn'
+// it; 'unsettled': its agent ended a turn with todos open, so the main session
+// judges how it ended (settle_order); 'waiting': settled as waiting for a wake
+// (a timer, a background task); 'done' / 'stopped-early' / 'failed': settled;
+// 'lost': its agent left the engine's agent list, or the person released it;
+// 'withdrawn': retired before it was dispatched (Claude withdrew it, or it
+// expired), with `withdrawnReason`. A knight order holds its place (the folder
+// claim) while dispatched, unsettled or waiting.
+export type OrderStatus = 'approved' | 'dispatched' | 'unsettled' | 'waiting' | 'done' | 'stopped-early' | 'failed' | 'lost' | 'withdrawn'
 
 export type ForbidOp = 'create' | 'edit' | 'delete'
 
@@ -190,15 +196,17 @@ export type Order = {
   // effort (settings scoutLevels, knightLevels). Absent in older orders (read
   // as the role's default: 2 for a knight, 1 for a scout).
   level?: OrderLevel
-  // The effort its agent's requests run at (from its level), kept with the
-  // order so it survives a reload and applies after a wake. Absent: untouched.
+  // The model and effort its agent runs on (from its level), kept with the
+  // order so they survive a reload and the effort applies after a wake (a
+  // woken agent keeps the model it was started on). Absent: untouched.
+  model?: string
   effort?: string
-  // How many times its agent woke after reporting (a timer, a background
-  // task, a message): each wake reopens the order. Absent: never.
+  // How many times its agent woke after ending a turn (a timer, a background
+  // task, a message): each wake puts the order back on the road. Absent: never.
   wakes?: number
-  // A note on the order the person should see (e.g. it woke while another
-  // knight was working in an overlapping place).
-  warning?: string
+  // The main session's note when it settled the order (settle_order), or why
+  // it was lost. Absent when there is none.
+  note?: string
 }
 
 export type OrderLevel = 1 | 2 | 3
@@ -269,6 +277,10 @@ export type Court = {
   isInSession: boolean
   // A prompt held for the council, while it sits.
   heldPrompt: string | null
+  // Lines for the main session (an order left unsettled) that could not be
+  // appended to its conversation: they go beside the person's next prompt.
+  // Absent when there are none.
+  notices?: string[]
 }
 
 // ── Learning from reconsiders (learning.ts) ──────────────────────────────

@@ -4,7 +4,7 @@ import type { AdvisorRun, Order } from '../types'
 import { advisorTask, findingsContext, isAdvisorPath, parseCheck, readAdviseArgs, summonsQuestions, withStaleAdvisors } from '../hooks/advisors'
 import { parseVerdict } from '../hooks/council'
 import {
-  STALE_REPORT,
+  LOST_NOTE,
   emptyCourt,
   joinedReport,
   knightClash,
@@ -19,8 +19,7 @@ import {
   repoCandidates,
   rulingText,
   setOrderLevel,
-  withStaleReleased,
-  withWoken,
+  withLostAgents,
 } from '../hooks/court'
 import { parseModelEfforts, readSettings } from '../hooks/settings'
 
@@ -140,12 +139,14 @@ describe('knight overlap', () => {
     expect(placesOverlap(place('C:\\w\\Api', 'C:\\w'), place('c:/w/web', 'C:/W'))).toBe(true)
   })
 
-  test('only a dispatched knight clashes; scouts and waiting orders do not', () => {
+  test('only a knight holding its place clashes (dispatched, unsettled or waiting); scouts, approved and settled orders do not', () => {
     const at = (entry: Order) => ({ order: entry, place: place(entry.folder) })
     const others = [at(order('O1', { status: 'dispatched' })), at(order('O2', { role: 'scout', status: 'dispatched', folder: '/dev/work/api' })), at(order('O3'))]
     expect(knightClash(place('/dev/work/api'), others)?.order.id).toBe('O1')
     expect(knightClash(place('/dev/work/api'), others, 'O1')).toBeUndefined()
     expect(knightClash(place('/dev/work/web'), others)).toBeUndefined()
+    for (const status of ['unsettled', 'waiting'] as const) expect(knightClash(place('/dev/work/api'), [at(order('O4', { status }))])?.order.id).toBe('O4')
+    for (const status of ['done', 'stopped-early', 'failed', 'lost', 'withdrawn'] as const) expect(knightClash(place('/dev/work/api'), [at(order('O4', { status }))])).toBeUndefined()
   })
 
   test('a repository is looked for at the folder and each one above it, never at the root', () => {
@@ -155,14 +156,22 @@ describe('knight overlap', () => {
   })
 })
 
-describe('releasing orders whose agent is gone', () => {
-  test('a dispatched order whose agent is no longer listed fails; a listed one (in any status) stays', () => {
-    const orders = [order('O1', { status: 'dispatched', agentId: 'gone' }), order('O2', { status: 'dispatched', agentId: 'waiting' }), order('O3'), order('O4', { status: 'done', agentId: 'old' })]
-    const released = withStaleReleased(orders, new Set(['waiting']), 9)
-    expect(released[0]).toMatchObject({ status: 'failed', report: STALE_REPORT, endedAt: 9 })
-    expect(released.slice(1)).toEqual(orders.slice(1))
-    const kept = orders.slice(1)
-    expect(withStaleReleased(kept, new Set(['waiting']), 9)).toBe(kept)
+describe('orders whose agent is gone', () => {
+  test('a dispatched, unsettled or waiting order whose agent is no longer listed is lost; a listed one (in any status) and a settled one stay', () => {
+    const orders = [
+      order('O1', { status: 'dispatched', agentId: 'gone', report: 'Half done.' }),
+      order('O2', { status: 'unsettled', agentId: 'gone-2' }),
+      order('O3', { status: 'waiting', agentId: 'gone-3' }),
+      order('O4', { status: 'dispatched', agentId: 'waiting' }),
+      order('O5'),
+      order('O6', { status: 'done', agentId: 'old' }),
+    ]
+    const lost = withLostAgents(orders, new Set(['waiting']), 9)
+    expect(lost.slice(0, 3).map(entry => entry.status)).toEqual(['lost', 'lost', 'lost'])
+    expect(lost[0]).toMatchObject({ report: 'Half done.', note: LOST_NOTE, endedAt: 9 })
+    expect(lost.slice(3)).toEqual(orders.slice(3))
+    const kept = orders.slice(3)
+    expect(withLostAgents(kept, new Set(['waiting']), 9)).toBe(kept)
   })
 
   test('a running advisor whose agent is gone fails too', () => {
@@ -174,12 +183,8 @@ describe('releasing orders whose agent is gone', () => {
 })
 
 describe('waking', () => {
-  test('a woken order is back on the road, and its next report follows the earlier one', () => {
-    const done = order('O1', { status: 'done', agentId: 'a', report: 'Started the tests.', endedAt: 5, isFolded: true })
-    expect(withWoken(done)).toMatchObject({ status: 'dispatched', wakes: 1, endedAt: null, isFolded: false, report: 'Started the tests.' })
-    expect(withWoken(withWoken(done))).toMatchObject({ wakes: 1 })
+  test('the next report after a wake follows the earlier one', () => {
     expect(joinedReport('Started the tests.', 'All 40 pass.')).toBe('Started the tests.\n\n[woke and went on]\nAll 40 pass.')
-    expect(joinedReport(STALE_REPORT, 'All 40 pass.')).toBe('All 40 pass.')
     expect(joinedReport('', 'x')).toBe('x')
   })
 })
