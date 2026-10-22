@@ -206,6 +206,16 @@ export type Order = {
   // entries given as `{ rule }`), which the sidekick mod's policy judge reads
   // against its shell commands. Absent when there are none.
   policy?: string[]
+  // Leave (knights only): specific exceptions to the default rules of the
+  // sidekick mod's policy judge, asked in the proposal and ruled on with the
+  // plan. Sidekick reads it only while `leaveStatus` is 'granted'. Absent when
+  // none was asked, or once the person denied it.
+  leave?: string[]
+  // Who has let the leave stand: 'pending' until the person types /council
+  // grant (leaveApproval owner, the default); 'granted' by the person, or at
+  // approval (leaveApproval council); 'denied' by /council deny-leave, which
+  // drops the leave. Absent when no leave was asked.
+  leaveStatus?: LeaveStatus
   status: OrderStatus
   agentId: string | null
   steps: number
@@ -254,6 +264,8 @@ export type Order = {
 
 export type OrderLevel = 1 | 2 | 3
 
+export type LeaveStatus = 'pending' | 'granted' | 'denied'
+
 // ── Advisor agents (council:advisor): read-only investigators ─────────────
 
 // 'timed-out': the council stopped waiting for it (a summons only).
@@ -292,7 +304,7 @@ export type AdvisorRun = {
 // proposed (court.ts Proposal).
 export type SummonsProposal = {
   plan: string
-  dispatches: Array<{ folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[] }>
+  dispatches: Array<{ folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[]; leave?: string[] }>
 }
 
 // A summons in progress, kept in the court so a reload never loses it: the

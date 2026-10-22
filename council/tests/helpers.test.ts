@@ -151,6 +151,7 @@ describe('settings', () => {
       ],
       isSummonsOn: true,
       amendmentsPerOrder: 1,
+      leaveApproval: 'owner',
     })
     expect(readSettings({ advisorEffort: 'extreme', advisorModel: '  ' }).advisorEffort).toBe('low')
     expect(readSettings({ advisorModel: '  ' }).advisorModel).toBe('sonnet')
@@ -168,6 +169,11 @@ describe('settings', () => {
     expect(readSettings({ amendmentsPerOrder: 0 }).amendmentsPerOrder).toBe(0)
     expect(readSettings({ amendmentsPerOrder: 3 }).amendmentsPerOrder).toBe(3)
     for (const bad of [-1, 11, 1.5, '2', null]) expect(readSettings({ amendmentsPerOrder: bad }).amendmentsPerOrder).toBe(1)
+  })
+
+  test('leave is granted by the person unless the setting is exactly council', () => {
+    expect(readSettings({ leaveApproval: 'council' }).leaveApproval).toBe('council')
+    for (const other of ['owner', 'Council', 'anyone', '', 1, null]) expect(readSettings({ leaveApproval: other }).leaveApproval).toBe('owner')
   })
 })
 

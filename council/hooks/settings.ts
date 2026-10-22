@@ -30,7 +30,12 @@ export type CouncilSettings = {
   isSummonsOn: boolean
   // How many amendments (mcp__council__amend_order) one order takes, refused ones included.
   amendmentsPerOrder: number
+  // Who grants an order's leave: the person, with /council grant (the
+  // default), or the council, when it approves the plan.
+  leaveApproval: LeaveApproval
 }
+
+export type LeaveApproval = 'owner' | 'council'
 
 // One level's model (an alias such as sonnet, or a full id) and effort.
 export type ModelEffort = { model: string; effort: Effort }
@@ -87,5 +92,7 @@ export function readSettings(options: PluginOptions): CouncilSettings {
     advisorAgentLevels: levelsOption(options.advisorAgentLevels, DEFAULT_ADVISOR_AGENT_LEVELS, 2),
     isSummonsOn: booleanOption(options.councilSummons, true),
     amendmentsPerOrder: countOption(options.amendmentsPerOrder, 1, 0, 10),
+    // Anything but exactly "council" leaves it with the person.
+    leaveApproval: options.leaveApproval === 'council' ? 'council' : 'owner',
   }
 }

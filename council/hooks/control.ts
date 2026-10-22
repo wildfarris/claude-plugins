@@ -70,7 +70,14 @@ export const DEFAULT_AMENDMENTS_PER_ORDER = 1
 export type Amendment = { id: string; change: string; reason: string; todos: string[] }
 
 // The amend_order tool's input, checked.
+// Fields an amendment may never carry: an order's leave is set only when it
+// is proposed, ruled on with the plan and granted before its dispatch.
+const LEAVE_FIELDS = ['leave', 'leaveStatus']
+
 export function readAmendment(input: Record<string, unknown>): Amendment | { error: string } {
+  if (LEAVE_FIELDS.some(field => field in input)) {
+    return { error: "An amendment can't add or change an order's leave: leave is asked only in propose_orders. Recall the order and propose a new one with the leave it needs." }
+  }
   if (!isText(input.id)) return { error: 'Name the order to amend (e.g. "O3").' }
   if (!isText(input.change)) return { error: 'Say what changes in the order: the change, in a sentence or two.' }
   if (!isText(input.reason)) return { error: 'Give the reason for the change.' }
@@ -120,6 +127,7 @@ export function amendmentBrief(order: Order, amendment: Amendment, petition: str
     `The order's task: ${order.task}`,
     `Its todos (${done} of ${order.todos.length} done): ${order.todos.map(todo => `${todoMark(todo)} ${todo.content}`).join('; ')}`,
     ...(order.conditions.length > 0 ? [`Its conditions: ${order.conditions.join(' ')}`] : []),
+    ...(order.leaveStatus === 'granted' && order.leave && order.leave.length > 0 ? [`Its leave (granted; an amendment can't change it): ${order.leave.join(' ')}`] : []),
     ...((order.amendments ?? []).filter(entry => entry.status !== 'ruling').map(entry => `An earlier amendment (${entry.status}): ${entry.change}`)),
     `The amendment: ${amendment.change}`,
     `Why: ${amendment.reason}`,

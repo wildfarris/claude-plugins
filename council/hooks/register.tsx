@@ -140,6 +140,10 @@ import {
   heldRefusal,
   heldText,
   summonsRuledLine,
+  isLeavePending,
+  leaveOnApproval,
+  leaveRefusal,
+  ruleOnLeave,
   type OrderEvent,
   type ArbiterDecision,
   type Place,
@@ -667,6 +671,9 @@ async function drawCouncil($: EngineInterface, e: RenderInput<'Pane'>) {
       isFinishedShown: await read($, isFinishedShownAtom),
       openOrderId: await read($, openOrderAtom),
       onToggleOrder: id => update($, openOrderAtom, current => (current === id ? null : id)),
+      // The person's press in the pane: the same as /council grant or deny-leave.
+      onGrantLeave: async id => $.ui.toast(await leaveAction($, id, 'grant')),
+      onDenyLeave: async id => $.ui.toast(await leaveAction($, id, 'deny')),
       portrait: (seat, report) => {
         const elements = table as unknown as Record<string, ((props: Record<string, unknown>) => unknown) | undefined>
         if (e.surface === 'terminal' || !elements.Svg || council === null) return null
@@ -897,7 +904,7 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
   const council = await conveneAndWait($, `Orders: ${proposal.plan}`, async () => ({ brief: proposalBrief(proposal, lastPetition) }), {
     source: 'claude',
-    extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn),
+    extra: orderAsk(proposal.dispatches.length, settings.isSummonsOn, hasLeave(proposal)),
     onReply,
   })
   if (council === undefined) return 'The council could not sit (no one is seated, or another council replaced it). Ask the person.'
@@ -909,10 +916,19 @@ async function proposeOrders($: EngineInterface, input: Record<string, unknown>)
   // handed out twice; the court's counter moves past it and clearing never frees it.
   let orders: Order[] = []
   await update($, courtAtom, current => {
-    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now, levels) : []
+    orders = result.isApproved ? newOrders(current, proposal, root, result.conditions, now, levels, 'approved', settings.leaveApproval) : []
     return { ...withOrdersAdded(current, orders), rulings: [...current.rulings.slice(-9), rulingRecord(result)] }
   })
+  toastPendingLeave($, orders)
   return rulingText(result, orders)
+}
+
+const hasLeave = (proposal: Proposal) => proposal.dispatches.some(dispatch => (dispatch.leave ?? []).length > 0)
+
+// The person hears at once of leave only they can grant.
+function toastPendingLeave($: EngineInterface, orders: readonly Order[]): void {
+  const pending = orders.filter(isLeavePending).map(order => order.id)
+  if (pending.length > 0) $.ui.toast(`Council: ${pending.join(', ')} ${pending.length === 1 ? 'asks' : 'ask'} for leave. /council grant <id> or /council deny-leave <id>; the court shows it.`)
 }
 
 // A ruling as the court records it.
@@ -1117,7 +1133,7 @@ async function holdForAdvisor($: EngineInterface, council: Council, proposal: Pr
   )
   let orders: Order[] = []
   await update($, courtAtom, current => {
-    orders = newOrders(current, proposal, root, [], now, levels, 'held')
+    orders = newOrders(current, proposal, root, [], now, levels, 'held', settings.leaveApproval)
     const summons: CourtSummons = {
       runId: run.id,
       phase: 'checking',
@@ -1232,7 +1248,7 @@ async function ruleSummons($: EngineInterface, runId: string, isTold = true): Pr
     const onReply = (seatId: AdvisorId, text: string) => replies.set(seatId, replies.has(seatId) ? `${text}\n${replies.get(seatId)}` : text)
     // Shown in the chamber only while it still holds this ruling's first round.
     const isShown = !isCouncilWorking && (await read($, councilAtom))?.topic === held.council.topic
-    council = await secondRound($, held.council, findingsContext(held.questions, record.findings), orderAsk(proposal.dispatches.length, false), onReply, isShown)
+    council = await secondRound($, held.council, findingsContext(held.questions, record.findings), orderAsk(proposal.dispatches.length, false, hasLeave(proposal)), onReply, isShown)
   }
   const { result, levels } = await finalRuling($, council, proposal, held.petition, replies, record)
   // Held knights claimed no place: one whose place a knight now holds must wait.
@@ -1256,7 +1272,7 @@ async function ruleSummons($: EngineInterface, runId: string, isTold = true): Pr
       if (index < 0) return order
       const level = levels[index]
       const next = result.isApproved
-        ? moved(order, 'approve', ruledAt, { conditions: result.conditions, approvedAt: ruledAt, ...(level !== undefined ? { level } : {}) })
+        ? moved(order, 'approve', ruledAt, { conditions: result.conditions, approvedAt: ruledAt, ...(level !== undefined ? { level } : {}), ...leaveOnApproval(order, settings.leaveApproval) })
         : moved(order, 'refuse', ruledAt, { withdrawnReason: refusal })
       if (next === undefined) return order
       settled.push(next)
@@ -1267,6 +1283,7 @@ async function ruleSummons($: EngineInterface, runId: string, isTold = true): Pr
   if (settled.length === 0) return undefined
   const line = summonsRuledLine(result, settled, waits)
   $.ui.toast(`Council: ${settled.map(order => order.id).join(', ')} ${result.isApproved ? 'released' : 'refused'} after its advisor (${runId}).`)
+  if (result.isApproved) toastPendingLeave($, settled)
   if (isTold) await tellMain($, line)
   return line
 }
@@ -1457,6 +1474,9 @@ async function dispatchOrder($: EngineInterface, e: { subagentType: string; desc
       deny: open.length > 0 ? `Name the order this carries in the description: open orders are ${open.join(', ')}.` : 'No approved order for this dispatch. Propose it with mcp__council__propose_orders first.',
     }
   }
+  // Leave the person has yet to grant holds the order back.
+  const leaveDenial = leaveRefusal(order)
+  if (leaveDenial !== undefined) return { deny: leaveDenial }
   // A knight waits while another works in an overlapping place.
   if (order.role === 'knight') {
     const refusal = await oneAtATime(async () => {
@@ -1657,6 +1677,22 @@ async function settleOrderTool($: EngineInterface, input: Record<string, unknown
     const again = settleOrder(current.orders, settlement, now)
     return 'error' in again ? current : { ...current, orders: again.orders }
   })
+  return outcome.message
+}
+
+// `/council grant <order>` or `/council deny-leave <order>` (or the court's
+// buttons): the person rules on an order's leave. Never a tool: Claude can't
+// grant leave. Claude is told, so it can dispatch the order.
+async function leaveAction($: EngineInterface, id: string, verdict: 'grant' | 'deny'): Promise<string> {
+  await expireOrders($)
+  let outcome = { error: `No order ${id}.` } as ReturnType<typeof ruleOnLeave>
+  await update($, courtAtom, current => {
+    outcome = ruleOnLeave(current.orders, id, verdict)
+    return 'error' in outcome ? current : { ...current, orders: outcome.orders }
+  })
+  if ('error' in outcome) return outcome.error
+  const { order } = outcome
+  await tellMain($, verdict === 'grant' ? `Council: the person granted ${order.id}'s leave; it can be dispatched.` : `Council: the person denied ${order.id}'s leave; it can be dispatched without it.`)
   return outcome.message
 }
 
@@ -1994,6 +2030,9 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   // The advisor agent and order levels are the person's alone.
   if (action === 'advise') return isPersonOrigin(origin) ? adviseCommand($, trimmed.replace(/^advise\b/, '')) : "Only the person can send the council's advisor: type /council advise at the prompt."
   if (action === 'level' && /^O\d+$/i.test(target) && words.length === 1) return isPersonOrigin(origin) ? levelCommand($, target, words[0]!) : "Only the person can change an order's level: type /council level at the prompt."
+  if ((action === 'grant' || action === 'deny-leave') && (target === '' || /^O\d+$/i.test(target)) && words.length === 0) {
+    return isPersonOrigin(origin) ? leaveAction($, target, action === 'grant' ? 'grant' : 'deny') : `Only the person can rule on an order's leave: type /council ${action} at the prompt.`
+  }
   if (action === 'release' && (target === '' || /^O\d+$/i.test(target)) && words.length === 0) return isPersonOrigin(origin) ? releaseCommand($, target) : 'Only the person can release an order: type /council release at the prompt.'
   if (action === 'message' && /^O\d+$/i.test(target)) {
     return isPersonOrigin(origin) ? messageCommand($, target, trimmed.replace(/^message\s+\S+\s*/, '')) : "Only the person can message an order's agent: type /council message at the prompt."
@@ -2037,7 +2076,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|release <order>|message <order> <text>|recall <order> <reason>|report|members|lessons|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|lessons|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)

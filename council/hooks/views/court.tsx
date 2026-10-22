@@ -8,7 +8,7 @@ import type { ElementTable } from 'claude-code'
 import type { AdvisorReport, AdvisorRun, Council, Court, Order, Seat } from '../../types'
 import { seatsOf } from '../council'
 import { isAdvisorFinished } from '../advisors'
-import { currentTodo, isFinished, isFolded, levelLabel, openTodos, progressOf } from '../court'
+import { currentTodo, isFinished, isFolded, isLeavePending, leaveSummary, levelLabel, openTodos, progressOf } from '../court'
 import { callsLabel } from '../tally'
 import { touchedFiles } from '../control'
 
@@ -32,6 +32,10 @@ export type CourtViewProps = {
   // The finished order whose full report is open.
   openOrderId: string | null
   onToggleOrder: (id: string) => unknown
+  // The person grants or denies an order's pending leave (as /council grant
+  // and /council deny-leave). Left out: no buttons, the command only.
+  onGrantLeave?: (id: string) => unknown
+  onDenyLeave?: (id: string) => unknown
 }
 
 const ROLE_TITLE = { scout: 'Scout', knight: 'Knight' } as const
@@ -77,9 +81,34 @@ function steeringLines(el: ElementTable, order: Order) {
   ]
 }
 
+type LeaveButtons = Pick<CourtViewProps, 'onGrantLeave' | 'onDenyLeave'>
+
+// An order's leave and where it stands; while it waits for the person, an
+// order not yet dispatched gets grant and deny buttons when the pane has them.
+function leaveLines(el: ElementTable, order: Order, buttons: LeaveButtons = {}) {
+  const { Box, Text, Button } = el
+  const summary = leaveSummary(order)
+  if (summary === undefined) return []
+  const isPending = isLeavePending(order)
+  const canRule = isPending && (order.status === 'approved' || order.status === 'held')
+  return [
+    <Text key={`order-leave-${order.id}`} color={isPending ? 'warning' : undefined} dimColor={!isPending} wrap="wrap">
+      {summary}
+    </Text>,
+    ...(canRule && (buttons.onGrantLeave || buttons.onDenyLeave)
+      ? [
+          <Box key={`order-leave-buttons-${order.id}`} flexDirection="row" columnGap={2}>
+            {buttons.onGrantLeave && <Button key={`order-grant-${order.id}`} label="grant leave" variant="primary" onPress={() => buttons.onGrantLeave!(order.id)} />}
+            {buttons.onDenyLeave && <Button key={`order-deny-${order.id}`} label="deny leave" variant="secondary" onPress={() => buttons.onDenyLeave!(order.id)} />}
+          </Box>,
+        ]
+      : []),
+  ]
+}
+
 // An order on the road: who and where, its progress on the right, the road,
 // then what it is doing now.
-function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown) {
+function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown, buttons: LeaveButtons = {}) {
   const { Box, Text } = el
   const { done, total } = progressOf(order)
   const calls = callsLabel(order.steps)
@@ -89,7 +118,9 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
   const now = isHeld
     ? 'held: advisor checking'
     : order.status === 'approved'
-      ? 'approved · waiting to be dispatched'
+      ? isLeavePending(order)
+        ? 'approved · its leave waits for you'
+        : 'approved · waiting to be dispatched'
       : order.recall
         ? 'recalled · winding down'
         : (currentTodo(order) ?? (done === total ? 'wrapping up' : 'setting out'))
@@ -119,6 +150,7 @@ function activeRow(el: ElementTable, order: Order, road: (order: Order) => unkno
           {`rules: ${order.policy.join(' · ')}`}
         </Text>
       )}
+      {leaveLines(el, order, buttons)}
       {steeringLines(el, order)}
     </Box>
   )
@@ -146,6 +178,7 @@ function pausedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: (i
       <Text key={`order-paused-${order.id}`} dimColor italic wrap="truncate-end">
         {detail}
       </Text>
+      {leaveLines(el, order)}
       {steeringLines(el, order)}
       {isOpen && (
         <Box flexDirection="column" paddingLeft={2} borderStyle="quote" borderColor="warning">
@@ -361,7 +394,7 @@ export function courtView(el: ElementTable, props: CourtViewProps) {
         </Box>
       )}
       {advisors.length > 0 && section(el, 'section-advisors', `Advisors · ${advisors.length}`, advisors.map(run => advisorRow(el, run, props.openOrderId === run.id, props.onToggleOrder)))}
-      {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road)))}
+      {active.length > 0 && section(el, 'section-active', `On the road · ${active.length}`, active.map(order => activeRow(el, order, props.road, props)))}
       {paused.length > 0 && section(el, 'section-paused', `Paused · ${paused.length}`, paused.map(order => pausedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
       {home.length > 0 && section(el, 'section-home', `Back home · ${home.length}`, home.map(order => finishedRow(el, order, props.openOrderId === order.id, props.onToggleOrder)))}
       {archived.length > 0 && (

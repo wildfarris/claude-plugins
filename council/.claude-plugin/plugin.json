@@ -98,6 +98,16 @@
       "title": "Amendments per order",
       "description": "How many amendments Claude may ask for on one council order under way (mcp__council__amend_order), refused ones included; each is ruled on by the council. 0 turns amendments off. Whole numbers 0 to 10.",
       "default": 1
+    },
+    "leaveApproval": {
+      "type": "string",
+      "title": "Leave approval",
+      "description": "Who grants a knight order's leave (exceptions to the default rules of the sidekick mod's policy judge, asked in the proposal and ruled on with the plan). owner: the order can't be dispatched until you type /council grant <order> (or /council deny-leave <order> to send it without). council: granted when the council approves the plan.",
+      "options": [
+        "owner",
+        "council"
+      ],
+      "default": "owner"
     }
   }
 }

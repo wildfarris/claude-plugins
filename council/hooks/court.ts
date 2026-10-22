@@ -4,7 +4,7 @@
 // proposal's checks, the brief, the ruling, matching a dispatch to its order,
 // the dispatched agent's instructions, and folding its progress in.
 
-import type { AdvisorId, Council, Court, ForbidOp, ForbidRule, Order, OrderLevel, OrderRole, OrderTodo, Ruling, Seat } from '../types'
+import type { AdvisorId, Council, Court, ForbidOp, ForbidRule, LeaveStatus, Order, OrderLevel, OrderRole, OrderTodo, Ruling, Seat } from '../types'
 import { seatsOf } from './council'
 import { canonicalPath, isPathInside, joinUnder, nativePath, parseAbsolute, pathStyleOf, relativeToRoot, segmentsBelow } from './paths'
 
@@ -25,7 +25,7 @@ export const MAX_TODOS = 12
 
 export const MAX_FORBID = 8
 
-export type ProposedDispatch = { folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[] }
+export type ProposedDispatch = { folder: string; role: OrderRole; task: string; todos: string[]; forbid?: ForbidRule[]; policy?: string[]; leave?: string[] }
 export type Proposal = { plan: string; dispatches: ProposedDispatch[] }
 
 const isText = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
@@ -76,6 +76,77 @@ function readForbid(raw: unknown, label: string): { rules: ForbidRule[]; policy:
   return { rules, policy }
 }
 
+// ── Leave: exceptions to the policy judge's default rules ────────────────
+
+export const MAX_LEAVE = 4
+export const MIN_LEAVE_SENTENCE = 10
+export const MAX_LEAVE_SENTENCE = 200
+
+// A dispatch's `leave`, checked strictly: knights only, at most MAX_LEAVE
+// sentences, each one line of plain text, MIN_LEAVE_SENTENCE to
+// MAX_LEAVE_SENTENCE characters, with no control characters and no angle
+// brackets (it reaches the judge's own instructions). Never cut short or
+// mended: a sentence that doesn't fit is refused, so what the council and the
+// person rule on is exactly what the judge reads.
+export function readLeave(raw: unknown, role: OrderRole, label: string): { leave: string[] } | { error: string } {
+  if (raw === undefined || raw === null) return { leave: [] }
+  if (!Array.isArray(raw)) return { error: `${label}: leave must be a list of sentences, e.g. ["May run systemctl status and systemctl restart on units this order installs."].` }
+  if (raw.length === 0) return { leave: [] }
+  if (role !== 'knight') return { error: `${label}: a scout changes nothing, so it takes no leave. Leave is for knights only.` }
+  if (raw.length > MAX_LEAVE) return { error: `${label}: at most ${MAX_LEAVE} leave sentences.` }
+  const leave: string[] = []
+  for (const [index, value] of (raw as unknown[]).entries()) {
+    const where = `${label}, leave ${index + 1}`
+    if (typeof value !== 'string') return { error: `${where}: each leave entry is one sentence of plain text.` }
+    if (/[\x00-\x1f\x7f\p{Zl}\p{Zp}]/u.test(value)) return { error: `${where}: one line of plain text, with no line breaks or tabs.` }
+    if (/[<>]/.test(value)) return { error: `${where}: no angle brackets (< or >); say it in words.` }
+    const sentence = value.trim().replace(/ {2,}/g, ' ')
+    if (sentence.length < MIN_LEAVE_SENTENCE || sentence.length > MAX_LEAVE_SENTENCE) {
+      return { error: `${where}: ${MIN_LEAVE_SENTENCE} to ${MAX_LEAVE_SENTENCE} characters, naming one specific exception (it has ${sentence.length}).` }
+    }
+    if (!leave.some(earlier => earlier.toLowerCase() === sentence.toLowerCase())) leave.push(sentence)
+  }
+  return { leave }
+}
+
+// An order's leave as everyone reads it: each sentence quoted, joined.
+export const leaveText = (leave: readonly string[]) => leave.map(sentence => `"${sentence}"`).join('; ')
+
+const LEAVE_WORD: Record<LeaveStatus, string> = { pending: 'waiting for you', granted: 'granted', denied: 'denied' }
+
+// The leave an order carries and where it stands, for the court; undefined when it has none.
+export function leaveSummary(order: Pick<Order, 'leave' | 'leaveStatus'>): string | undefined {
+  if (order.leaveStatus === 'denied') return 'leave denied: it goes without'
+  if (!order.leave || order.leave.length === 0) return undefined
+  return `leave (${LEAVE_WORD[order.leaveStatus ?? 'pending']}): ${order.leave.join(' · ')}`
+}
+
+// Leave not yet granted: the order can't be dispatched.
+export const isLeavePending = (order: Pick<Order, 'leave' | 'leaveStatus'>) => (order.leave ?? []).length > 0 && order.leaveStatus !== 'granted'
+
+// Why a dispatch of this order is refused for its leave, or undefined.
+export const leaveRefusal = (order: Order): string | undefined =>
+  isLeavePending(order) ? `${order.id} asks for leave the person hasn't granted. Ask them to type /council grant ${order.id}, or /council deny-leave ${order.id} to send it without; then dispatch it.` : undefined
+
+// `/council grant <id>` and `/council deny-leave <id>`: the person rules on an
+// order's leave before it is dispatched. Denying drops the leave, and the
+// order can then be dispatched without it.
+export function ruleOnLeave(orders: readonly Order[], id: string, verdict: 'grant' | 'deny'): { orders: Order[]; order: Order; message: string } | { error: string } {
+  const command = verdict === 'grant' ? 'grant' : 'deny-leave'
+  const wanted = id.trim().toUpperCase()
+  if (!/^O\d+$/.test(wanted)) return { error: `Usage: /council ${command} <order id>, e.g. /council ${command} O3` }
+  const order = orders.find(candidate => candidate.id === wanted)
+  if (order === undefined) return { error: `No order ${wanted}.` }
+  if (!order.leave || order.leave.length === 0) return { error: `${order.id} asks for no leave${order.leaveStatus === 'denied' ? ' (it was denied)' : ''}.` }
+  if (order.status !== 'approved' && order.status !== 'held') return { error: `${order.id} is ${order.status}: leave is ruled on only before the order is dispatched.` }
+  if (verdict === 'grant' && order.leaveStatus === 'granted') return { error: `${order.id}'s leave is already granted.` }
+  const { leave: _dropped, ...rest } = order
+  const next: Order = verdict === 'grant' ? { ...order, leaveStatus: 'granted' } : { ...rest, leaveStatus: 'denied' }
+  const message =
+    verdict === 'grant' ? `${order.id}'s leave is granted: ${leaveText(order.leave)}. It can be dispatched.` : `${order.id}'s leave is denied and dropped; it can be dispatched without it.`
+  return { orders: orders.map(candidate => (candidate.id === order.id ? next : candidate)), order: next, message }
+}
+
 const forbidOpsText = (ops: readonly ForbidOp[]) => (ops.length === FORBID_OPS.length ? 'create, edit, delete' : ops.join(', '))
 
 // One rule as the advisors, Claude and the agent read it.
@@ -122,7 +193,17 @@ export function readProposal(input: Record<string, unknown>, root: string): Prop
     if (todos.length > MAX_TODOS) return { error: `${label}: at most ${MAX_TODOS} todos.` }
     const forbid = readForbid(entry.forbid, label)
     if ('error' in forbid) return forbid
-    dispatches.push({ folder, role: entry.role, task: entry.task.trim(), todos, ...(forbid.rules.length > 0 ? { forbid: forbid.rules } : {}), ...(forbid.policy.length > 0 ? { policy: forbid.policy } : {}) })
+    const leave = readLeave(entry.leave, entry.role, label)
+    if ('error' in leave) return leave
+    dispatches.push({
+      folder,
+      role: entry.role,
+      task: entry.task.trim(),
+      todos,
+      ...(forbid.rules.length > 0 ? { forbid: forbid.rules } : {}),
+      ...(forbid.policy.length > 0 ? { policy: forbid.policy } : {}),
+      ...(leave.leave.length > 0 ? { leave: leave.leave } : {}),
+    })
   }
   return { plan: input.plan.trim(), dispatches }
 }
@@ -134,7 +215,10 @@ const planLines = (proposal: Proposal) => [
     (dispatch, index) =>
       `${index + 1}. A ${dispatch.role} (${dispatch.role === 'scout' ? 'reads only' : 'may change files and run commands'}) in ${dispatch.folder}/: ${dispatch.task}\n   Todos: ${dispatch.todos.join('; ')}` +
       (dispatch.forbid && dispatch.forbid.length > 0 ? `\n   Forbidden paths (under ${dispatch.folder}/): ${dispatch.forbid.map(forbidText).join('; ')}` : '') +
-      (dispatch.policy && dispatch.policy.length > 0 ? `\n   Rules (plain language): ${dispatch.policy.join(' ')}` : ''),
+      (dispatch.policy && dispatch.policy.length > 0 ? `\n   Rules (plain language): ${dispatch.policy.join(' ')}` : '') +
+      (dispatch.leave && dispatch.leave.length > 0
+        ? `\n   LEAVE ASKED (exceptions to the policy judge's default rules on the machine, for this knight only; rule on them with the plan): ${leaveText(dispatch.leave)}`
+        : ''),
   ),
 ]
 
@@ -302,7 +386,19 @@ export const withOrdersAdded = (court: Court, orders: readonly Order[]): Court =
 // `now` (ms) stamps when each order was approved, which starts its expiry
 // clock; `levels`, the council's rating of each dispatch (court.ts orderLevels).
 // `status`: 'held' while the council's summoned advisor checks a fact.
-export function newOrders(court: Court, proposal: Proposal, root: string, conditions: string[], now?: number, levels?: readonly OrderLevel[], status: 'approved' | 'held' = 'approved'): Order[] {
+// `leaveApproval`: who grants a knight's leave (settings): 'owner' leaves it
+// pending until the person grants it; 'council' grants it with the approval
+// (a held order's, at its release: leaveOnApproval).
+export function newOrders(
+  court: Court,
+  proposal: Proposal,
+  root: string,
+  conditions: string[],
+  now?: number,
+  levels?: readonly OrderLevel[],
+  status: 'approved' | 'held' = 'approved',
+  leaveApproval: 'owner' | 'council' = 'owner',
+): Order[] {
   const next = nextOrderNumber(court)
   return proposal.dispatches.map((dispatch, index) => ({
     ...(levels?.[index] !== undefined ? { level: levels[index] } : {}),
@@ -316,6 +412,9 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
     conditions,
     ...(dispatch.forbid && dispatch.forbid.length > 0 ? { forbid: dispatch.forbid } : {}),
     ...(dispatch.policy && dispatch.policy.length > 0 ? { policy: dispatch.policy } : {}),
+    ...(dispatch.role === 'knight' && dispatch.leave && dispatch.leave.length > 0
+      ? { leave: [...dispatch.leave], leaveStatus: (leaveApproval === 'council' && status === 'approved' ? 'granted' : 'pending') as LeaveStatus }
+      : {}),
     status,
     agentId: null,
     steps: 0,
@@ -325,6 +424,24 @@ export function newOrders(court: Court, proposal: Proposal, root: string, condit
     endedAt: null,
     ...(now === undefined ? {} : { approvedAt: now }),
   }))
+}
+
+// A held order released by the council: with leaveApproval 'council', its
+// pending leave is granted with the release.
+export const leaveOnApproval = (order: Pick<Order, 'leave' | 'leaveStatus'>, leaveApproval: 'owner' | 'council'): { leaveStatus?: LeaveStatus } =>
+  leaveApproval === 'council' && (order.leave ?? []).length > 0 && order.leaveStatus === 'pending' ? { leaveStatus: 'granted' } : {}
+
+// An order's leave beside its line for Claude.
+const leaveNote = (order: Order) => (order.leave && order.leave.length > 0 ? `, leave (${order.leaveStatus ?? 'pending'}): ${leaveText(order.leave)}` : '')
+
+// What Claude is told of leave the person must still grant.
+function pendingLeaveLines(orders: readonly Order[]): string[] {
+  const pending = orders.filter(isLeavePending).map(order => order.id)
+  if (pending.length === 0) return []
+  const one = pending.length === 1
+  return [
+    `${pending.join(', ')} ${one ? 'asks' : 'ask'} for leave the person must grant first: ${one ? 'it' : 'they'} can't be dispatched until they type /council grant <id> (or /council deny-leave <id> to send it without). Tell them; dispatch ${one ? 'it' : 'them'} after.`,
+  ]
 }
 
 // What the tool tells Claude after the ruling.
@@ -341,8 +458,9 @@ export function rulingText(result: Ruling & { conditions: string[] }, orders: re
     'Dispatch each order with the Agent tool, its subagent_type as given, and its order id in the description (e.g. "O1 api limits"). An order you decide not to dispatch, withdraw with mcp__council__withdraw_orders; an undispatched order expires after a day:',
     ...orders.map(
       order =>
-        `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}${order.forbid && order.forbid.length > 0 ? `, forbids: ${order.forbid.map(rule => rule.glob).join(', ')}` : ''}${order.policy && order.policy.length > 0 ? `, rules: ${order.policy.join(' ')}` : ''}`,
+        `- ${order.id}: subagent_type "${AGENT_TYPES[order.role]}", folder ${order.relFolder}/, task: ${order.task}${order.forbid && order.forbid.length > 0 ? `, forbids: ${order.forbid.map(rule => rule.glob).join(', ')}` : ''}${order.policy && order.policy.length > 0 ? `, rules: ${order.policy.join(' ')}` : ''}${leaveNote(order)}`,
     ),
+    ...pendingLeaveLines(orders),
     'Each agent is given its folder, its todos, the conditions and any forbidden paths; keep your own prompt to the task.',
   ].join('\n')
 }
@@ -376,6 +494,11 @@ export function dispatchPrompt(order: Order, folderInstructions: string | null, 
     ...(order.policy && order.policy.length > 0
       ? [
           `Rules for this order (plain language; the sidekick mod's policy judge holds your shell commands to them). If one stands in the way, stop and report why instead of working around it:\n${order.policy.map(rule => `- ${rule}`).join('\n')}`,
+        ]
+      : []),
+    ...(order.leaveStatus === 'granted' && order.leave && order.leave.length > 0
+      ? [
+          `Leave granted to this order (the sidekick mod's policy judge lets these through as exceptions to its default rules, and nothing beyond their words; the folder, the path rules and the inline-code ban still hold):\n${order.leave.map(sentence => `- ${sentence}`).join('\n')}`,
         ]
       : []),
     ...(folderInstructions ? [`${order.relFolder}/CLAUDE.md (this folder's rules):\n${folderInstructions.slice(0, 6000)}`] : []),
@@ -597,7 +720,7 @@ export const WITHDRAW_ORDERS_SCHEMA = {
 }
 
 export const PROPOSE_ORDERS_DESCRIPTION =
-  "Put a plan of dispatches to the person's council before doing the work. Each dispatch sends one agent into one subfolder: a scout (council:scout) reads and reports, a knight (council:knight) changes files and runs commands there. The advisors rule on the plan (it takes a minute); approved dispatches become orders O1, O2…, which you then carry out with the Agent tool, naming the order id in the description. When the person rules out some paths (\"do not edit tests\", \"no new CSS\"), give the dispatch a forbid list; the order carries it and the agent is held to it. Use it for multi-folder work, and always in court mode."
+  "Put a plan of dispatches to the person's council before doing the work. Each dispatch sends one agent into one subfolder: a scout (council:scout) reads and reports, a knight (council:knight) changes files and runs commands there. The advisors rule on the plan (it takes a minute); approved dispatches become orders O1, O2…, which you then carry out with the Agent tool, naming the order id in the description. When the person rules out some paths (\"do not edit tests\", \"no new CSS\"), give the dispatch a forbid list; the order carries it and the agent is held to it. When a knight's task itself needs what the sidekick mod's policy judge refuses by default (installed tools, PATH, services, system settings), give it leave: up to 4 specific exceptions, e.g. \"May run systemctl and edit unit files under /etc/systemd on this host.\" The council rules on leave with the plan, and by default the person must grant it (/council grant) before the order can be dispatched; leave can't be added later. Use it for multi-folder work, and always in court mode."
 
 export const PROPOSE_ORDERS_SCHEMA = {
   type: 'object',
@@ -625,6 +748,12 @@ export const PROPOSE_ORDERS_SCHEMA = {
                 rule: { type: 'string', description: 'Instead of a glob: a plain-language rule, one sentence in the person\'s words (e.g. "Push nothing.").' },
               },
             },
+          },
+          leave: {
+            type: 'array',
+            maxItems: MAX_LEAVE,
+            items: { type: 'string', minLength: MIN_LEAVE_SENTENCE, maxLength: MAX_LEAVE_SENTENCE },
+            description: `Optional, knights only, at most ${MAX_LEAVE}: specific exceptions to the policy judge's default rules that the task needs, one sentence each (${MIN_LEAVE_SENTENCE} to ${MAX_LEAVE_SENTENCE} characters, one line, no < or >), e.g. "May run systemctl and edit unit files under /etc/systemd on this host." Ask only what the task needs.`,
           },
         },
         required: ['folder', 'role', 'task', 'todos'],
@@ -666,8 +795,14 @@ export const levelOf = (order: Pick<Order, 'role' | 'level'>): OrderLevel => ord
 // What a ruling on orders asks of every member beyond its three lines: one
 // LEVEL line per dispatch, and (when summons are on) an optional CHECK. No
 // extra model call: it rides on the ruling's own.
-export function orderAsk(count: number, isSummonsOn: boolean): string {
+// `hasLeave`: some dispatch asks for leave, which the members weigh with the plan.
+export function orderAsk(count: number, isSummonsOn: boolean, hasLeave = false): string {
   return [
+    ...(hasLeave
+      ? [
+          "Some dispatches ask for LEAVE: exceptions to the default rules the sidekick mod's policy judge holds agents to (such as not changing installed tools, PATH, services or system settings). Weigh each leave as a widening of what that agent may do on the machine, in your concern and verdict: leave broader than its task needs is a reason for concern.",
+        ]
+      : []),
     `Also rate how demanding each numbered dispatch is, one line per dispatch: LEVEL <dispatch number>: <1 to 3>, where 1 = a simple lookup or mechanical edit, 2 = ordinary work, 3 = needs deep reasoning or is risky. (${count} dispatch${count === 1 ? '' : 'es'}: LEVEL 1${count > 1 ? ` to LEVEL ${count}` : ''}.)`,
     ...(isSummonsOn
       ? [
@@ -851,7 +986,7 @@ export function moved(
   order: Order,
   event: OrderEvent,
   now: number,
-  fields: Partial<Pick<Order, 'agentId' | 'report' | 'note' | 'withdrawnReason' | 'model' | 'effort' | 'recall' | 'agentName' | 'conditions' | 'level' | 'approvedAt'>> = {},
+  fields: Partial<Pick<Order, 'agentId' | 'report' | 'note' | 'withdrawnReason' | 'model' | 'effort' | 'recall' | 'agentName' | 'conditions' | 'level' | 'approvedAt' | 'leaveStatus'>> = {},
 ): Order | undefined {
   const status = nextStatus(order.status, event)
   if (status === undefined) return undefined
@@ -996,6 +1131,7 @@ export function summonsRuledLine(result: Ruling & { conditions: string[] }, orde
     ...(result.conditions.length > 0 ? [`Conditions: ${result.conditions.join('; ')}`] : []),
     ...(findings ? [`Findings: ${findings.length > 500 ? `${findings.slice(0, 499)}…` : findings}`] : []),
     `Dispatch them as before, the order id in each description: ${orders.map(order => `${order.id} (${AGENT_TYPES[order.role]}, ${order.relFolder}/)`).join(', ')}.`,
+    ...pendingLeaveLines(orders),
     ...waits,
   ].join('\n')
 }
