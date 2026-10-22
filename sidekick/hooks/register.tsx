@@ -75,6 +75,8 @@ import {
   BACKSTOP_RETENTION_MS,
   backstopToast,
   backstopWarning,
+  scopePathspec,
+  withinScope,
   changesSince,
   dirtyMatches,
   flaggedChanges,
@@ -1237,7 +1239,7 @@ async function hashesOf($: EngineInterface, top: string, changes: readonly Chang
 
 // At an order agent's first tool call: if its order or the standing rules
 // forbid any paths, record where its repo starts (HEAD, and the matching paths
-// already changed then). Kept in the store, so a reload mid-run keeps it.
+// already changed then inside its own folder). Kept in the store, so a reload mid-run keeps it.
 async function startBackstop($: EngineInterface, agentId: string): Promise<void> {
   const order = await councilOrder($, agentId)
   if (order === undefined) return
@@ -1245,11 +1247,15 @@ async function startBackstop($: EngineInterface, agentId: string): Promise<void>
   if ((await $.store.get(backstopStoreKey(agentId))) !== undefined) return
   const rules = await activePathRules($, await $.session.root(), order)
   if (rules.length === 0) return
-  const [top, head] = await Promise.all([git($, order.folder, ['rev-parse', '--show-toplevel']), git($, order.folder, ['rev-parse', 'HEAD'])])
-  if (!top || !head) return void $.ui.toast(`Path rules backstop: ${order.id}'s folder is not a git repository with a commit, so what it changes won't be checked when it stops.`)
-  const status = await gitOutput($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
-  const dirty = await hashesOf($, top, dirtyMatches(parseStatus(status ?? ''), top, rules))
-  const baseline: Baseline = { orderId: order.id, folder: order.folder, top, start: head, rules, dirty, startedAt: await $.clock.now() }
+  const [top, head, scope] = await Promise.all([
+    git($, order.folder, ['rev-parse', '--show-toplevel']),
+    git($, order.folder, ['rev-parse', 'HEAD']),
+    git($, order.folder, ['rev-parse', '--show-prefix']),
+  ])
+  if (!top || !head || scope === undefined) return void $.ui.toast(`Path rules backstop: ${order.id}'s folder is not a git repository with a commit, so what it changes won't be checked when it stops.`)
+  const status = await gitOutput($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', scopePathspec(scope)])
+  const dirty = await hashesOf($, top, dirtyMatches(withinScope(parseStatus(status ?? ''), scope), top, rules))
+  const baseline: Baseline = { orderId: order.id, folder: order.folder, top, scope, start: head, rules, dirty, startedAt: await $.clock.now() }
   await $.store.set(backstopStoreKey(agentId), baseline)
 }
 
@@ -1262,14 +1268,14 @@ async function finishBackstop($: EngineInterface, agentId: string): Promise<stri
   await $.store.delete(backstopStoreKey(agentId))
   if (!isBaseline(stored)) return undefined
   const [diff, untracked] = await Promise.all([
-    gitOutput($, stored.top, ['diff', '--name-status', '--no-renames', '-z', stored.start]),
-    gitOutput($, stored.top, ['ls-files', '--others', '--exclude-standard', '-z']),
+    gitOutput($, stored.top, ['diff', '--name-status', '--no-renames', '-z', stored.start, '--', scopePathspec(stored.scope)]),
+    gitOutput($, stored.top, ['ls-files', '--others', '--exclude-standard', '-z', '--', scopePathspec(stored.scope)]),
   ])
   if (diff === undefined || untracked === undefined) {
     $.ui.toast(`Path rules backstop: git could not list what ${stored.orderId} changed, so its forbidden paths were not checked at its stop.`)
     return undefined
   }
-  const flagged = flaggedChanges(changesSince(parseNameStatus(diff), untracked.split('\0').filter(Boolean)), stored.top, stored.rules)
+  const flagged = flaggedChanges(withinScope(changesSince(parseNameStatus(diff), untracked.split('\0').filter(Boolean)), stored.scope), stored.top, stored.rules)
   const wasDirty = flagged.filter(entry => entry.path in stored.dirty)
   const hashNow = wasDirty.length === 0 ? {} : await hashesOf($, stored.top, wasDirty.map(entry => ({ path: entry.path, op: entry.hits[0]!.op })))
   const fresh = newSinceStart(flagged, stored.dirty, hashNow, stored.top, stored.rules)

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { BACKSTOP_MARK, backstopWarning, changesSince, dirtyMatches, flaggedChanges, newSinceStart, parseNameStatus, parseStatus } from '../hooks/backstop'
+import { BACKSTOP_MARK, backstopWarning, changesSince, dirtyMatches, flaggedChanges, newSinceStart, parseNameStatus, parseStatus, scopePathspec, withinScope } from '../hooks/backstop'
 import type { ActivePathRule } from '../hooks/scope-rules'
 import { baseStandIn, settle } from './stand-in'
 
@@ -31,6 +31,20 @@ describe('reading git', () => {
       { path: 'src/z.ts', op: 'edit' },
     ])
     expect(changesSince(tracked, ['src/x.spec.ts', 'src/n.css'])).toEqual([...tracked, { path: 'src/n.css', op: 'create' }])
+  })
+
+  test("only an order's own folder counts: two sibling folders in one repo are told apart", () => {
+    const changes = [
+      { path: 'web/src/a.ts', op: 'edit' as const },
+      { path: 'api/src/b.ts', op: 'edit' as const },
+      { path: 'webapp/c.ts', op: 'create' as const },
+    ]
+    expect(withinScope(changes, 'web/')).toEqual([changes[0]!])
+    expect(withinScope(changes, 'api/')).toEqual([changes[1]!])
+    expect(withinScope(changes, '')).toEqual(changes)
+    expect(withinScope(changes, undefined)).toEqual(changes)
+    expect(scopePathspec('web/')).toBe(':/web/')
+    expect(scopePathspec('')).toBe(':/')
   })
 })
 
@@ -69,14 +83,14 @@ describe('judging the changes', () => {
 
 // A repo at WEB as git reports it: HEAD, a status at the start, then what the
 // agent's script left (the diff since the start, new files, hashes).
-type Repo = { status: string; diff: string; untracked: string; hashes: Record<string, string>; calls: string[] }
+type Repo = { status: string; diff: string; untracked: string; hashes: Record<string, string>; calls: string[]; top?: string; prefix?: string }
 
 function gitStandIn(repo: Repo) {
   return (argv: readonly string[]) => {
     const args = argv.slice(3)
     repo.calls.push(args.join(' '))
     if (argv[0] !== 'git') return undefined
-    if (args[0] === 'rev-parse') return { exitCode: 0, stdout: args[1] === '--show-toplevel' ? `${WEB}\n` : 'abc123\n' }
+    if (args[0] === 'rev-parse') return { exitCode: 0, stdout: args[1] === '--show-toplevel' ? `${repo.top ?? WEB}\n` : args[1] === '--show-prefix' ? `${repo.prefix ?? ''}\n` : 'abc123\n' }
     if (args[0] === 'status') return { exitCode: 0, stdout: repo.status }
     if (args[0] === 'diff') return { exitCode: 0, stdout: repo.diff }
     if (args[0] === 'ls-files') return { exitCode: 0, stdout: repo.untracked }
@@ -108,7 +122,7 @@ test('the backstop catches an indirect write the Bash layer misses, and names it
   // The Bash layer can't see what a script does: the call goes through.
   const ran = (await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'node scripts/clean-specs.js' } as never)) as { deny?: string }
   expect(ran.deny).toBeUndefined()
-  expect(repo.calls).toContain('status --porcelain=v1 -z --untracked-files=all')
+  expect(repo.calls).toContain('status --porcelain=v1 -z --untracked-files=all -- :/')
 
   // What the script did: deleted one spec, added another and a CSS file, and
   // left the spec that was already changed before the order as it was.
@@ -138,6 +152,27 @@ test('a change already there at the start is blamed on the order only if it chan
   repo.diff = ['M', 'src/app.spec.ts', ''].join('\0')
   repo.hashes['src/app.spec.ts'] = 'h2'
   expect((await stop($)).text).toContain('editing src/app.spec.ts is forbidden')
+})
+
+test("with two sibling folders in one repo, only changes in the order's own folder are reported", async ($, on) => {
+  // The repo's top is ROOT; O7 works in web/, a sibling knight in api/.
+  const repo: Repo = { status: [' M api/src/held.spec.ts', ''].join('\0'), diff: '', untracked: '', hashes: {}, calls: [], top: ROOT, prefix: 'web/' }
+  orderStandIn(on, repo)
+  await $.session.start({ cwd: WEB, surface: 'desktop', isInteractive: true })
+  await settle()
+  await $.tool.call({ tool: 'Bash', agentId: 'agent-1', command: 'npm test' } as never)
+  expect(repo.calls).toContain('status --porcelain=v1 -z --untracked-files=all -- :/web/')
+  // The stand-in ignores the pathspec; the path filter still keeps api/ out.
+  repo.diff = ['D', 'api/src/old.spec.ts', 'D', 'web/src/old.spec.ts', ''].join('\0')
+  repo.untracked = ['api/src/new.spec.ts', 'web/src/new.spec.ts', ''].join('\0')
+  const report = (await stop($)).text ?? ''
+  expect(repo.calls).toContain('diff --name-status --no-renames -z abc123 -- :/web/')
+  expect(repo.calls).toContain('ls-files --others --exclude-standard -z -- :/web/')
+  expect(report).toContain('stopped with 2 changes its path rules forbid')
+  expect(report).toContain('deleting src/old.spec.ts is forbidden')
+  expect(report).toContain('creating src/new.spec.ts is forbidden')
+  expect(report).not.toContain('api/')
+  expect(report).not.toContain('../')
 })
 
 test('with nothing forbidden changed, the report is untouched; agents without an order get no backstop', async ($, on) => {

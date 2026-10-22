@@ -9,7 +9,9 @@
 // content hash, so changes that predate the order are not blamed on it. At the
 // stop: `git diff --name-status --no-renames -z <start>` (tracked changes since
 // the start, committed or not) plus `git ls-files --others --exclude-standard
-// -z` (new files). Ignored files are not seen.
+// -z` (new files). Ignored files are not seen. Every git call carries a
+// pathspec for the order's own folder, and the paths are filtered to it again,
+// so a sibling knight's changes elsewhere in the same repo are not blamed on it.
 
 import { hitText, matchPathRules, type ActivePathRule, type PathOp, type PathRuleHit } from './scope-rules'
 
@@ -25,6 +27,10 @@ export type Baseline = {
   folder: string
   // The repo's top folder, as git prints it; change paths are relative to it.
   top: string
+  // The order's folder relative to the top, with a trailing slash (`git
+  // rev-parse --show-prefix`); '' for the top itself. Absent in older
+  // baselines, which then cover the whole repo.
+  scope?: string
   // HEAD when the agent started.
   start: string
   rules: ActivePathRule[]
@@ -75,6 +81,16 @@ export function changesSince(tracked: readonly Change[], untracked: readonly str
   for (const change of tracked) byPath.set(change.path, change)
   for (const path of untracked) if (!byPath.has(path)) byPath.set(path, { path, op: 'create' })
   return [...byPath.values()]
+}
+
+// The pathspec that limits a git call (run at the top) to the order's folder.
+export const scopePathspec = (scope: string | undefined) => (scope ? `:/${scope}` : ':/')
+
+// The changes inside the order's folder (paths relative to the top).
+export function withinScope(changes: readonly Change[], scope: string | undefined): Change[] {
+  if (!scope) return [...changes]
+  const prefix = scope.endsWith('/') ? scope : `${scope}/`
+  return changes.filter(change => change.path.startsWith(prefix))
 }
 
 export const joinTop = (top: string, path: string) => `${top.replace(/[\\/]+$/, '')}/${path}`
