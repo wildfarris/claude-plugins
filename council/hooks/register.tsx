@@ -9,7 +9,7 @@
 // itself. Everything else lives beside it as pure code.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderInput, Timer } from 'claude-code'
+import type { EngineInterface, ModelCompleteRequest, ModelCompleteResult, ModelForkRequest, ModelForkResult, ModelUsage, Register, RenderInput, Timer, TurnUsage } from 'claude-code'
 
 import type { AdvisorId, AdvisorQuestion, AdvisorReport, AdvisorRun, AdvisorRunStatus, Council, Court, CourtSummons, DocketEntry, DocketFilter, DocketView, LearningView, Order, Roster, RulingSummons, Seat } from '../types'
 import {
@@ -230,6 +230,33 @@ import {
 import { councilView, portraitFor, rosterView } from './views/council'
 import { MAX_SEATS, memberId, mergeMembers, parseMemberFile, resolveReference, seatOf, seatedMembers, trimReferences, tuningFiles, tuningSummary, BUILT_IN_MEMBERS, type MemberDefinition } from './members'
 import { conditionAt, mergeProfiles, parseProfile, profileContext, profileReport, type Profile, type ProfileFields, type ProfileSource } from './profile'
+import { removeInside, type RemoveHost } from './remove'
+import {
+  SIDEKICK_LEDGERS,
+  STEP_FLUSH_EVERY,
+  USAGE_FOLDER,
+  addTokens,
+  callRecord,
+  dayOf,
+  expiredUsageFiles,
+  foldCalls,
+  isUsageFileName,
+  parseSince,
+  parseUsageFile,
+  serializeUsage,
+  sidekickRecords,
+  stepKey,
+  tokensOf,
+  usageFileName,
+  usageReport,
+  withStepsAdded,
+  ZERO,
+  type AgentKind,
+  type StepCategory,
+  type StepTotal,
+  type Tokens,
+  type UsageRecord,
+} from './usage'
 
 const COUNCIL_PANE_ID = 'council-chamber'
 const DEFAULT_COUNCIL_TOPIC = 'The work in progress in this session: is the current approach sound?'
@@ -327,8 +354,8 @@ async function blitSprites($: EngineInterface): Promise<void> {
 
 // The advisors' calls: the advisor model, or for a brain trust the deep one
 // (with more room to answer, since higher effort thinks first).
-const askAdvisorModel = ($: EngineInterface, isDeep: boolean | undefined, advisorSystem: string, prompt: string, maxTokens: number) =>
-  $.model.complete({
+const askAdvisorModel = ($: EngineInterface, use: ModelUse, isDeep: boolean | undefined, advisorSystem: string, prompt: string, maxTokens: number) =>
+  completeModel($, use, {
     model: isDeep ? settings.deepModel : settings.advisorModel,
     effort: isDeep ? settings.deepEffort : settings.advisorEffort,
     system: advisorSystem,
@@ -342,7 +369,7 @@ type BriefOutcome = { brief: string; notice?: string | null } | { failure: strin
 // A plain council's brief: a fork of this conversation (main model, no tools,
 // mostly served from the prompt cache).
 async function forkBrief($: EngineInterface, topic: string): Promise<BriefOutcome> {
-  const reply = await $.model.fork({ prompt: heraldForkPrompt(topic) }).catch(() => undefined)
+  const reply = await forkModel($, { purpose: 'herald' }, { prompt: heraldForkPrompt(topic) }).catch(() => undefined)
   if (reply?.isAnswered && reply.text.trim() !== '') return { brief: reply.text.trim() }
   return {
     failure:
@@ -402,8 +429,7 @@ async function reviewBrief($: EngineInterface, project: string, request: ReviewR
   }
 
   // The herald names the files it wants; the mod reads them, inside the repo only.
-  const pick = await $.model
-    .complete({ model: isDeep ? settings.deepModel : settings.briefModel, effort: isDeep ? settings.deepEffort : 'low', system: PICK_FILES_SYSTEM, prompt: pickFilesPrompt(material), maxTokens: isDeep ? 2000 : 400, timeoutMs: isDeep ? 180000 : 60000 })
+  const pick = await completeModel($, { purpose: 'brief' }, { model: isDeep ? settings.deepModel : settings.briefModel, effort: isDeep ? settings.deepEffort : 'low', system: PICK_FILES_SYSTEM, prompt: pickFilesPrompt(material), maxTokens: isDeep ? 2000 : 400, timeoutMs: isDeep ? 180000 : 60000 })
     .catch(() => undefined)
   const picked: Array<{ path: string; text: string }> = []
   let budget = REVIEW_LIMITS.files
@@ -415,8 +441,7 @@ async function reviewBrief($: EngineInterface, project: string, request: ReviewR
     picked.push({ path, text })
   }
 
-  const reply = await $.model
-    .complete({ model: isDeep ? settings.deepModel : settings.briefModel, effort: isDeep ? settings.deepEffort : 'medium', system: REVIEW_BRIEF_SYSTEM, prompt: reviewBriefPrompt(material, patch ?? '', picked), maxTokens: isDeep ? 3000 : 700, timeoutMs: isDeep ? 300000 : 120000 })
+  const reply = await completeModel($, { purpose: 'brief' }, { model: isDeep ? settings.deepModel : settings.briefModel, effort: isDeep ? settings.deepEffort : 'medium', system: REVIEW_BRIEF_SYSTEM, prompt: reviewBriefPrompt(material, patch ?? '', picked), maxTokens: isDeep ? 3000 : 700, timeoutMs: isDeep ? 300000 : 120000 })
     .catch(() => undefined)
   if (!reply?.isAnswered || reply.text.trim() === '') return { failure: 'the herald could not write a brief' }
   const fetchTimes = commonDir
@@ -431,7 +456,8 @@ async function reviewBrief($: EngineInterface, project: string, request: ReviewR
 // this council is still the current one.
 // `extra`: a sitting's own request beside the usual three lines (a ruling on
 // orders: LEVEL and CHECK lines); `onReply`: each member's raw answer, for them.
-type Asking = { extra?: string; onReply?: (seatId: AdvisorId, text: string) => void }
+// `use`: what its member calls are recorded as, when not a plain vote (member:<id>).
+type Asking = { extra?: string; onReply?: (seatId: AdvisorId, text: string) => void; use?: ModelUse }
 
 async function holdCouncil($: EngineInterface, generation: number, topic: string, seats: readonly Seat[], isDeep: boolean, produceBrief: () => Promise<BriefOutcome>, asking: Asking = {}): Promise<void> {
   const isCurrent = () => generation === councilGeneration
@@ -450,7 +476,7 @@ async function holdCouncil($: EngineInterface, generation: number, topic: string
   await updateCouncil($, council => ({ ...withAdvisorsDeliberating(council, brief), notice: outcome.notice ?? null }))
   await Promise.all(
     seats.map(async advisor => {
-      const verdict = await askAdvisorModel($, isDeep, advisorSystemPrompt(advisor, standing), advisorPrompt(topic, brief, options, asking.extra), asking.extra ? 450 : 300).catch(() => undefined)
+      const verdict = await askAdvisorModel($, asking.use ?? { purpose: `member:${advisor.id}` }, isDeep, advisorSystemPrompt(advisor, standing), advisorPrompt(topic, brief, options, asking.extra), asking.extra ? 450 : 300).catch(() => undefined)
       if (verdict?.isAnswered) asking.onReply?.(advisor.id, verdict.text)
       if (isCurrent()) await updateCouncil($, council => withVerdict(council, advisor.id, verdict?.isAnswered ? verdict.text : undefined))
     }),
@@ -539,7 +565,7 @@ async function reconsider($: EngineInterface, context: string, isDeep = false): 
       const report = reconsidering.advisors[advisor.id]
       if (report === undefined) return
       const prompt = reconsiderPrompt(reconsidering, report)
-      const verdict = await askAdvisorModel($, reconsidering.isDeep, advisorSystemPrompt(advisor, reconsidering.standing), prompt, 300).catch(() => undefined)
+      const verdict = await askAdvisorModel($, { purpose: `member:${advisor.id}` }, reconsidering.isDeep, advisorSystemPrompt(advisor, reconsidering.standing), prompt, 300).catch(() => undefined)
       if (isCurrent()) await updateCouncil($, current => withVerdict(current, advisor.id, verdict?.isAnswered ? verdict.text : undefined))
     }),
   )
@@ -569,7 +595,7 @@ async function askAdvisor($: EngineInterface, query: string, question: string): 
   await openCouncilPane($)
   const generation = councilGeneration
   // In the background: the command returns now, the answer fills in under the card.
-  void askAdvisorModel($, council.isDeep, advisorSystemPrompt(advisor, council.standing), followUpPrompt(council.topic, council.brief, report, question), 400)
+  void askAdvisorModel($, { purpose: `member:${advisor.id}` }, council.isDeep, advisorSystemPrompt(advisor, council.standing), followUpPrompt(council.topic, council.brief, report, question), 400)
     .catch(() => undefined)
     .then(reply =>
       generation !== councilGeneration
@@ -595,7 +621,7 @@ async function reportCouncil($: EngineInterface): Promise<string> {
   if (council === null) return 'The council has not convened. /council <question> first.'
   if (council.phase !== 'done') return 'The council can report once it has adjourned.'
   const generation = councilGeneration
-  void askAdvisorModel($, council.isDeep, REPORT_SYSTEM, reportPrompt(council), 500)
+  void askAdvisorModel($, { purpose: 'report' }, council.isDeep, REPORT_SYSTEM, reportPrompt(council), 500)
     .catch(() => undefined)
     .then(async reply => {
       if (generation !== councilGeneration) return
@@ -954,7 +980,7 @@ async function conveneAndWait(
   await openCouncilPane($)
   isCouncilWorking = true
   try {
-    await holdCouncil($, generation, topic, seats, sitting.isDeep === true, produceBrief, { extra: sitting.extra, onReply: sitting.onReply })
+    await holdCouncil($, generation, topic, seats, sitting.isDeep === true, produceBrief, { extra: sitting.extra, onReply: sitting.onReply, use: sitting.use })
   } finally {
     if (generation === councilGeneration) isCouncilWorking = false
   }
@@ -1136,6 +1162,7 @@ async function startAdvisorAgent($: EngineInterface, runId: string, folders: str
 // The advisor's spawn went through: its agent id noted (its effort is the run's, in the court).
 async function advisorStarted($: EngineInterface, pending: PendingAdvisor, agentId: string): Promise<void> {
   advisorAgents.set(agentId, pending.folders)
+  usageAgents.set(agentId, { category: 'advisor' })
   await update($, courtAtom, current => withAdvisorChanged(current, pending.runId, run => ({ ...run, agentId })))
 }
 
@@ -1457,7 +1484,7 @@ async function secondRound($: EngineInterface, council: Council, context: string
       seatsOf(current).map(async seat => {
         const report = current.advisors[seat.id]
         if (report === undefined) return
-        const reply = await askAdvisorModel($, current.isDeep, advisorSystemPrompt(seat, current.standing), reconsiderPrompt(current, report, extra), 450).catch(() => undefined)
+        const reply = await askAdvisorModel($, { purpose: 'summons-round2' }, current.isDeep, advisorSystemPrompt(seat, current.standing), reconsiderPrompt(current, report, extra), 450).catch(() => undefined)
         if (reply?.isAnswered) onReply(seat.id, reply.text)
         current = withVerdict(current, seat.id, reply?.isAnswered ? reply.text : undefined)
         await mirror()
@@ -1588,7 +1615,7 @@ async function arbitrate($: EngineInterface, council: Council, proposal: Proposa
   }
   let review: ArbiterDecision[] | { failure: string }
   try {
-    const reply = await $.model.complete({
+    const reply = await completeModel($, { purpose: 'arbiter' }, {
       model: settings.advisorModel,
       effort: 'low',
       system: advisorSystemPrompt(seat, council.standing, true),
@@ -1926,7 +1953,7 @@ async function amendOrderTool($: EngineInterface, input: Record<string, unknown>
   const changeOne = (change: (current: Order) => Order) => updateOrder($, candidate => candidate.id === asked.id, change)
   let council: Council | undefined
   try {
-    council = await conveneAndWait($, `Amendment to ${asked.id}: ${amendment.change}`, async () => ({ brief: amendmentBrief(asked, amendment, lastPetition) }), { source: 'claude' })
+    council = await conveneAndWait($, `Amendment to ${asked.id}: ${amendment.change}`, async () => ({ brief: amendmentBrief(asked, amendment, lastPetition) }), { source: 'claude', use: { purpose: 'amend', orderId: asked.id, level: levelOf(asked) } })
   } catch {
     council = undefined
   }
@@ -2049,8 +2076,7 @@ async function triage($: EngineInterface, petition: string): Promise<Route> {
   if (namesWholeCouncil(petition)) return 'asked'
   const { members, root } = await loadMembers($)
   const seated = seatedMembers(members, await unseatedIds($, root)).slice(0, MAX_SEATS)
-  const reply = await $.model
-    .complete({ model: settings.triageModel, system: TRIAGE_SYSTEM, prompt: triagePrompt(petition, seated), maxTokens: 12, timeoutMs: 15000 })
+  const reply = await completeModel($, { purpose: 'triage' }, { model: settings.triageModel, system: TRIAGE_SYSTEM, prompt: triagePrompt(petition, seated), maxTokens: 12, timeoutMs: 15000 })
     .catch(() => undefined)
   const sorted = parseTriage(reply?.isAnswered ? reply.text : undefined, seated.map(member => member.id))
   return sorted.route === 'seat' ? { seat: sorted.id } : sorted.route === 'pass' ? 'pass' : 'review'
@@ -2207,8 +2233,7 @@ async function draftSummary($: EngineInterface, project: string): Promise<void> 
   const mine = lessons.filter(lesson => lesson.project === project)
   if (mine.length === 0) return
   const existing = guidance.filter(section => section.scope === EVERYWHERE || section.scope === project).flatMap(section => section.items)
-  const reply = await $.model
-    .complete({ model: settings.advisorModel, effort: settings.advisorEffort, system: SUMMARY_SYSTEM, prompt: summaryPrompt(mine, existing, project), maxTokens: 800, timeoutMs: 120000 })
+  const reply = await completeModel($, { purpose: 'guidance' }, { model: settings.advisorModel, effort: settings.advisorEffort, system: SUMMARY_SYSTEM, prompt: summaryPrompt(mine, existing, project), maxTokens: 800, timeoutMs: 120000 })
     .catch(() => undefined)
   const draft = reply?.isAnswered ? parseSummary(reply.text) : []
   if (draft.length === 0) {
@@ -2489,6 +2514,8 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   }
   if (action === 'members') return membersCommand($, target, words.join(' '))
   if (action === 'profile' && isAlone) return profileCommand($)
+  // Only as a subcommand: "usage of the API?" is still a question for the council.
+  if (action === 'usage' && (isAlone || /^usage(\s+since)?\s+\d{4}-\d{2}-\d{2}$/.test(trimmed))) return usageCommand($, trimmed.replace(/^usage\b/, ''))
   if (action === 'court') return courtCommand($, target)
   if (action === 'lessons' && isAlone) {
     await openLessons($)
@@ -2507,6 +2534,238 @@ async function councilCommand($: EngineInterface, args: string, origin?: { kind:
   return conveneFromText($, trimmed || DEFAULT_COUNCIL_TOPIC)
 }
 
+// ── Usage ─────────────────────────────────────────────────────────────────
+//
+// Every model call the council makes goes through completeModel or forkModel,
+// which record its purpose, model and tokens; turn.step sums the session's
+// model requests by category. Both land in ~/.claude/council/usage/<session>.jsonl,
+// written only by this session, through one queue, never awaited by the call
+// or the request it records. A failure is toasted once and changes nothing else.
+
+// What a model call is for: `member:<id>`, `herald`, `brief`, `triage`,
+// `arbiter`, `summons-round2`, `amend`, `report` or `guidance`.
+type ModelUse = { purpose: string; orderId?: string; level?: number }
+
+// Call records not yet written.
+let pendingCalls: Array<Omit<UsageRecord, 'at' | 'session'>> = []
+// Model requests not yet written, summed by agent ('' for main) and model.
+const stepDeltas = new Map<string, { agentId?: string; model: string; tokens: Tokens; requests: number }>()
+let unflushedSteps = 0
+// Turns whose requests turn.step saw (a turn it didn't see counts from its turn.complete).
+const steppedTurns = new Set<string>()
+// Agents known by their spawn: an order's, or the council's advisor.
+const usageAgents = new Map<string, AgentKind>()
+// The file as last read or written: its call records and step totals.
+let usageFile: { path: string; calls: UsageRecord[]; steps: Map<string, StepTotal> } | null = null
+let usageWrites: Promise<void> = Promise.resolve()
+let isUsageFlushQueued = false
+let isUsageFailureToasted = false
+let isUsagePruned = false
+// The main loop's model, for a fork's record (a fork runs on it).
+let mainModel: string | undefined
+
+async function completeModel($: EngineInterface, use: ModelUse, request: ModelCompleteRequest): Promise<ModelCompleteResult> {
+  const reply = await $.model.complete(request)
+  noteModelCall($, use, request.model, request.effort, reply.usage)
+  return reply
+}
+
+async function forkModel($: EngineInterface, use: ModelUse, request: ModelForkRequest): Promise<ModelForkResult> {
+  const reply = await $.model.fork(request)
+  if ('usage' in reply) noteModelCall($, use, mainModel ?? 'main model', undefined, reply.usage)
+  return reply
+}
+
+// Queues a call's record; never throws.
+function noteModelCall($: EngineInterface, use: ModelUse, model: string, effort: string | number | undefined, usage: ModelUsage | undefined): void {
+  try {
+    const { at: _at, session: _session, ...record } = callRecord({ at: 0, plugin: 'council', purpose: use.purpose, model, effort, session: '', usage, orderId: use.orderId, level: use.level })
+    if (pendingCalls.length < 500) pendingCalls.push(record)
+    void flushUsage($)
+  } catch (error) {
+    usageFailed($, error)
+  }
+}
+
+// One model request's usage, summed in memory; never throws, never waits.
+function noteStep($: EngineInterface, agentId: string | undefined, turnId: string, usage: TurnUsage | null | undefined): void {
+  try {
+    if (steppedTurns.size > 500) steppedTurns.delete(steppedTurns.values().next().value!)
+    steppedTurns.add(turnId)
+    if (usage === null || usage === undefined) return
+    addStepDelta(agentId, usage.model, tokensOf(usage), 1)
+    if (++unflushedSteps >= STEP_FLUSH_EVERY) void flushUsage($)
+  } catch (error) {
+    usageFailed($, error)
+  }
+}
+
+function addStepDelta(agentId: string | undefined, model: string, tokens: Tokens, requests: number): void {
+  const key = `${agentId ?? ''}|${model}`
+  const existing = stepDeltas.get(key)
+  stepDeltas.set(key, { ...(agentId !== undefined ? { agentId } : {}), model, tokens: addTokens(existing?.tokens ?? ZERO, tokens), requests: (existing?.requests ?? 0) + requests })
+}
+
+// A turn's end: a subagent's turn whose requests turn.step never saw counts
+// from the turn's own usage; a main turn's end writes the totals.
+function noteTurnEnd($: EngineInterface, e: { turnId: string; agentId?: string; usage?: TurnUsage }): void {
+  try {
+    const wasStepped = steppedTurns.delete(e.turnId)
+    if (!wasStepped && e.agentId !== undefined && e.usage !== undefined) addStepDelta(e.agentId, e.usage.model, tokensOf(e.usage), 1)
+    if (e.agentId === undefined) void flushUsage($)
+  } catch (error) {
+    usageFailed($, error)
+  }
+}
+
+function flushUsage($: EngineInterface): Promise<void> {
+  if (isUsageFlushQueued) return usageWrites
+  isUsageFlushQueued = true
+  usageWrites = usageWrites
+    .then(() => {
+      isUsageFlushQueued = false
+      return writeUsage($)
+    })
+    .catch(error => usageFailed($, error))
+  return usageWrites
+}
+
+function usageFailed($: EngineInterface, error: unknown): void {
+  if (isUsageFailureToasted) return
+  isUsageFailureToasted = true
+  try {
+    $.ui.toast(`Council: usage could not be recorded (${error instanceof Error ? error.message : String(error)}); nothing else is affected.`)
+  } catch {
+    // Nothing more to do.
+  }
+}
+
+// Who an agent's requests belong to: an order's (with its level), the
+// council's advisor, or (undefined) another subagent.
+function agentKindOf(court: Court | undefined, agentId: string): AgentKind | undefined {
+  const order = court?.orders.find(candidate => candidate.agentId === agentId)
+  if (order !== undefined) return { category: 'dispatch', orderId: order.id, level: levelOf(order), role: order.role, folder: order.relFolder }
+  if (advisorAgents.has(agentId) || court?.advisors?.some(run => run.agentId === agentId)) return { category: 'advisor' }
+  return usageAgents.get(agentId)
+}
+
+// Writes what is pending into this session's file: the file read first once
+// (a reload or a resume continues it), then rewritten whole. With no home
+// folder nothing is recorded. The first write deletes files past retention.
+async function writeUsage($: EngineInterface): Promise<void> {
+  const calls = pendingCalls
+  const deltas = [...stepDeltas.values()]
+  if (calls.length === 0 && deltas.length === 0) return
+  pendingCalls = []
+  stepDeltas.clear()
+  unflushedSteps = 0
+  try {
+    const homePath = await home($)
+    if (homePath === '') return
+    const [now, session] = await Promise.all([$.clock.now(), $.session.id()])
+    const folder = `${homePath}/${USAGE_FOLDER}`
+    const name = usageFileName(session)
+    const path = `${folder}/${name}`
+    if (usageFile === null || usageFile.path !== path) {
+      const isThere = await $.fs.exists(path).catch(() => false)
+      const text = isThere ? await readFileText($, path) : ''
+      // A file that is there but can't be read is never overwritten.
+      if (text === undefined) throw new Error(`${path} could not be read`)
+      const parsed = parseUsageFile(text)
+      usageFile = { path, calls: parsed.calls, steps: new Map(parsed.steps.map(total => [stepKey(total), total])) }
+    }
+    const court = deltas.some(delta => delta.agentId !== undefined) ? await read($, courtAtom).catch(() => undefined) : undefined
+    const day = dayOf(now)
+    let steps = usageFile.steps
+    const orderTotals = new Map<string, Tokens & { requests: number }>()
+    for (const delta of deltas) {
+      const agent = delta.agentId === undefined ? undefined : agentKindOf(court, delta.agentId)
+      const category: StepCategory = delta.agentId === undefined ? 'main' : (agent?.category ?? 'other')
+      steps = withStepsAdded(steps, { day, at: now, session, category, model: delta.model, tokens: delta.tokens, requests: delta.requests, ...(agent ? { agent } : {}) })
+      if (agent?.category === 'dispatch') {
+        const sum = orderTotals.get(agent.orderId)
+        orderTotals.set(agent.orderId, { ...addTokens(sum ?? ZERO, delta.tokens), requests: (sum?.requests ?? 0) + delta.requests })
+      }
+    }
+    const records = foldCalls([...usageFile.calls, ...calls.map(call => ({ ...call, at: now, session }) as UsageRecord)])
+    await $.fs.write(path, serializeUsage(records, steps.values()))
+    usageFile = { path, calls: records, steps }
+    for (const [orderId, sum] of orderTotals) {
+      await updateOrder($, order => order.id === orderId, order => ({ ...order, usage: { ...addTokens(order.usage ?? ZERO, sum), requests: (order.usage?.requests ?? 0) + sum.requests } })).catch(() => undefined)
+    }
+    if (!isUsagePruned) {
+      isUsagePruned = true
+      void pruneUsage($, folder, name, now).catch(() => undefined)
+    }
+  } catch (error) {
+    // Kept for the next write (bounded): one failure loses no counts.
+    pendingCalls = [...calls, ...pendingCalls].slice(-500)
+    for (const delta of deltas) addStepDelta(delta.agentId, delta.model, delta.tokens, delta.requests)
+    throw error
+  }
+}
+
+// Retention: usage files past 60 days deleted, each on its own, only in the
+// usage folder. One that can't be deleted stays, noted in the debug log.
+async function pruneUsage($: EngineInterface, folder: string, current: string, now: number): Promise<void> {
+  const files = await $.fs.list(folder).catch(() => [])
+  const homePath = await home($)
+  for (const name of expiredUsageFiles(files.filter(file => !file.isLink), current, now)) {
+    await removeInside(removeHostOf($), `${folder}/${name}`, folder, homePath || undefined).catch(error => {
+      try {
+        $.ui.log(`council: kept an expired usage file: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+      } catch {
+        // A log line is best effort.
+      }
+    })
+  }
+}
+
+// remove.ts's engine calls, spelled here: the engine follows `$` into no other file.
+const removeHostOf = ($: EngineInterface): RemoveHost => ({
+  stat: (path, options) => $.fs.stat(path, options),
+  list: path => $.fs.list(path),
+  exists: path => $.fs.exists(path),
+  run: (argv, init) => $.process.run(argv, init),
+})
+
+// Every file of a folder modified since `since` (an older one holds no newer
+// line), read; a file that can't be read is skipped.
+async function readRecentFiles($: EngineInterface, folder: string, since: number, isWanted: (name: string) => boolean): Promise<string[]> {
+  const entries = await $.fs.list(folder).catch(() => [])
+  const texts = await Promise.all(
+    entries.filter(entry => entry.kind === 'file' && !entry.isLink && entry.mtimeMs >= since && isWanted(entry.name)).map(entry => readFileText($, `${folder}/${entry.name}`)),
+  )
+  return texts.filter((text): text is string => text !== undefined)
+}
+
+// Sidekick's records, read loosely from its ledgers (one folder per session,
+// segment files holding every kind of entry): null when it recorded none.
+async function readSidekickUsage($: EngineInterface, homePath: string, since: number): Promise<UsageRecord[] | null> {
+  const base = `${homePath}/${SIDEKICK_LEDGERS}`
+  const sessions = (await $.fs.list(base).catch(() => undefined))?.filter(entry => entry.kind === 'dir' && !entry.isLink)
+  if (sessions === undefined || sessions.length === 0) return null
+  // Every session's folder (a folder's own time moves only when a file is added): its recent segments.
+  const texts = await Promise.all(sessions.map(entry => readRecentFiles($, `${base}/${entry.name}`, since, name => /^\d{6}\.jsonl$/.test(name))))
+  const records = texts.flat().flatMap(sidekickRecords)
+  return records.length === 0 ? null : records
+}
+
+// /council usage [since YYYY-MM-DD]: one short table, from every session's
+// usage file on this machine and sidekick's ledgers.
+async function usageCommand($: EngineInterface, args: string): Promise<string> {
+  const now = await $.clock.now()
+  const since = parseSince(args, now)
+  if ('error' in since) return since.error
+  const homePath = await home($)
+  if (homePath === '') return `Usage is not recorded: ${NO_HOME}.`
+  await flushUsage($).catch(() => undefined)
+  const texts = await readRecentFiles($, `${homePath}/${USAGE_FOLDER}`, since.since, isUsageFileName)
+  const parsed = texts.map(parseUsageFile)
+  const sidekick = await readSidekickUsage($, homePath, since.since)
+  return usageReport({ label: since.label, steps: parsed.flatMap(file => file.steps), calls: parsed.flatMap(file => file.calls), sidekick, sinceDay: since.day, since: since.since, now })
+}
+
 // ── Hooks ─────────────────────────────────────────────────────────────────
 
 export const register: Register = (on, options) => {
@@ -2517,7 +2776,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'council',
       description: 'Convene the council of five on a question, or on a repo\'s work since a ref',
-      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|court [on|off|clear]|show|reset]',
+      argumentHint: '[<question>|deep <question>|deep reconsider <context>|review [folder] <ref> [question]|reconsider <context>|ask <advisor> <question>|advise [deep] <folder> <question>|level <order> <1-3>|grant <order>|deny-leave <order>|release <order>|message <order> <text>|recall <order> <reason>|report|members|profile|lessons|docket|usage [since YYYY-MM-DD]|court [on|off|clear]|show|reset]',
     })
     await settleInterruptedWork($)
     await expireOrders($).catch(() => undefined)
@@ -2538,6 +2797,7 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     stopAnimation()
+    await flushUsage($).catch(() => undefined)
     return next(e)
   })
 
@@ -2627,6 +2887,7 @@ export const register: Register = (on, options) => {
       const result = await next({ ...e, prompt: outcome.prompt, description: outcome.description, model: level.model })
       if (result.agentId !== undefined) {
         stepEfforts.set(result.agentId, level.effort)
+        usageAgents.set(result.agentId, { category: 'dispatch', orderId: outcome.order.id, level: levelOf(outcome.order), role: outcome.order.role, folder: outcome.order.relFolder })
         await moveOrder($, outcome.order.id, 'spawn', { agentId: result.agentId, model: level.model, effort: level.effort, ...(e.name ? { agentName: e.name } : {}) })
       }
       return result
@@ -2645,7 +2906,8 @@ export const register: Register = (on, options) => {
   )
 
   // A council agent's model requests run at its level's effort; everything
-  // else passes untouched. A model that takes no effort is left alone.
+  // else passes untouched. A model that takes no effort is left alone. Every
+  // request's usage is summed for /council usage (no wait, no change).
   // A recalled agent's request past its ceiling is answered here, without
   // next: a final reply that ends its turn between steps, never mid-tool.
   on('turn.step', async function* ($, e, next) {
@@ -2655,8 +2917,12 @@ export const register: Register = (on, options) => {
       yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: null }
       return { turnId: e.turnId, index: e.index, answer: reply, toolUses: [], stopReason: 'end_turn' as const, usage: null }
     }
+    if (e.agentId === undefined) mainModel = e.model
     const effort = e.agentId === undefined || e.effort === undefined ? undefined : await stepEffortFor($, e.agentId)
-    return yield* next(effort === undefined || effort === e.effort ? e : { ...e, effort: effort as typeof e.effort })
+    // The response streams through untouched; its usage is summed once it is whole.
+    const result = yield* next(effort === undefined || effort === e.effort ? e : { ...e, effort: effort as typeof e.effort })
+    noteStep($, e.agentId, e.turnId, result?.usage)
+    return result
   })
 
   // A council agent's calls: progress, edits, and its folder's bounds; the
@@ -2694,6 +2960,7 @@ export const register: Register = (on, options) => {
   // A council agent's last answer is its report; an advisor's, its findings.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    noteTurnEnd($, e)
     if (e.agentId !== undefined) {
       const answer = 'answer' in e ? e.answer : ''
       await finishOrder($, e.agentId, answer, e.reason).catch(() => undefined)

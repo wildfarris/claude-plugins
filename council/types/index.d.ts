@@ -285,7 +285,13 @@ export type Order = {
   amendments?: OrderAmendment[]
   // Set when it is recalled.
   recall?: OrderRecall
+  // What its agent's model requests have cost so far (turn.step), summed:
+  // the four token counts and how many requests. Absent until its first
+  // totals are written (council 0.4.0 on).
+  usage?: OrderUsage
 }
+
+export type OrderUsage = { input: number; cacheRead: number; cacheWrite: number; output: number; requests: number }
 
 export type OrderLevel = 1 | 2 | 3
 

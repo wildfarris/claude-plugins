@@ -10,6 +10,7 @@ import { seatsOf } from '../council'
 import { isAdvisorFinished } from '../advisors'
 import { currentTodo, isFinished, isFolded, isLeavePending, leaveSummary, levelLabel, openTodos, progressOf } from '../court'
 import { callsLabel } from '../tally'
+import { tokensLabel } from '../usage'
 import { touchedFiles } from '../control'
 
 export type CourtViewProps = {
@@ -113,7 +114,7 @@ function leaveLines(el: ElementTable, order: Order, buttons: LeaveButtons = {}) 
 function activeRow(el: ElementTable, order: Order, road: (order: Order) => unknown, buttons: LeaveButtons = {}) {
   const { Box, Text } = el
   const { done, total } = progressOf(order)
-  const calls = callsLabel(order.steps)
+  const calls = [callsLabel(order.steps), tokensLabel(order.usage)].filter(Boolean).join(' · ')
   // Held: approved on the first round, waiting for the advisor's check and the second.
   const isHeld = order.status === 'held'
   const isWaiting = order.status === 'approved' || isHeld
@@ -220,7 +221,7 @@ function finishedRow(el: ElementTable, order: Order, isOpen: boolean, onToggle: 
     )
   }
   const ended = ENDED[order.status] ?? ENDED.failed!
-  const calls = callsLabel(order.steps)
+  const calls = [callsLabel(order.steps), tokensLabel(order.usage)].filter(Boolean).join(' · ')
   return (
     <Box key={`order-${order.id}`} flexDirection="column">
       <Box flexDirection="row" gap={1}>
